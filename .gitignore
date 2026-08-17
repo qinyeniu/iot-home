@@ -1,0 +1,43 @@
+# ===== 环境变量与凭据 =====
+.env
+*.env
+!.env.example
+!*.env.example
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== Node =====
+node_modules/
+
+# ===== ESP-IDF / ESP32 固件 =====
+firmware/**/build/
+firmware/**/managed_components/
+firmware/**/dependencies.lock
+firmware/**/sdkconfig
+firmware/**/sdkconfig.old
+
+# ===== Docker 本地数据卷 =====
+server/data/
+
+# ===== 日志 =====
+*.log
+
+# ===== KiCad / EDA =====
+hardware/**/*-backups/
+hardware/**/*.kicad_pcb-bak
+hardware/**/fp-info-cache
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

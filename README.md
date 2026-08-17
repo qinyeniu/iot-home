@@ -1,0 +1,70 @@
+# iot-home — IoT 三层架构学习原型
+
+一个"终端 + 网关 + 服务器"完整三层架构的项目原型，作为后续扩展的基座。
+第一版主题：**室内环境监测 + 远程开关**。主题不重要，核心要求是**扩展性**：
+以后增加新传感器、新执行器、新终端节点时，不需要重构现有代码和数据库。
+
+## 技术选型
+
+| 层 | 方案 |
+|----|------|
+| 终端 / 网关 | ESP32-C6（内置 Wi-Fi 6 + BLE + Zigbee 3.0/Thread） |
+| 终端 ↔ 网关 | Zigbee 3.0（乐鑫 ESP-Zigbee-SDK，标准 ZCL 簇） |
+| 网关上联 | Wi-Fi STA + MQTT |
+| 消息中间件 | Mosquitto（MQTT） |
+| 服务端 | FastAPI + MySQL 8.0（独立库 `iot_home`）+ Grafana |
+| 本地开发 | Windows + Docker Compose 一键环境（Mosquitto + MySQL + FastAPI + Grafana） |
+| 服务器部署 | 阿里云 ECS，systemd 管理（**已后置**，等服务器资源优化） |
+
+## 目录结构
+
+```
+iot-home/
+├── docs/                  # 分阶段中文文档（设计先行）
+├── firmware/
+│   ├── gateway/           # 网关固件：Zigbee 协调器 + Wi-Fi + MQTT + OLED
+│   ├── node_sensor/       # 传感器终端：AHT20 + BH1750 + SSD1306
+│   ├── node_switch/       # 开关终端：继电器 / WS2812B
+│   └── common/            # 共享模块：传感器驱动注册表、MQTT 主题常量
+├── server/
+│   ├── backend/           # FastAPI 后端：MQTT 订阅入库 + 设备/命令 API
+│   ├── docker-compose.yml # 本地一键环境（第 1 周代码阶段提供）
+│   ├── grafana/           # 数据源与看板 provisioning
+│   ├── mysql/init/        # 建库建表初始化脚本
+│   └── mosquitto/config/  # MQTT 配置
+├── hardware/              # 接线图、BOM、KiCad 底板图纸
+└── tools/                 # 模拟器与调试工具（硬件到货前联调用）
+```
+
+## 阶段计划
+
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| 第 1–2 周 | 本地 Docker 端到端：模拟设备 → MQTT → 入库 → Grafana 曲线 | 进行中 |
+| 第 3–4 周 | 网关固件：ESP-IDF + Wi-Fi + MQTT + OLED + 断线重连 | 待开始 |
+| 第 5–7 周 | Zigbee 组网、传感器节点、开关节点；Grafana + 远程控制接口 | 待开始 |
+| 第 8–9 周 | 可靠性（OTA、重连、可选 TLS）+ KiCad 底板 → 嘉立创 SMT 贴片 | 待开始 |
+| 第 10 周起 | 按兴趣扩展：低功耗电池、更多传感器、告警推送、Matter、Web App | 待开始 |
+
+> 阿里云 ECS 部署内容（Mosquitto 安装、安全组、systemd）整体后置，
+> 等待服务器资源优化完成后另行安排，不影响本地开发进度。
+
+## 扩展性设计（第一版必须落实）
+
+1. 终端节点统一 I2C 扩展排针：3V3 / GND / SDA / SCL + 2 个备用 GPIO，新传感器即插即用。
+2. 固件用"传感器驱动注册表"：每个传感器一个驱动模块，新增传感器只加文件，不改主逻辑。
+3. 数据库用指标表：设备 ID + 指标名 + 时间戳 + 值，任何新指标自动兼容，不重建表。
+4. 上报 JSON 用"公共字段 + extras 扩展字段"，服务器接口不随传感器种类变化。
+5. MQTT 主题规范化：`iot-home/{网关ID}/nodes/{节点ID}/telemetry`、`/status`、`/cmd`、`/permit_join`。
+6. 网关支持多终端注册与命令转发，设备列表由服务器管理。
+
+## 安全约定
+
+- 所有凭据（MQTT 密码、MySQL 密码、服务器密码、AI API Key）只放 `.env`，严禁写入代码、文档或提交仓库。
+- `.env` 已加入 `.gitignore`；仓库只提交 `.env.example` 占位模板。
+
+## 工作方式
+
+- 全程中文沟通；设计先行，每阶段先给简明文档再写代码。
+- 每交付一个阶段先自测/自查，再给出可复现的操作步骤。
+- 每一步完成后先汇报，经确认再进入下一步。

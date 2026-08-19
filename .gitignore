@@ -23,6 +23,7 @@ firmware/**/managed_components/
 firmware/**/dependencies.lock
 firmware/**/sdkconfig
 firmware/**/sdkconfig.old
+tools/firmware/*.bin
 
 # ===== Docker 本地数据卷 =====
 server/data/

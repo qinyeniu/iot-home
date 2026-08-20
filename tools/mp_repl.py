@@ -21,7 +21,7 @@ def main() -> None:
     with open(script_path, "r", encoding="utf-8") as f:
         script = f.read()
 
-    p = serial.Serial(port, 115200, timeout=2)
+    p = serial.Serial(port, 115200, timeout=0.3)
     try:
         time.sleep(1)
         p.write(b"\x03")  # Ctrl+C：中断板子上可能正在运行的程序
@@ -31,9 +31,20 @@ def main() -> None:
         time.sleep(0.2)
         p.write(script.encode("utf-8"))
         p.write(b"\x04")  # Ctrl+D：结束粘贴并执行
-        time.sleep(3.0)
-        out = p.read(8192)
-        print(out.decode("utf-8", errors="replace"))
+        # 持续读取直到板子回到 REPL 提示符（>>>），最长等 25 秒
+        out = bytearray()
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            chunk = p.read(4096)
+            if chunk:
+                out.extend(chunk)
+                if out[-20:].find(b">>>") != -1:
+                    break
+            else:
+                time.sleep(0.05)
+        # 直接写原始字节，避免 Windows 控制台 GBK 编码打印 Unicode 符号报错
+        sys.stdout.buffer.write(bytes(out))
+        sys.stdout.buffer.write(b"\r\n")
     finally:
         p.close()
 

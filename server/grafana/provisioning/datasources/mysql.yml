@@ -1,0 +1,13 @@
+apiVersion: 1
+
+datasources:
+  - name: MySQL
+    type: mysql
+    access: proxy
+    url: mysql:3306
+    database: iot_home
+    user: iot_home
+    secureJsonData:
+      password: iot_mysql_2024
+    isDefault: true
+    editable: true

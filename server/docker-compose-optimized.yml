@@ -1,7 +1,7 @@
 ﻿version: '3.8'
 
 services:
-  # MQTT 消息中间件（最小化配置）
+  # MQTT 消息中间件
   mosquitto:
     image: eclipse-mosquitto:2.0
     container_name: iot-mosquitto
@@ -27,7 +27,7 @@ services:
     networks:
       - iot-network
 
-  # MySQL 数据库（优化配置）
+  # MySQL 数据库
   mysql:
     image: mysql:8.0
     container_name: iot-mysql
@@ -43,15 +43,7 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
       - ./mysql/init:/docker-entrypoint-initdb.d
-    command: >
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_unicode_ci
-      --default-authentication-plugin=mysql_native_password
-      --innodb_buffer_pool_size=64M
-      --innodb_log_file_size=16M
-      --max_connections=50
-      --query_cache_type=1
-      --query_cache_size=16M
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-authentication-plugin=mysql_native_password --innodb_buffer_pool_size=64M --max_connections=50
     deploy:
       resources:
         limits:
@@ -63,12 +55,12 @@ services:
     networks:
       - iot-network
     healthcheck:
-      test: mysqladmin ping -h localhost -u root -p$MYSQL_ROOT_PASSWORD
+      test: mysqladmin ping -h localhost -u root -p${MYSQL_ROOT_PASSWORD}
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # FastAPI 后端（最小化配置）
+  # FastAPI 后端
   backend:
     build:
       context: ./backend
@@ -92,10 +84,8 @@ services:
     volumes:
       - ./backend:/app
     depends_on:
-      mosquitto:
-        condition: service_started
-      mysql:
-        condition: service_healthy
+      - mosquitto
+      - mysql
     deploy:
       resources:
         limits:
@@ -107,7 +97,7 @@ services:
     networks:
       - iot-network
 
-  # Grafana 可视化（最小化配置）
+  # Grafana 可视化
   grafana:
     image: grafana/grafana:11.2.0
     container_name: iot-grafana

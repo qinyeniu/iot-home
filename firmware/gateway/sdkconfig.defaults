@@ -1,0 +1,25 @@
+# ESP-IDF SDK Configuration for IoT-Home Gateway
+# Target: ESP32-C6
+
+# Project-specific values are selected in C source/Kconfig; Wi-Fi credentials
+# are provided by main/wifi_secrets.h, which is intentionally not committed.
+
+# Event loop task (Zigbee ZDO signals are dispatched here)
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# Logging
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Partition Table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Flash Size Configuration
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# USB CDC Console
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Coexistence
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y

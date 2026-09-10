@@ -1,143 +1,83 @@
 # IoT-Home 项目进度文档
 
-**最后更新**: 2026-08-26 21:45
-**当前阶段**: 固件开发 - 网关固件
+**最后更新**: 2026-09-10
+**当前阶段**: OLED 已实机目视通过；网关 WiFi 自愈已增强，等待路由器 2.4G 恢复后做 10 分钟稳定观察；Zigbee 端到端待 COM5 烧录验证
 
-## 一、今日完成
+## 一、已完成
 
-### 1. 服务器环境 ✅
-- Docker Desktop 配置完成
-- Mosquitto MQTT 服务运行中
-- MySQL 数据库运行中
-- FastAPI 后端运行中
-- Grafana 可视化运行中
-- 模拟设备测试成功
+### 阶段 0：硬件先行 ✅
+- 可行性分析与采购清单
+- 硬件到货验收
+- I2C 设备扫描验证
 
-### 2. 网关固件项目 ✅
-- ESP-IDF v5.5.4 已安装
-- 项目结构已创建
-- Wi-Fi STA 连接代码已编写
-- MQTT 客户端代码已编写
-- Wi-Fi 配置已修改（SSID: qyn, Password: 20051030）
+### 第 1-2 周：本地 Docker 端到端 ✅
+- Docker 环境配置
+- MQTT、MySQL、FastAPI、Grafana
 
-## 二、当前状态
+### 第 3-4 周：网关固件 ✅
+- Wi-Fi STA 连接
+- MQTT 客户端
+- OLED 状态显示（黄蓝双色）
+- 遥测数据上报
 
-### ESP-IDF 环境
-- 安装位置: C:\Espressif\v5.5.4\esp-idf
-- Python 环境: 已安装，但需要添加到 PATH
-- export.ps1: 需要修复 Python PATH 问题
+### 第 5 周：综合终端 ✅
+- AHT20 温湿度传感器
+- BH1750 光照传感器
+- 继电器控制（GPIO20）
+- Wi-Fi + MQTT 数据上报
 
-### 待解决问题
-- Python 命令找不到（需要添加到 PATH）
-- ESP-IDF 终端无法正常打开
+### 第 5-7 周：Zigbee 组网 ✅
+- 网关协调器 + 终端入网（addr=0x0e8a）
+- 设备加入 MQTT 通知
 
-## 三、明天继续
 
-### 步骤 1：修复 Python PATH
-`powershell
-# 添加 Python 到 PATH
-C:\Users\HJB\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell;C:\Users\HJB\.codex\tmp\arg0\codex-arg03OOfiB;C:\Users\HJB\.cache\codex-runtimes\codex-primary-runtime\dependencies\bin\override;C:\Program Files (x86)\Common Files\Oracle\Java\javapath;F:\xuniji\bin\;C:\Program Files\Common Files\Oracle\Java\javapath;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0\;C:\WINDOWS\System32\OpenSSH\;C:\Users\HJB\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell;C:\Users\Administrator\AppData\Local\Microsoft\WindowsApps;C:\Recovery\OEM\Backup\;C:\Program Files\dotnet\;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0\;C:\WINDOWS\System32\OpenSSH\;F:\web\;C:\Program Files\NVIDIA Corporation\NVIDIA App\NvDLISR;C:\Program Files (x86)\NVIDIA Corporation\PhysX\Common;C:\Program Files\Git\cmd;C:\Program Files\Docker\Docker\resources\bin;C:\Users\HJB\Downloads;f:\trea\Trae\bin;C:\Users\HJB\AppData\Local\Programs\Eclipse Adoptium\jdk-21.0.10.7-hotspot\bin;C:\Program Files\MySQL\MySQL Shell 8.0\bin\;C:\Users\HJB\deveco studio\bin;F:\python\PyCharm 2025.2.1.1\bin;C:\Users\HJB\AppData\Roaming\npm;C:\Users\HJB\AppData\Local\GitHubDesktop\bin;C:\Users\HJB\AppData\Local\Python\bin;C:\Users\HJB\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\HJB\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Python\Python 3.14;C:\Users\HJB\AppData\Local\Microsoft\WindowsApps;F:\IntelliJ IDEA 2025.2.6.1\bin;C:\Users\HJB\AppData\Local\Programs\Warp\bin;C:\Users\HJB\AppData\Local\Python\pythoncore-3.14-64;C:\Users\HJB\AppData\Local\Python\pythoncore-3.14-64\Scripts;C:\Users\HJB\.cache\codex-runtimes\codex-primary-runtime\dependencies\bin\fallback;C:\Users\HJB\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\git\cmd;C:\Program Files\WindowsApps\OpenAI.Codex_26.818.8289.0_x64__2p2nqsd0c76g0\app\resources += ";C:\Espressif\tools\python\v5.5.4\venv\Scripts"
+### 2026-09-10 晚间：OLED 修复与网关 WiFi 自愈增强
+- 官方 `espressif/ssd1306` 1.0.5 文字 API 在本机实机乱码；改为网关内本地 SSD1306 5x7 文本驱动，用户目视确认正常。
+- WiFi 改为全信道扫描、配置仅 RAM 保存，并打印底层断线 reason/rssi。
+- 修复启动看门狗 NVS 计数可能永久停在 2 的问题：改为 RTC 魔数计数，重新断电获得新的 2 次热重启预算，拿 IP 后清零。
+- 实机曾在热重启后拿到 `192.168.10.112` 并连接 MQTT；当前 2.4G AP 不稳定时仍会报 201/36，需要先恢复路由器 2.4G。
+- 详见 `docs/GATEWAY_WIFI_RECOVERY.md`。
 
-# 验证 Python
-python --version
-`
+### 2026-09-09：Zigbee 标准 ZCL 数据传输 🔄 待实机验证
+- 终端 v3.0：EP10 注册 Basic/Identify + 温度(0x0402)/湿度(0x0405)/照度(0x0400)
+  测量 server cluster；每 10s 读传感器并向协调器 0x0000 单播 3 条 Report Attributes
+  （温湿度 0.01 单位，照度按 Zigbee 对数刻度 10000*log10(lux+1)）
+- 网关 v3.1：EP10 注册 Home Gateway device + 三个测量 client cluster；
+  注册统一核心回调 ESP_ZB_CORE_REPORT_ATTR_CB_ID（旧回调写了从未注册，已修复）；
+  按源短地址缓存、2s 聚合成一条 MQTT；修复转发 JSON 与后端不兼容问题
+  （后端只入库 data 字段）；设备加入通知改发 nodes/zb-{addr}/status；
+  OLED 底行显示 ZB 节点数
+- 两个工程均 idf.py build 通过（esp-zigbee-lib 1.6.0 API 已对照头文件）
+- 设计文档: docs/ZIGBEE数据传输设计.md
+- ⚠️ 尚未烧录实测，按项目原则不算完成
 
-### 步骤 2：设置 ESP-IDF 环境
-`powershell
-cd C:\Espressif\v5.5.4\esp-idf
-.\export.ps1
-`
+## 二、当前硬件
 
-### 步骤 3：编译固件
-`powershell
-cd C:\Users\HJB\Documents\iot-home\firmware\gateway
-idf.py build
-`
+| 设备 | 串口 | 说明 |
+|------|------|------|
+| 网关 ESP32-C6 | COM6 | 协调器 + Wi-Fi + MQTT + OLED |
+| Zigbee 终端 ESP32-C6 | COM5 | AHT20 + BH1750，ED 模式 |
 
-### 步骤 4：烧录固件
-`powershell
-idf.py -p COM3 flash
-`
+- 服务器: API http://8.163.110.27:8000 / Grafana :3000 / MQTT :1883
 
-### 步骤 5：查看日志
-`powershell
-idf.py -p COM3 monitor
-`
+## 三、下一步实测（Zigbee 端到端验收）
 
-## 四、重要文件位置
+1. 烧录网关: `cd firmware/gateway; idf.py -p COM6 flash monitor`
+2. 烧录终端: `cd firmware/node_zigbee; idf.py -p COM5 flash monitor`
+3. 验收点：
+   - 终端日志: 周期 DATA JSON + 无 ZCL 报错
+   - 网关日志: `ZCL report from 0x....: cluster=0x0402/0405/0400`
+     和 `MQTT -> nodes/zb-xxxx/telemetry: {"data":{...}}`
+   - MQTT 订阅 `iot-home/gw-001/nodes/#` 看到聚合数据
+   - 后端日志"遥测数据已保存: gw-001-zb-xxxx"，API/Grafana 可查
+   - 连续观察 10 分钟稳定性
+4. 实测通过后：深度睡眠低功耗（见 ZIGBEE_LOW_POWER_DESIGN.md）、多终端、命令下发
 
-### 服务器环境
-- 项目目录: C:\Users\HJB\Documents\iot-home
-- 启动脚本: server\start-simple.bat
-- 配置文件: server\.env
+## 四、参考文档
 
-### 固件开发
-- 网关固件: firmware\gateway
-- 主程序: firmware\gateway\main\main.c
-- 配置文件: firmware\gateway\sdkconfig.defaults
-- ESP-IDF: C:\Espressif\v5.5.4\esp-idf
-
-## 五、Wi-Fi 配置
-
-`properties
-CONFIG_ESP_WIFI_SSID="qyn"
-CONFIG_ESP_WIFI_PASSWORD="20051030"
-`
-
-## 六、MQTT 配置
-
-`c
-#define MQTT_BROKER_URI "mqtt://localhost:1883"
-#define MQTT_TOPIC_PREFIX "iot-home/gw-001"
-`
-
-## 七、预期结果
-
-烧录成功后，你会看到：
-`
-IoT-Home Gateway Starting...
-Initializing WiFi...
-connected to ap SSID:qyn
-Initializing MQTT...
-MQTT_EVENT_CONNECTED
-Gateway initialized successfully!
-`
-
-## 八、故障排除
-
-### 问题：Python 命令找不到
-解决：添加到 PATH
-`powershell
-C:\Users\HJB\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell;C:\Users\HJB\.codex\tmp\arg0\codex-arg03OOfiB;C:\Users\HJB\.cache\codex-runtimes\codex-primary-runtime\dependencies\bin\override;C:\Program Files (x86)\Common Files\Oracle\Java\javapath;F:\xuniji\bin\;C:\Program Files\Common Files\Oracle\Java\javapath;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0\;C:\WINDOWS\System32\OpenSSH\;C:\Users\HJB\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell;C:\Users\Administrator\AppData\Local\Microsoft\WindowsApps;C:\Recovery\OEM\Backup\;C:\Program Files\dotnet\;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0\;C:\WINDOWS\System32\OpenSSH\;F:\web\;C:\Program Files\NVIDIA Corporation\NVIDIA App\NvDLISR;C:\Program Files (x86)\NVIDIA Corporation\PhysX\Common;C:\Program Files\Git\cmd;C:\Program Files\Docker\Docker\resources\bin;C:\Users\HJB\Downloads;f:\trea\Trae\bin;C:\Users\HJB\AppData\Local\Programs\Eclipse Adoptium\jdk-21.0.10.7-hotspot\bin;C:\Program Files\MySQL\MySQL Shell 8.0\bin\;C:\Users\HJB\deveco studio\bin;F:\python\PyCharm 2025.2.1.1\bin;C:\Users\HJB\AppData\Roaming\npm;C:\Users\HJB\AppData\Local\GitHubDesktop\bin;C:\Users\HJB\AppData\Local\Python\bin;C:\Users\HJB\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\HJB\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Python\Python 3.14;C:\Users\HJB\AppData\Local\Microsoft\WindowsApps;F:\IntelliJ IDEA 2025.2.6.1\bin;C:\Users\HJB\AppData\Local\Programs\Warp\bin;C:\Users\HJB\AppData\Local\Python\pythoncore-3.14-64;C:\Users\HJB\AppData\Local\Python\pythoncore-3.14-64\Scripts;C:\Users\HJB\.cache\codex-runtimes\codex-primary-runtime\dependencies\bin\fallback;C:\Users\HJB\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\git\cmd;C:\Program Files\WindowsApps\OpenAI.Codex_26.818.8289.0_x64__2p2nqsd0c76g0\app\resources += ";C:\Espressif\tools\python\v5.5.4\venv\Scripts"
-`
-
-### 问题：export.ps1 失败
-解决：使用完整路径
-`powershell
-& "C:\Espressif\tools\python\v5.5.4\venv\Scripts\python.exe" "tools/activate.py" --export
-`
-
-### 问题：编译失败
-解决：确保 ESP-IDF 环境正确设置
-
-### 问题：烧录失败
-解决：按住 BOOT 按钮再插入 USB
-
-## 九、下一步计划
-
-1. ✅ 服务器环境搭建
-2. ✅ 网关固件项目创建
-3. ⏳ 修复 ESP-IDF 环境问题
-4. ⏳ 编译和烧录网关固件
-5. ⏳ 测试 Wi-Fi 和 MQTT 连接
-6. ⏳ 实现 Zigbee 协调器
-7. ⏳ 实现 OLED 状态显示
-8. ⏳ 开发传感器终端固件
-9. ⏳ 开发开关终端固件
-10. ⏳ 实现 Zigbee 组网
-
-## 十、参考资源
-
-- ESP-IDF 安装文档: docs\ESP-IDF工具链安装.md
-- 网关固件说明: firmware\gateway\README.md
-- 服务器环境: server\README.md
+- Zigbee 数据传输设计: docs/ZIGBEE数据传输设计.md
+- 项目总结: docs/PROJECT_SUMMARY.md
+- Zigbee 低功耗设计: docs/ZIGBEE_LOW_POWER_DESIGN.md
+- 双项目切换: docs/双项目切换指南.md
+- OLED 技术文档: docs/hardware/OLED技术文档.md
+- 网关开发配置: firmware/gateway/DEV_CONFIG.md

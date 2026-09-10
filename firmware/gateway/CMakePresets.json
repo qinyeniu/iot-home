@@ -1,0 +1,70 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default (development)",
+      "description": "Development configuration",
+      "binaryDir": "${sourceDir}/build/default",
+      "cacheVariables": {
+        "SDKCONFIG": "${sourceDir}/build/default/sdkconfig",
+        "IDF_TARGET": "esp32c6"
+      },
+      "vendor": {
+        "espressif/vscode-esp-idf": {
+          "schemaVersion": 1,
+          "settings": [
+            {
+              "type": "openOCD",
+              "value": {
+                "debugLevel": 2,
+                "configs": [
+                  "board/esp32c6-builtin.cfg"
+                ],
+                "args": []
+              }
+            }
+          ]
+        }
+      },
+      "environment": {
+        "OPENOCD_USB_ADAPTER_LOCATION": "1-4.3"
+      }
+    },
+    {
+      "name": "production",
+      "displayName": "Production",
+      "description": "Production configuration",
+      "binaryDir": "${sourceDir}/build/production",
+      "cacheVariables": {
+        "SDKCONFIG": "${sourceDir}/build/production/sdkconfig",
+        "IDF_TARGET": "esp32c6"
+      },
+      "vendor": {
+        "espressif/vscode-esp-idf": {
+          "schemaVersion": 1,
+          "settings": [
+            {
+              "type": "openOCD",
+              "value": {
+                "debugLevel": 2,
+                "configs": [
+                  "board/esp32c6-builtin.cfg"
+                ],
+                "args": []
+              }
+            }
+          ]
+        }
+      },
+      "environment": {
+        "OPENOCD_USB_ADAPTER_LOCATION": "1-4"
+      }
+    }
+  ]
+}

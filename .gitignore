@@ -20,7 +20,7 @@ node_modules/
 # ===== ESP-IDF / ESP32 固件 =====
 firmware/**/build/
 firmware/**/managed_components/
-firmware/**/dependencies.lock
+# dependencies.lock files are tracked for reproducible component versions
 firmware/**/sdkconfig
 firmware/**/sdkconfig.old
 tools/firmware/*.bin
@@ -42,3 +42,11 @@ hardware/**/fp-info-cache
 *.swp
 .DS_Store
 Thumbs.db
+
+# Local firmware secrets
+firmware/**/main/wifi_secrets.h
+
+# One-off debugging backups (Git tags/commits are the version checkpoint)
+*.bak
+firmware/gateway/main/main_backup.c
+firmware/gateway/main/main_v2.c

@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -24,6 +25,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_sleep.h"
 #include "nvs_flash.h"
 #include "mqtt_client.h"
 #include "driver/i2c.h"
@@ -38,6 +40,8 @@
 #define WIFI_RETRY_MAX_MS       60000
 #define WIFI_BOOT_GRACE_MS      25000   // if not associated this long after boot,
 #define WIFI_BOOT_MAX_RESTARTS  2       // warm-reboot (caps cold-boot radio glitch)
+#define WIFI_RF_EMPTY_LIMIT     3       // zero-AP scans before deep-sleep RF reset
+#define WIFI_RF_SLEEP_US        (2000000ULL)
 
 #define MQTT_BROKER_URI         "mqtt://8.163.110.27:1883"
 #define MQTT_TOPIC_PREFIX       "iot-home/gw-001"
@@ -528,6 +532,96 @@ static void boot_restart_count_set(int v)
     s_wifi_boot_reboots = v;
 }
 
+static int s_rf_empty_scans = 0;
+
+// A normal router outage still leaves many neighboring 2.4GHz APs visible. If
+// an active scan sees zero APs repeatedly, the Wi-Fi/RF subsystem is wedged in
+// the state observed on 2026-09-10: esp_restart()/RTS did not recover it, but
+// removing USB power did. Deep sleep powers down the modem much harder than a
+// software restart and then timer-wakes the gateway automatically.
+static void wifi_rf_deep_sleep_recovery(void)
+{
+    ESP_LOGE(TAG, "RF health: no APs on %d full scans; deep sleep %.1fs to power-cycle RF",
+             WIFI_RF_EMPTY_LIMIT, WIFI_RF_SLEEP_US / 1000000.0f);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_wifi_deinit();
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+    esp_sleep_enable_timer_wakeup(WIFI_RF_SLEEP_US);
+    esp_deep_sleep_start();
+}
+
+// Returns true when at least one surrounding AP is visible. A successful scan
+// proves RF reception works even if the home router itself is temporarily off.
+static bool wifi_rf_health_scan(void)
+{
+    wifi_scan_config_t scan_cfg = {
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 120,
+        .scan_time.active.max = 300,
+    };
+
+    // A blocked active scan cannot run while an association attempt owns the
+    // STA state. Disconnect here only for the diagnostic; the reconnect loop
+    // starts a normal connection immediately after this health check.
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RF health scan failed to start: %s", esp_err_to_name(err));
+        return false;  // Scan failure is not evidence that RF is dead.
+    }
+
+    uint16_t ap_count = 0;
+    err = esp_wifi_scan_get_ap_num(&ap_count);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RF health scan count failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    bool target_visible = false;
+    if (ap_count > 0) {
+        wifi_ap_record_t *aps = calloc(ap_count, sizeof(wifi_ap_record_t));
+        if (aps != NULL) {
+            uint16_t got = ap_count;
+            err = esp_wifi_scan_get_ap_records(&got, aps);
+            if (err == ESP_OK) {
+                for (int i = 0; i < got; ++i) {
+                    if (strcmp((const char *)aps[i].ssid, WIFI_SSID) == 0) {
+                        target_visible = true;
+                    }
+                }
+            } else {
+                ESP_LOGW(TAG, "RF health scan records failed: %s", esp_err_to_name(err));
+            }
+            free(aps);
+        } else {
+            esp_wifi_clear_ap_list();
+            ESP_LOGW(TAG, "RF health scan could not allocate %u records", ap_count);
+        }
+    }
+
+    if (ap_count > 0) {
+        s_rf_empty_scans = 0;
+        ESP_LOGI(TAG, "RF health scan OK: %u AP(s), target %s",
+                 ap_count, target_visible ? "VISIBLE" : "not visible");
+        return true;
+    }
+
+    s_rf_empty_scans++;
+    ESP_LOGW(TAG, "RF health scan empty %d/%d (target router off would still show neighbors)",
+             s_rf_empty_scans, WIFI_RF_EMPTY_LIMIT);
+    if (s_rf_empty_scans >= WIFI_RF_EMPTY_LIMIT) {
+        wifi_rf_deep_sleep_recovery();
+    }
+    return false;
+}
+
 // Dedicated WiFi reconnect task with exponential backoff.
 // Kept out of the system event loop so Zigbee signals are never blocked.
 static void wifi_reconnect_task(void *arg)
@@ -539,6 +633,14 @@ static void wifi_reconnect_task(void *arg)
             int delay = WIFI_RETRY_BASE_MS * (1 << shift);
             if (delay > WIFI_RETRY_MAX_MS) delay = WIFI_RETRY_MAX_MS;
             ESP_LOGW(TAG, "WiFi lost, retry %d in %dms", s_wifi_retry, delay);
+
+            // Check the whole 2.4GHz environment, not only the target SSID:
+            // neighbors visible + target absent means wait for the router;
+            // zero APs repeatedly means the local RF needs a deep power reset.
+            if ((s_wifi_retry >= 2 && s_wifi_retry <= 4) ||
+                (s_wifi_retry >= 8 && (s_wifi_retry % 4) == 0)) {
+                wifi_rf_health_scan();
+            }
 
             // Boot watchdog: if the radio never associated since power-on
             // (cold-boot RF glitch), perform a warm reboot like pressing RST.
@@ -596,6 +698,7 @@ static void wifi_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
         ESP_LOGI(TAG, "WiFi OK, IP: %s", s_ip);
         s_wifi_retry = 0;
+        s_rf_empty_scans = 0;
         s_wifi_ok = true;
         if (!s_wifi_ever_connected) {
             s_wifi_ever_connected = true;
@@ -614,7 +717,10 @@ static void wifi_start(void)
     esp_netif_create_default_wifi_sta();
     
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    esp_err_t err = esp_wifi_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(err));
+    }
 
     
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_cb, NULL, NULL);
@@ -646,6 +752,31 @@ static void wifi_start(void)
         },
     };
     esp_wifi_set_mode(WIFI_MODE_STA);
+
+    // Chinese home routers may select channel 12/13. The IDF default [01]
+    // scans only 1-11; explicitly allow the CN 2.4GHz channel range.
+    wifi_country_t country = {
+        .cc = {'C', 'N'},
+        .schan = 1,
+        .nchan = 13,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL,
+    };
+    err = esp_wifi_set_country(&country);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi set country failed: %s", esp_err_to_name(err));
+    }
+
+    // Give each active scan a little more time to catch a beacon in a busy
+    // apartment RF environment. This applies to internal connection scans too.
+    wifi_scan_default_params_t scan_params = {
+        .scan_time.active.min = 0,
+        .scan_time.active.max = 300,
+        .home_chan_dwell_time = 30,
+    };
+    err = esp_wifi_set_scan_parameters(&scan_params);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi set scan parameters failed: %s", esp_err_to_name(err));
+    }
 
     // Phone hotspots and some APs mishandle modem-sleep beacon timing, which
     // silently drops the TCP SYN and MQTT never connects. Keep the radio awake.

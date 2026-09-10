@@ -533,6 +533,7 @@ static void boot_restart_count_set(int v)
 }
 
 static int s_rf_empty_scans = 0;
+static bool s_rf_environment_alive = false;
 
 // A normal router outage still leaves many neighboring 2.4GHz APs visible. If
 // an active scan sees zero APs repeatedly, the Wi-Fi/RF subsystem is wedged in
@@ -608,11 +609,13 @@ static bool wifi_rf_health_scan(void)
 
     if (ap_count > 0) {
         s_rf_empty_scans = 0;
+        s_rf_environment_alive = true;
         ESP_LOGI(TAG, "RF health scan OK: %u AP(s), target %s",
                  ap_count, target_visible ? "VISIBLE" : "not visible");
         return true;
     }
 
+    s_rf_environment_alive = false;
     s_rf_empty_scans++;
     ESP_LOGW(TAG, "RF health scan empty %d/%d (target router off would still show neighbors)",
              s_rf_empty_scans, WIFI_RF_EMPTY_LIMIT);
@@ -647,14 +650,18 @@ static void wifi_reconnect_task(void *arg)
             if (!s_wifi_ever_connected &&
                 (int64_t)esp_timer_get_time() / 1000 > WIFI_BOOT_GRACE_MS) {
                 int cnt = boot_restart_count_get();
-                if (cnt < WIFI_BOOT_MAX_RESTARTS) {
+                if (s_rf_environment_alive) {
+                    ESP_LOGI(TAG,
+                             "Boot watchdog hold: nearby APs are visible; target SSID absent or association pending, no reboot");
+                } else if (cnt < WIFI_BOOT_MAX_RESTARTS) {
                     boot_restart_count_set(cnt + 1);
                     ESP_LOGW(TAG, "WiFi boot watchdog: warm reboot %d/%d",
                              cnt + 1, WIFI_BOOT_MAX_RESTARTS);
                     vTaskDelay(pdMS_TO_TICKS(200));
                     esp_restart();
+                } else {
+                    ESP_LOGE(TAG, "WiFi still down after %d warm reboots; keep retrying", cnt);
                 }
-                ESP_LOGE(TAG, "WiFi still down after %d warm reboots; keep retrying", cnt);
             }
 
             vTaskDelay(pdMS_TO_TICKS(delay));
@@ -699,6 +706,7 @@ static void wifi_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGI(TAG, "WiFi OK, IP: %s", s_ip);
         s_wifi_retry = 0;
         s_rf_empty_scans = 0;
+        s_rf_environment_alive = true;
         s_wifi_ok = true;
         if (!s_wifi_ever_connected) {
             s_wifi_ever_connected = true;
@@ -766,8 +774,14 @@ static void wifi_start(void)
         ESP_LOGW(TAG, "WiFi set country failed: %s", esp_err_to_name(err));
     }
 
-    // Give each active scan a little more time to catch a beacon in a busy
-    // apartment RF environment. This applies to internal connection scans too.
+    // Phone hotspots and some APs mishandle modem-sleep beacon timing, which
+    // silently drops the TCP SYN and MQTT never connects. Keep the radio awake.
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    esp_wifi_start();
+
+    // The STA must be started before changing default scan timing. A longer
+    // active scan helps in crowded 2.4GHz environments and on channels 12/13.
     wifi_scan_default_params_t scan_params = {
         .scan_time.active.min = 0,
         .scan_time.active.max = 300,
@@ -778,11 +792,6 @@ static void wifi_start(void)
         ESP_LOGW(TAG, "WiFi set scan parameters failed: %s", esp_err_to_name(err));
     }
 
-    // Phone hotspots and some APs mishandle modem-sleep beacon timing, which
-    // silently drops the TCP SYN and MQTT never connects. Keep the radio awake.
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
-    esp_wifi_start();
     ESP_LOGI(TAG, "WiFi starting: %s", WIFI_SSID);
 }
 

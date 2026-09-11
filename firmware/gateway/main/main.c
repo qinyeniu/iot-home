@@ -958,6 +958,13 @@ void app_main(void)
         nvs_flash_erase();
         nvs_flash_init();
     }
+
+#if CONFIG_ESP_COEX_SW_COEXIST_ENABLE && CONFIG_SOC_IEEE802154_SUPPORTED
+    // Required when the same ESP32-C6 radio runs Wi-Fi and Zigbee/802.15.4.
+    // Mirrors the ESP-IDF Thread border-router example.
+    ESP_ERROR_CHECK(esp_coex_wifi_i154_enable());
+    ESP_LOGI(TAG, "Wi-Fi/IEEE 802.15.4 coexistence enabled");
+#endif
     
     // I2C
     i2c_config_t i2c_cfg = {

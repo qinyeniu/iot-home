@@ -1,7 +1,8 @@
-﻿version: '3.8'
+version: '3.8'
 
 services:
-  # MQTT 娑堟伅涓棿浠?  mosquitto:
+  # MQTT broker
+  mosquitto:
     image: eclipse-mosquitto:2.0
     container_name: iot-mosquitto
     restart: unless-stopped
@@ -18,7 +19,8 @@ services:
     networks:
       - iot-network
 
-  # MySQL 鏁版嵁搴?  mysql:
+  # MySQL database
+  mysql:
     image: mysql:8.0
     container_name: iot-mysql
     restart: unless-stopped
@@ -70,10 +72,22 @@ services:
         condition: service_started
       mysql:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.15'
+          memory: 160M
     networks:
       - iot-network
 
-  # Grafana 鍙鍖?  grafana:
+  # Grafana dashboard
+  grafana:
     image: grafana/grafana:11.2.0
     container_name: iot-grafana
     restart: unless-stopped

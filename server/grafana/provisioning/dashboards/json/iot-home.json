@@ -305,7 +305,7 @@
           "group": [],
           "metricColumn": "metric",
           "rawQuery": true,
-          "rawSql": "SELECT\n  ts AS time,\n  metric,\n  value\nFROM metrics\nWHERE\n  device_id = '$device_id'\n  AND metric = 'light'\n  AND ts >= NOW() - INTERVAL $hours HOUR\nORDER BY ts",
+          "rawSql": "SELECT\n  ts AS time,\n  metric,\n  value\nFROM metrics\nWHERE\n  device_id = '$device_id'\n  AND metric = 'lux'\n  AND ts >= NOW() - INTERVAL $hours HOUR\nORDER BY ts",
           "refId": "A",
           "select": [
             [
@@ -430,7 +430,7 @@
         "allValue": null,
         "current": {},
         "datasource": "MySQL",
-        "definition": "SELECT DISTINCT device_id FROM metrics",
+        "definition": "SELECT device_id FROM metrics GROUP BY device_id ORDER BY MAX(ts) DESC",
         "description": "设备ID",
         "error": null,
         "hide": 0,
@@ -439,7 +439,7 @@
         "multi": false,
         "name": "device_id",
         "options": [],
-        "query": "SELECT DISTINCT device_id FROM metrics",
+        "query": "SELECT device_id FROM metrics GROUP BY device_id ORDER BY MAX(ts) DESC",
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,

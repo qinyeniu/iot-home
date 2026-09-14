@@ -17,6 +17,7 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_zigbee_core.h"
+#include "nwk/esp_zigbee_nwk.h"
 #include "driver/i2c.h"
 
 // ==================== Configuration ====================
@@ -35,7 +36,7 @@
 #define COORDINATOR_SHORT_ADDR  0x0000
 
 #define INSTALLCODE_POLICY      false
-#define ESP_ZB_CHANNEL_MASK     (1l << 25)
+#define ESP_ZB_CHANNEL_MASK     (1l << 26)
 
 // Zigbee End Device config
 #define ESP_ZB_ZED_CONFIG()                         \
@@ -192,6 +193,11 @@ static esp_zb_ep_list_t *create_sensor_ep(void)
 
 // ==================== Zigbee signals ====================
 
+static void bdb_commissioning_cb(uint8_t mode_mask)
+{
+    esp_zb_bdb_start_top_level_commissioning(mode_mask);
+}
+
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 {
     uint32_t *p_sg_p = signal_struct->p_app_signal;
@@ -217,7 +223,14 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 ESP_LOGI(TAG, "Zigbee: Short addr=0x%04x", s_short_addr);
             }
         } else {
-            ESP_LOGE(TAG, "Zigbee: Failed to start");
+            ESP_LOGW(TAG, "Zigbee: Startup/rejoin failed (0x%x), retry steering", (unsigned)err_status);
+            // A previously commissioned ZED first attempts a silent rejoin.
+            // If that parent/rejoin attempt fails, explicitly run network
+            // steering instead of waiting forever for another signal.
+            if (sig_type == ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT) {
+                esp_zb_scheduler_alarm(bdb_commissioning_cb,
+                                       ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+            }
         }
         break;
     case ESP_ZB_BDB_SIGNAL_STEERING:
@@ -226,10 +239,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             s_zigbee_connected = true;
             s_short_addr = esp_zb_get_short_address();
             ESP_LOGI(TAG, "Zigbee: Short addr=0x%04x", s_short_addr);
+            esp_zb_scheduler_alarm_cancel(bdb_commissioning_cb,
+                                          ESP_ZB_BDB_MODE_NETWORK_STEERING);
         } else {
-            ESP_LOGW(TAG, "Zigbee: Steering failed, retry in 5s");
-            vTaskDelay(pdMS_TO_TICKS(5000));
-            esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            ESP_LOGW(TAG, "Zigbee: Steering failed (0x%x), retry in 5s", (unsigned)err_status);
+            esp_zb_scheduler_alarm(bdb_commissioning_cb,
+                                   ESP_ZB_BDB_MODE_NETWORK_STEERING, 5000);
         }
         break;
     default:
@@ -245,6 +260,9 @@ static void zigbee_task(void *arg)
 
     esp_zb_cfg_t zb_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_cfg);
+    // Temporary diagnostic: keep this ZED receiver on instead of sleepy polling.
+    esp_zb_set_rx_on_when_idle(true);
+    ESP_LOGI(TAG, "RX-on-when-idle=%d", esp_zb_get_rx_on_when_idle());
     esp_zb_set_primary_network_channel_set(ESP_ZB_CHANNEL_MASK);
     esp_zb_device_register(create_sensor_ep());
     esp_zb_start(false);
@@ -352,6 +370,18 @@ void app_main(void)
     i2c_param_config(I2C_NUM_0, &i2c_cfg);
     i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
     ESP_LOGI(TAG, "I2C init OK (SDA=%d SCL=%d)", I2C_SDA_PIN, I2C_SCL_PIN);
+
+    // Temporary wiring diagnostic: scan bus for AHT20 (0x38) / BH1750 (0x23)
+    for (uint8_t a = 1; a < 127; a++) {
+        i2c_cmd_handle_t hh = i2c_cmd_link_create();
+        i2c_master_start(hh);
+        i2c_master_write_byte(hh, (a << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(hh);
+        esp_err_t r = i2c_master_cmd_begin(I2C_NUM_0, hh, pdMS_TO_TICKS(50));
+        i2c_cmd_link_delete(hh);
+        if (r == ESP_OK) ESP_LOGW(TAG, "I2C SCAN: found 0x%02x", a);
+    }
+    ESP_LOGW(TAG, "I2C SCAN: expect AHT20=0x38 BH1750=0x23");
 
     xTaskCreate(zigbee_task, "zigbee", 16384, NULL, 5, NULL);
     xTaskCreate(sensor_task, "sensor", 4096, NULL, 5, NULL);

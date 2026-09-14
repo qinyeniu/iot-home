@@ -19,6 +19,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "esp_system.h"
 #include "esp_attr.h"
 #include "esp_wifi.h"
@@ -27,10 +28,12 @@
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "mqtt_client.h"
 #include "driver/i2c.h"
 #include "esp_zigbee_core.h"
 #include "esp_coexist.h"
+#include "esp_ieee802154.h"
 #include "wifi_secrets.h"
 
 // ==================== Configuration ====================
@@ -45,6 +48,7 @@
 
 #define MQTT_BROKER_URI         "mqtt://8.163.110.27:1883"
 #define MQTT_TOPIC_PREFIX       "iot-home/gw-001"
+#define MQTT_GW_STATUS_SUFFIX   "nodes/gw-001/status"
 
 #define I2C_SDA_PIN             2
 #define I2C_SCL_PIN             3
@@ -73,9 +77,47 @@ static esp_mqtt_client_handle_t s_mqtt = NULL;
 static bool s_wifi_ok = false;
 static bool s_mqtt_ok = false;
 static char s_ip[16] = "0.0.0.0";
+static bool s_network_formed = false;
+static bool s_child_seen = false;
 static bool s_zigbee_ok = false;
-static int s_zigbee_devices = 0;
+static volatile int s_zigbee_devices = 0;
+static volatile bool s_zb_status_resync = false;
 static bool s_oled_available = false;
+
+// ZBOSS may deliver some signals with task preemption disabled.  Keep those
+// callbacks free of ESP_LOG/newlib/MQTT and hand a small copied event to a
+// normal task.  Recursive VFS locks (USB serial logging) in that context call
+// abort() with "recursive mutexes make no sense in ISR context".
+typedef enum {
+    ZB_APP_EVENT_JOIN = 1,
+    ZB_APP_EVENT_REPORT,
+    ZB_APP_EVENT_LEAVE,
+} zb_app_event_type_t;
+
+typedef struct {
+    zb_app_event_type_t type;
+    uint16_t addr;
+    uint16_t cluster;
+    uint16_t raw;
+    uint8_t ieee[8];
+} zb_app_event_t;
+
+static QueueHandle_t s_zb_app_q;
+static uint32_t s_zb_report_events;
+
+static void zb_app_event_send(const zb_app_event_t *event)
+{
+    if (s_zb_app_q == NULL) {
+        return;
+    }
+    if (xPortCanYield()) {
+        (void)xQueueSend(s_zb_app_q, event, 0);
+    } else {
+        BaseType_t higher_woken = pdFALSE;
+        (void)xQueueSendFromISR(s_zb_app_q, event, &higher_woken);
+        portYIELD_FROM_ISR(higher_woken);
+    }
+}
 
 // ==================== OLED SSD1306 ====================
 // Minimal local text driver for this 128x64 yellow/blue SSD1306 panel.
@@ -279,7 +321,11 @@ static void oled_text(int x, int y, const char *s)
 
 #define MAX_CHILDREN                10
 #define INSTALLCODE_POLICY_ENABLE   false
-#define ESP_ZB_CHANNEL_MASK         (1l << 25)  // Channel 25
+#define ESP_ZB_CHANNEL_MASK         (1l << 26)  // Channel 26
+#define ZB_ONLY_RF_DIAG             0  // Temporary RF/coexistence diagnostic
+#define ZB_JOIN_BEFORE_WIFI         1  // Commission on 802.15.4 before enabling Wi-Fi
+#define ZB_JOIN_FIRST_TIMEOUT_MS    180000
+#define ZB_REJOIN_FIRST_TIMEOUT_MS  180000
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 {
@@ -296,12 +342,19 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
         if (err_status == ESP_OK) {
             ESP_LOGI(TAG, "Zigbee: Device started");
-            if (esp_zb_bdb_is_factory_new()) {
-                ESP_LOGI(TAG, "Zigbee: Start network formation");
-                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_FORMATION);
-            } else {
+            // Formation is driven by our own NVS flag: after a full flash
+            // erase some ZBOSS builds signal DEVICE_REBOOT on blank NVRAM and
+            // skip formation, leaving the coordinator beaconless (nodes saw
+            // "Can't find PAN"). Force formation until we have persisted one.
+            if (s_network_formed) {
                 ESP_LOGI(TAG, "Zigbee: Rebooted, open network");
+                ESP_LOGI(TAG, "Zigbee: PANID=0x%04x channel=%d",
+                         (unsigned)esp_zb_get_pan_id(),
+                         (int)esp_zb_get_current_channel());
                 esp_zb_bdb_open_network(180);
+            } else {
+                ESP_LOGI(TAG, "Zigbee: Start network formation (flag absent)");
+                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_FORMATION);
             }
         } else {
             ESP_LOGE(TAG, "Zigbee: Failed to start (status: %s)", esp_err_to_name(err_status));
@@ -310,7 +363,18 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_FORMATION:
         if (err_status == ESP_OK) {
             ESP_LOGI(TAG, "Zigbee: Network formed!");
+            ESP_LOGI(TAG, "Zigbee: PANID=0x%04x channel=%d mask=0x%lx",
+                     (unsigned)esp_zb_get_pan_id(),
+                     (int)esp_zb_get_current_channel(),
+                     (unsigned long)esp_zb_get_channel_mask());
             s_zigbee_ok = true;
+            s_network_formed = true;
+            nvs_handle_t nvh;
+            if (nvs_open("gwzb", NVS_READWRITE, &nvh) == ESP_OK) {
+                nvs_set_u8(nvh, "formed", 1);
+                nvs_commit(nvh);
+                nvs_close(nvh);
+            }
             esp_zb_bdb_open_network(180);
         } else {
             ESP_LOGE(TAG, "Zigbee: Formation failed, retrying...");
@@ -319,31 +383,32 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         break;
     case ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE:
         {
-            esp_zb_zdo_signal_device_annce_params_t *params = 
+            // This signal has been observed arriving in a non-preemptible ZBOSS
+            // context. Copy it and defer logging/MQTT to a regular task.
+            esp_zb_zdo_signal_device_annce_params_t *params =
                 (esp_zb_zdo_signal_device_annce_params_t *)esp_zb_app_signal_get_params(p_sg_p);
-            ESP_LOGI(TAG, "Zigbee: Device joined! addr=0x%04x", params->device_short_addr);
-            s_zigbee_devices++;
-            
-            // 通知服务器有新设备加入
-            if (s_mqtt_ok) {
-                char data[128];
-                char topic_suffix[40];
-                snprintf(topic_suffix, sizeof(topic_suffix), "nodes/zb-%04x/status", params->device_short_addr);
-                snprintf(data, sizeof(data),
-                    "{\"status\":\"online\",\"event\":\"device_joined\",\"ieee\":\"%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\"}",
-                    params->ieee_addr[7], params->ieee_addr[6], params->ieee_addr[5], params->ieee_addr[4],
-                    params->ieee_addr[3], params->ieee_addr[2], params->ieee_addr[1], params->ieee_addr[0]);
-                mqtt_pub(topic_suffix, data);
-                ESP_LOGI(TAG, "MQTT: Device joined notification sent");
+            if (params != NULL) {
+                zb_app_event_t event = {
+                    .type = ZB_APP_EVENT_JOIN,
+                    .addr = params->device_short_addr,
+                };
+                memcpy(event.ieee, params->ieee_addr, sizeof(event.ieee));
+                zb_app_event_send(&event);
             }
         }
         break;
     case ESP_ZB_ZDO_SIGNAL_LEAVE_INDICATION:
         {
+            // Like device announce, defer table mutation/logging/MQTT out of ZBOSS context.
             esp_zb_zdo_signal_leave_indication_params_t *params =
                 (esp_zb_zdo_signal_leave_indication_params_t *)esp_zb_app_signal_get_params(p_sg_p);
-            ESP_LOGI(TAG, "Zigbee: Device left! addr=0x%04x", params->device_addr);
-            if (s_zigbee_devices > 0) s_zigbee_devices--;
+            if (params != NULL) {
+                zb_app_event_t event = {
+                    .type = ZB_APP_EVENT_LEAVE,
+                };
+                memcpy(event.ieee, params->device_addr, sizeof(event.ieee));
+                zb_app_event_send(&event);
+            }
         }
         break;
     default:
@@ -359,16 +424,23 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 #define ZB_MASK_TEMP                0x01
 #define ZB_MASK_HUM                 0x02
 #define ZB_MASK_LUX                 0x04
+#define ZB_MASK_ALL                 (ZB_MASK_TEMP | ZB_MASK_HUM | ZB_MASK_LUX)
 #define ZB_TEMP_INVALID             ((int16_t)0x8000)
 #define ZB_VALUE_INVALID            0xFFFF
+#define ZB_REPORT_PARTIAL_DELAY_MS  30000
+#define ZB_TELEMETRY_DEDUP_MS       9000
 
 typedef struct {
     uint16_t addr;          // 0 = free slot
     int16_t  temp_raw;      // 0.01 C
     uint16_t hum_raw;       // 0.01 %
     uint16_t lux_raw;       // Zigbee log scale: 10000 * log10(lux + 1)
-    uint8_t  valid;        // fields ever received
-    uint8_t  dirty;        // fields updated since last MQTT publish
+    uint8_t  ieee[8];       // extended address, used for retained status
+    uint8_t  valid;         // fields ever received
+    uint8_t  dirty;         // fields updated since last MQTT publish
+    uint8_t  active;        // currently joined child
+    uint32_t first_dirty_ms;
+    uint32_t last_report_ms;
 } zb_node_t;
 
 static zb_node_t s_zb_nodes[MAX_ZB_NODES];
@@ -383,66 +455,56 @@ static zb_node_t *zb_node_get_or_create(uint16_t addr)
     }
     if (free_slot) {
         free_slot->addr = addr;
-        ESP_LOGI(TAG, "Zigbee: new reporting node 0x%04x", addr);
     }
     return free_slot;
 }
 
-// Unified ZCL core callback (runs in ZBOSS thread: only cache data, do not block)
+// Unified ZCL core callback. ZBOSS may invoke this with preemption disabled,
+// so this function only validates and queues a small value. All logging, node
+// table mutation, and MQTT work happen in zb_forward_task().
 static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message)
 {
-    if (callback_id != ESP_ZB_CORE_REPORT_ATTR_CB_ID) {
+    if (callback_id != ESP_ZB_CORE_REPORT_ATTR_CB_ID || message == NULL) {
         return ESP_OK;
     }
+
     const esp_zb_zcl_report_attr_message_t *m =
         (const esp_zb_zcl_report_attr_message_t *)message;
-    if (m->status != ESP_ZB_ZCL_STATUS_SUCCESS || m->attribute.id != 0x0000) {
+    if (m->status != ESP_ZB_ZCL_STATUS_SUCCESS || m->attribute.id != 0x0000 ||
+        m->attribute.data.value == NULL) {
         return ESP_OK;
     }
 
-    uint16_t addr = m->src_address.u.short_addr;
+    zb_app_event_t event = {
+        .type = ZB_APP_EVENT_REPORT,
+        .addr = m->src_address.u.short_addr,
+        .cluster = m->cluster,
+    };
     const void *v = m->attribute.data.value;
 
-    portENTER_CRITICAL(&s_zb_lock);
-    zb_node_t *node = zb_node_get_or_create(addr);
-    if (node) {
-        switch (m->cluster) {
-        case ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT: {
-            int16_t raw = *(const int16_t *)v;
-            if (raw != ZB_TEMP_INVALID) {
-                node->temp_raw = raw;
-                node->valid |= ZB_MASK_TEMP;
-                node->dirty |= ZB_MASK_TEMP;
-            }
-            break;
+    switch (m->cluster) {
+    case ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT: {
+        int16_t raw = *(const int16_t *)v;
+        if (raw == ZB_TEMP_INVALID) {
+            return ESP_OK;
         }
-        case ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT: {
-            uint16_t raw = *(const uint16_t *)v;
-            if (raw != ZB_VALUE_INVALID) {
-                node->hum_raw = raw;
-                node->valid |= ZB_MASK_HUM;
-                node->dirty |= ZB_MASK_HUM;
-            }
-            break;
-        }
-        case ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT: {
-            uint16_t raw = *(const uint16_t *)v;
-            if (raw != ZB_VALUE_INVALID) {
-                node->lux_raw = raw;
-                node->valid |= ZB_MASK_LUX;
-                node->dirty |= ZB_MASK_LUX;
-            }
-            break;
-        }
-        default:
-            break;
-        }
+        event.raw = (uint16_t)raw;
+        break;
     }
-    portEXIT_CRITICAL(&s_zb_lock);
+    case ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT:
+    case ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT: {
+        uint16_t raw = *(const uint16_t *)v;
+        if (raw == ZB_VALUE_INVALID) {
+            return ESP_OK;
+        }
+        event.raw = raw;
+        break;
+    }
+    default:
+        return ESP_OK;
+    }
 
-    if (node) {
-        ESP_LOGI(TAG, "ZCL report from 0x%04x: cluster=0x%04x", addr, m->cluster);
-    }
+    zb_app_event_send(&event);
     return ESP_OK;
 }
 
@@ -483,9 +545,14 @@ static esp_zb_ep_list_t *create_gateway_ep(void)
 
 static void zigbee_task(void *arg)
 {
+#if ZB_JOIN_BEFORE_WIFI
+    // Wi-Fi is intentionally off during the clean RF commissioning/rejoin window.
+    vTaskDelay(pdMS_TO_TICKS(500));
+#else
     ESP_LOGI(TAG, "Zigbee: Waiting 10s for WiFi to stabilize...");
     vTaskDelay(pdMS_TO_TICKS(10000));
-    
+#endif
+
     ESP_LOGI(TAG, "Starting Zigbee coordinator...");
     
     esp_zb_cfg_t zb_cfg;
@@ -774,9 +841,10 @@ static void wifi_start(void)
         ESP_LOGW(TAG, "WiFi set country failed: %s", esp_err_to_name(err));
     }
 
-    // Phone hotspots and some APs mishandle modem-sleep beacon timing, which
-    // silently drops the TCP SYN and MQTT never connects. Keep the radio awake.
-    esp_wifi_set_ps(WIFI_PS_NONE);
+    // Temporary coexistence test: the ESP-Zigbee gateway example uses
+    // MIN_MODEM so Wi-Fi yields the shared radio for 802.15.4 time slots.
+    // WIFI_PS_NONE was starving Zigbee association on this board/hotspot.
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     esp_wifi_set_config(WIFI_IF_STA, &wcfg);
     esp_wifi_start();
 
@@ -804,6 +872,7 @@ static void mqtt_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT connected");
         s_mqtt_ok = true;
+        s_zb_status_resync = true;
         char sub[64];
         snprintf(sub, sizeof(sub), "%s/nodes/+/cmd", MQTT_TOPIC_PREFIX);
         esp_mqtt_client_subscribe(s_mqtt, sub, 1);
@@ -822,8 +891,17 @@ static void mqtt_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 static void mqtt_start(void)
 {
+    static const char gw_lwt_payload[] =
+        "{\"status\":\"offline\",\"event\":\"lwt\"}";
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
+        .session.last_will = {
+            .topic = MQTT_TOPIC_PREFIX "/" MQTT_GW_STATUS_SUFFIX,
+            .msg = gw_lwt_payload,
+            .msg_len = sizeof(gw_lwt_payload) - 1,
+            .qos = 1,
+            .retain = true,
+        },
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_cb, NULL);
@@ -831,12 +909,17 @@ static void mqtt_start(void)
     ESP_LOGI(TAG, "MQTT starting: %s", MQTT_BROKER_URI);
 }
 
-void mqtt_pub(const char *topic_suffix, const char *data)
+void mqtt_pub_retained(const char *topic_suffix, const char *data, bool retain)
 {
     if (!s_mqtt_ok) return;
     char topic[128];
     snprintf(topic, sizeof(topic), "%s/%s", MQTT_TOPIC_PREFIX, topic_suffix);
-    esp_mqtt_client_publish(s_mqtt, topic, data, 0, 1, 0);
+    esp_mqtt_client_publish(s_mqtt, topic, data, 0, 1, retain ? 1 : 0);
+}
+
+void mqtt_pub(const char *topic_suffix, const char *data)
+{
+    mqtt_pub_retained(topic_suffix, data, false);
 }
 
 // ==================== Tasks ====================
@@ -884,8 +967,10 @@ static void status_task(void *arg)
         if (s_mqtt_ok) {
             int64_t us = esp_timer_get_time() / 1000000;
             char msg[128];
-            snprintf(msg, sizeof(msg), "{\"ip\":\"%s\",\"uptime\":%lld}", s_ip, us);
-            mqtt_pub("nodes/gw-001/status", msg);
+            snprintf(msg, sizeof(msg),
+                     "{\"status\":\"online\",\"event\":\"heartbeat\",\"ip\":\"%s\",\"uptime\":%lld}",
+                     s_ip, us);
+            mqtt_pub_retained(MQTT_GW_STATUS_SUFFIX, msg, true);
         }
         vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
     }
@@ -895,52 +980,314 @@ static void status_task(void *arg)
 
 #define ZB_FORWARD_INTERVAL_MS  2000
 
+static void zb_persist_child_seen(void)
+{
+    if (s_child_seen) {
+        return;
+    }
+    s_child_seen = true;
+
+    nvs_handle_t nvh;
+    if (nvs_open("gwzb", NVS_READWRITE, &nvh) == ESP_OK) {
+        nvs_set_u8(nvh, "child", 1);
+        nvs_commit(nvh);
+        nvs_close(nvh);
+    }
+}
+
+static void zb_publish_gateway_status(const char *event)
+{
+    if (!s_mqtt_ok) {
+        return;
+    }
+
+    int64_t us = esp_timer_get_time() / 1000000;
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "{\"status\":\"online\",\"event\":\"%s\",\"ip\":\"%s\",\"uptime\":%lld}",
+             event, s_ip, us);
+    mqtt_pub_retained(MQTT_GW_STATUS_SUFFIX, msg, true);
+}
+
+static void zb_publish_node_status(const zb_node_t *node, const char *event, bool online)
+{
+    if (!s_mqtt_ok || node == NULL || node->addr == 0) {
+        return;
+    }
+
+    char topic_suffix[40];
+    char data[144];
+    snprintf(topic_suffix, sizeof(topic_suffix), "nodes/zb-%04x/status", node->addr);
+    snprintf(data, sizeof(data),
+             "{\"status\":\"%s\",\"event\":\"%s\",\"ieee\":\"%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\"}",
+             online ? "online" : "offline", event,
+             node->ieee[7], node->ieee[6], node->ieee[5], node->ieee[4],
+             node->ieee[3], node->ieee[2], node->ieee[1], node->ieee[0]);
+    mqtt_pub_retained(topic_suffix, data, true);
+    ESP_LOGI(TAG, "MQTT: %s status retained: %s", topic_suffix, event);
+}
+
+static void zb_publish_known_statuses(void)
+{
+    zb_node_t snap[MAX_ZB_NODES];
+    int n_active = 0;
+
+    portENTER_CRITICAL(&s_zb_lock);
+    for (int i = 0; i < MAX_ZB_NODES; i++) {
+        if (s_zb_nodes[i].addr != 0 && s_zb_nodes[i].active) {
+            snap[n_active++] = s_zb_nodes[i];
+        }
+    }
+    portEXIT_CRITICAL(&s_zb_lock);
+
+    zb_publish_gateway_status("status_resync");
+    for (int i = 0; i < n_active; i++) {
+        zb_publish_node_status(&snap[i], "status_resync", true);
+    }
+}
+
+static void zb_handle_join_event(const zb_app_event_t *event)
+{
+    zb_node_t *node;
+    zb_node_t status_snap = {0};
+    bool is_new_child = false;
+
+    portENTER_CRITICAL(&s_zb_lock);
+    node = zb_node_get_or_create(event->addr);
+    if (node != NULL) {
+        if (!node->active) {
+            node->active = true;
+            is_new_child = true;
+            s_zigbee_devices++;
+        }
+        memcpy(node->ieee, event->ieee, sizeof(node->ieee));
+        status_snap = *node;
+    }
+    portEXIT_CRITICAL(&s_zb_lock);
+
+    if (node == NULL) {
+        ESP_LOGW(TAG, "Zigbee: join event ignored, node table full addr=0x%04x", event->addr);
+        return;
+    }
+
+    if (is_new_child) {
+        ESP_LOGI(TAG, "Zigbee: Device joined! addr=0x%04x", event->addr);
+        zb_persist_child_seen();
+    } else {
+        ESP_LOGI(TAG, "Zigbee: Device announced again! addr=0x%04x", event->addr);
+    }
+
+    zb_publish_node_status(&status_snap, is_new_child ? "device_joined" : "device_announce", true);
+}
+
+static void zb_handle_leave_event(const zb_app_event_t *event)
+{
+    zb_node_t snap;
+    bool was_active = false;
+
+    portENTER_CRITICAL(&s_zb_lock);
+    for (int i = 0; i < MAX_ZB_NODES; i++) {
+        if (s_zb_nodes[i].addr != 0 &&
+            memcmp(s_zb_nodes[i].ieee, event->ieee, sizeof(event->ieee)) == 0) {
+            if (s_zb_nodes[i].active) {
+                snap = s_zb_nodes[i];
+                s_zb_nodes[i].active = false;
+                s_zb_nodes[i].dirty = 0;
+                s_zigbee_devices--;
+                was_active = true;
+            }
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_zb_lock);
+
+    if (was_active) {
+        ESP_LOGI(TAG, "Zigbee: Device left! addr=0x%04x", snap.addr);
+        zb_publish_node_status(&snap, "device_left", false);
+    } else {
+        ESP_LOGI(TAG, "Zigbee: Leave for unknown/inactive IEEE "
+                      "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+                 event->ieee[7], event->ieee[6], event->ieee[5], event->ieee[4],
+                 event->ieee[3], event->ieee[2], event->ieee[1], event->ieee[0]);
+    }
+}
+
+static void zb_handle_report_event(const zb_app_event_t *event)
+{
+    bool became_active = false;
+    bool first_dirty = false;
+    bool need_status = false;
+    zb_node_t status_snap = {0};
+    uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+
+    portENTER_CRITICAL(&s_zb_lock);
+    zb_node_t *node = zb_node_get_or_create(event->addr);
+    if (node) {
+        // A successful report proves the child is present even if an announce was dropped.
+        if (!node->active) {
+            node->active = true;
+            became_active = true;
+            s_zigbee_devices++;
+        }
+        first_dirty = (node->dirty == 0);
+
+        switch (event->cluster) {
+        case ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT:
+            node->temp_raw = (int16_t)event->raw;
+            node->valid |= ZB_MASK_TEMP;
+            node->dirty |= ZB_MASK_TEMP;
+            break;
+        case ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT:
+            node->hum_raw = event->raw;
+            node->valid |= ZB_MASK_HUM;
+            node->dirty |= ZB_MASK_HUM;
+            break;
+        case ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT:
+            node->lux_raw = event->raw;
+            node->valid |= ZB_MASK_LUX;
+            node->dirty |= ZB_MASK_LUX;
+            break;
+        default:
+            break;
+        }
+
+        if (became_active) {
+            status_snap = *node;
+            need_status = true;
+        }
+        if (first_dirty) {
+            node->first_dirty_ms = now_ms;
+        }
+        node->last_report_ms = now_ms;
+    }
+    portEXIT_CRITICAL(&s_zb_lock);
+
+    if (node) {
+        if (became_active) {
+            ESP_LOGI(TAG, "Zigbee: Device active by report addr=0x%04x", event->addr);
+            zb_persist_child_seen();
+            if (need_status) {
+                zb_publish_node_status(&status_snap, "device_active", true);
+            }
+        }
+        s_zb_report_events++;
+        ESP_LOGI(TAG, "Zigbee: cached report node=0x%04x cluster=0x%04x raw=%u total=%lu",
+                 event->addr, event->cluster, event->raw,
+                 (unsigned long)s_zb_report_events);
+    }
+}
+
+static uint32_t s_zb_last_telemetry_ms[MAX_ZB_NODES];
+static char s_zb_last_telemetry_payload[MAX_ZB_NODES][128];
+
+static void zb_forward_pending(void)
+{
+    if (!s_mqtt_ok) {
+        return;
+    }
+
+    // Wait for a complete temperature/humidity/light sample to avoid duplicate
+    // MQTT messages; sleepy-end-device reports can arrive more than 10s apart.
+    // A longer partial timeout still publishes incomplete/legacy sensors.
+    zb_node_t snap[MAX_ZB_NODES];
+    int n_dirty = 0;
+    uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+    portENTER_CRITICAL(&s_zb_lock);
+    for (int i = 0; i < MAX_ZB_NODES; i++) {
+        zb_node_t *node = &s_zb_nodes[i];
+        if (node->addr == 0 || !node->active || node->dirty == 0) {
+            continue;
+        }
+        bool complete = (node->dirty & ZB_MASK_ALL) == ZB_MASK_ALL;
+        uint32_t age_ms = now_ms - node->first_dirty_ms;
+        if (complete || age_ms >= ZB_REPORT_PARTIAL_DELAY_MS) {
+            snap[n_dirty++] = *node;
+            node->dirty = 0;
+        }
+    }
+    portEXIT_CRITICAL(&s_zb_lock);
+
+    for (int i = 0; i < n_dirty; i++) {
+        zb_node_t *n = &snap[i];
+        char topic_suffix[40];
+        snprintf(topic_suffix, sizeof(topic_suffix), "nodes/zb-%04x/telemetry", n->addr);
+
+        char payload[160];
+        int pos = snprintf(payload, sizeof(payload), "{\"data\":{");
+        if (n->valid & ZB_MASK_TEMP) {
+            pos += snprintf(payload + pos, sizeof(payload) - pos,
+                            "\"temperature\":%.1f,", n->temp_raw / 100.0f);
+        }
+        if (n->valid & ZB_MASK_HUM) {
+            pos += snprintf(payload + pos, sizeof(payload) - pos,
+                            "\"humidity\":%.1f,", n->hum_raw / 100.0f);
+        }
+        if (n->valid & ZB_MASK_LUX) {
+            // raw = 10000 * log10(lux + 1)  ->  lux = 10^(raw/10000) - 1
+            float lux = powf(10.0f, (float)n->lux_raw / 10000.0f) - 1.0f;
+            pos += snprintf(payload + pos, sizeof(payload) - pos,
+                            "\"lux\":%.1f,", lux);
+        }
+        if (payload[pos - 1] == ',') pos--;
+        snprintf(payload + pos, sizeof(payload) - pos, "}}");
+
+        uint32_t telemetry_age_ms = now_ms - s_zb_last_telemetry_ms[i];
+        bool duplicate_telemetry =
+            s_zb_last_telemetry_payload[i][0] != '\0' &&
+            telemetry_age_ms < ZB_TELEMETRY_DEDUP_MS &&
+            strcmp(payload, s_zb_last_telemetry_payload[i]) == 0;
+
+        if (duplicate_telemetry) {
+            ESP_LOGI(TAG, "MQTT duplicate suppressed (%s, age=%lu ms): %s",
+                     topic_suffix, (unsigned long)telemetry_age_ms, payload);
+        } else {
+            mqtt_pub(topic_suffix, payload);
+            ESP_LOGI(TAG, "MQTT -> %s: %s", topic_suffix, payload);
+            strlcpy(s_zb_last_telemetry_payload[i], payload,
+                    sizeof(s_zb_last_telemetry_payload[i]));
+            s_zb_last_telemetry_ms[i] = now_ms;
+        }
+    }
+}
+
+static bool zb_have_full_active_sample(void)
+{
+    bool ready = false;
+
+    portENTER_CRITICAL(&s_zb_lock);
+    for (int i = 0; i < MAX_ZB_NODES; i++) {
+        if (s_zb_nodes[i].addr != 0 &&
+            s_zb_nodes[i].active &&
+            (s_zb_nodes[i].valid & ZB_MASK_ALL) == ZB_MASK_ALL) {
+            ready = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_zb_lock);
+    return ready;
+}
+
 static void zb_forward_task(void *arg)
 {
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(ZB_FORWARD_INTERVAL_MS));
-        if (!s_mqtt_ok) continue;
-
-        // Snapshot dirty nodes inside the critical section, then do
-        // float formatting / MQTT work outside of it.
-        zb_node_t snap[MAX_ZB_NODES];
-        int n_dirty = 0;
-        portENTER_CRITICAL(&s_zb_lock);
-        for (int i = 0; i < MAX_ZB_NODES; i++) {
-            if (s_zb_nodes[i].addr != 0 && s_zb_nodes[i].dirty != 0) {
-                snap[n_dirty++] = s_zb_nodes[i];
-                s_zb_nodes[i].dirty = 0;
-            }
+        zb_app_event_t event;
+        if (xQueueReceive(s_zb_app_q, &event, pdMS_TO_TICKS(ZB_FORWARD_INTERVAL_MS))) {
+            do {
+                if (event.type == ZB_APP_EVENT_JOIN) {
+                    zb_handle_join_event(&event);
+                } else if (event.type == ZB_APP_EVENT_REPORT) {
+                    zb_handle_report_event(&event);
+                } else if (event.type == ZB_APP_EVENT_LEAVE) {
+                    zb_handle_leave_event(&event);
+                }
+            } while (xQueueReceive(s_zb_app_q, &event, 0) == pdTRUE);
         }
-        portEXIT_CRITICAL(&s_zb_lock);
 
-        for (int i = 0; i < n_dirty; i++) {
-            zb_node_t *n = &snap[i];
-            char topic_suffix[40];
-            snprintf(topic_suffix, sizeof(topic_suffix), "nodes/zb-%04x/telemetry", n->addr);
-
-            char payload[160];
-            int pos = snprintf(payload, sizeof(payload), "{\"data\":{");
-            if (n->valid & ZB_MASK_TEMP) {
-                pos += snprintf(payload + pos, sizeof(payload) - pos,
-                                "\"temperature\":%.1f,", n->temp_raw / 100.0f);
-            }
-            if (n->valid & ZB_MASK_HUM) {
-                pos += snprintf(payload + pos, sizeof(payload) - pos,
-                                "\"humidity\":%.1f,", n->hum_raw / 100.0f);
-            }
-            if (n->valid & ZB_MASK_LUX) {
-                // raw = 10000 * log10(lux + 1)  ->  lux = 10^(raw/10000) - 1
-                float lux = powf(10.0f, (float)n->lux_raw / 10000.0f) - 1.0f;
-                pos += snprintf(payload + pos, sizeof(payload) - pos,
-                                "\"lux\":%.1f,", lux);
-            }
-            if (payload[pos - 1] == ',') pos--;
-            snprintf(payload + pos, sizeof(payload) - pos, "}}");
-
-            mqtt_pub(topic_suffix, payload);
-            ESP_LOGI(TAG, "MQTT -> %s: %s", topic_suffix, payload);
+        if (s_zb_status_resync && s_mqtt_ok) {
+            s_zb_status_resync = false;
+            zb_publish_known_statuses();
         }
+        zb_forward_pending();
     }
 }
 
@@ -959,11 +1306,29 @@ void app_main(void)
         nvs_flash_init();
     }
 
-#if CONFIG_ESP_COEX_SW_COEXIST_ENABLE && CONFIG_SOC_IEEE802154_SUPPORTED
-    // Required when the same ESP32-C6 radio runs Wi-Fi and Zigbee/802.15.4.
-    // Mirrors the ESP-IDF Thread border-router example.
+    {
+        nvs_handle_t nvh;
+        uint8_t formed = 0;
+        uint8_t child = 0;
+        if (nvs_open("gwzb", NVS_READONLY, &nvh) == ESP_OK) {
+            nvs_get_u8(nvh, "formed", &formed);
+            nvs_get_u8(nvh, "child", &child);
+            nvs_close(nvh);
+        }
+        s_network_formed = (formed != 0);
+        s_child_seen = (child != 0);
+    }
+
+#if !ZB_ONLY_RF_DIAG && CONFIG_ESP_COEX_SW_COEXIST_ENABLE && CONFIG_SOC_IEEE802154_SUPPORTED
     ESP_ERROR_CHECK(esp_coex_wifi_i154_enable());
-    ESP_LOGI(TAG, "Wi-Fi/IEEE 802.15.4 coexistence enabled");
+    esp_ieee802154_set_coex_config((esp_ieee802154_coex_config_t){
+        .idle = IEEE802154_IDLE,
+        .txrx = IEEE802154_LOW,
+        .txrx_at = IEEE802154_MIDDLE,
+    });
+    ESP_LOGI(TAG, "Wi-Fi/IEEE 802.15.4 coexistence enabled (15.4 priority LOW/MIDDLE)");
+#else
+    ESP_LOGW(TAG, "ZB-only RF diagnostic: Wi-Fi/coexistence disabled");
 #endif
     
     // I2C
@@ -995,13 +1360,23 @@ void app_main(void)
     }
 
     
+#if !ZB_ONLY_RF_DIAG && !ZB_JOIN_BEFORE_WIFI
     // WiFi
     wifi_start();
     xEventGroupWaitBits(s_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
-    
+
     // MQTT
     mqtt_start();
-    
+#elif ZB_ONLY_RF_DIAG
+    ESP_LOGW(TAG, "ZB-only RF diagnostic: WiFi and MQTT not started");
+#endif
+
+    // Application events are queued before the Zigbee task can produce them.
+    s_zb_app_q = xQueueCreate(32, sizeof(zb_app_event_t));
+    if (s_zb_app_q == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate Zigbee application event queue");
+    }
+
     // Tasks
     // Zigbee
     xTaskCreate(zigbee_task, "zigbee", 16384, NULL, 5, NULL);
@@ -1009,6 +1384,49 @@ void app_main(void)
     xTaskCreate(oled_task, "oled", 4096, NULL, 5, NULL);
     xTaskCreate(status_task, "status", 4096, NULL, 5, NULL);
     xTaskCreate(zb_forward_task, "zb-fwd", 4096, NULL, 5, NULL);
+
+#if !ZB_ONLY_RF_DIAG && ZB_JOIN_BEFORE_WIFI
+    // Give commissioning a contention-free 802.15.4 window. Once a node is
+    // present, bring up Wi-Fi/MQTT and rely on balanced runtime coexistence.
+    const int join_first_timeout_ms =
+        s_child_seen ? ZB_REJOIN_FIRST_TIMEOUT_MS : ZB_JOIN_FIRST_TIMEOUT_MS;
+    ESP_LOGI(TAG, "Zigbee %s RF window before Wi-Fi: %d ms",
+             s_child_seen ? "rejoin" : "commissioning", join_first_timeout_ms);
+
+    int join_wait_ms = 0;
+    while (join_wait_ms < join_first_timeout_ms && s_zigbee_devices == 0) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        join_wait_ms += 500;
+    }
+    bool join_seen = (s_zigbee_devices > 0);
+    bool first_sample_ready = false;
+    if (join_seen) {
+        ESP_LOGI(TAG, "Zigbee join announced; keep Wi-Fi off until a full sensor sample");
+        while (join_wait_ms < join_first_timeout_ms) {
+            if (zb_have_full_active_sample()) {
+                first_sample_ready = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+            join_wait_ms += 500;
+        }
+    }
+
+    if (!join_seen) {
+        ESP_LOGW(TAG, "No Zigbee join in %d ms; start Wi-Fi anyway", join_first_timeout_ms);
+    } else if (first_sample_ready) {
+        ESP_LOGI(TAG, "Full Zigbee sample received at %d ms; start IP stack after cache window",
+                 join_wait_ms);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    } else {
+        ESP_LOGW(TAG, "Join seen but no full sample in %d ms; start Wi-Fi anyway",
+                 join_first_timeout_ms);
+    }
+
+    wifi_start();
+    xEventGroupWaitBits(s_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
+    mqtt_start();
+#endif
     
     ESP_LOGI(TAG, "Gateway ready!");
     

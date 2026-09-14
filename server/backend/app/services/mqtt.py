@@ -95,8 +95,12 @@ class MQTTService:
         
         async with async_session_factory() as session:
             try:
-                # 确保设备存在
-                await self._ensure_device(session, device_id, node_id, "sensor", gateway_id)
+                # 确保设备存在；遥测本身也证明设备当前在线
+                device = await self._ensure_device(
+                    session, device_id, node_id, "sensor", gateway_id
+                )
+                device.status = "online"
+                device.last_seen = datetime.now()
                 
                 # 写入指标数据
                 ts = datetime.fromisoformat(payload.get("ts", datetime.now().isoformat()))
@@ -140,7 +144,7 @@ class MQTTService:
                 logger.error(f"更新设备状态失败: {e}")
     
     async def _ensure_device(self, session, device_id: str, name: str, device_type: str, parent_id: str):
-        """确保设备存在"""
+        """确保设备存在，并返回设备实例"""
         device = await session.get(Device, device_id)
         if not device:
             device = Device(
@@ -154,6 +158,7 @@ class MQTTService:
             session.add(device)
             await session.flush()
             logger.info(f"新设备已注册: {device_id}")
+        return device
     
     async def publish_command(self, device_id: str, command: str, payload: dict = None):
         """发布命令到设备"""

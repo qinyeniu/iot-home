@@ -51,6 +51,9 @@ class MQTTService:
                         await self._handle_message(message)
                         
             except aiomqtt.MqttError as e:
+                if not self._running:
+                    logger.info("MQTT disconnected during shutdown")
+                    break
                 logger.warning(f"MQTT 连接断开: {e}，5秒后重连...")
                 await asyncio.sleep(5)
             except Exception as e:
@@ -60,8 +63,19 @@ class MQTTService:
     async def stop(self):
         """停止 MQTT 客户端"""
         self._running = False
-        if self.client:
-            await self.client.disconnect()
+        client = self.client
+        self.client = None
+        if client is not None:
+            disconnect = getattr(client, "disconnect", None)
+            if asyncio.iscoroutinefunction(disconnect):
+                # Future aiomqtt versions may expose an async disconnect().
+                await disconnect()
+            else:
+                # aiomqtt 2.0.x disconnects when leaving its async context.
+                # Close the wrapped client so the blocked message loop exits.
+                underlying = getattr(client, "_client", None)
+                if underlying is not None:
+                    underlying.disconnect()
         logger.info("MQTT 客户端已停止")
     
     async def _handle_message(self, message: aiomqtt.Message):

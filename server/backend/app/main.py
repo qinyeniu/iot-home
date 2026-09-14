@@ -39,11 +39,14 @@ async def lifespan(app: FastAPI):
     
     # 关闭 MQTT 客户端
     await mqtt_service.stop()
-    mqtt_task.cancel()
     try:
-        await mqtt_task
-    except asyncio.CancelledError:
-        pass
+        await asyncio.wait_for(mqtt_task, timeout=5)
+    except asyncio.TimeoutError:
+        mqtt_task.cancel()
+        try:
+            await mqtt_task
+        except asyncio.CancelledError:
+            pass
     logger.info("MQTT 客户端已停止")
     
     # 关闭数据库连接

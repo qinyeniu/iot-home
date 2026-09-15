@@ -31,6 +31,7 @@
 #include "nvs.h"
 #include "mqtt_client.h"
 #include "driver/i2c.h"
+#include "driver/gpio.h"
 #include "esp_zigbee_core.h"
 #include "esp_coexist.h"
 #include "esp_ieee802154.h"
@@ -57,7 +58,7 @@
 #define OLED_HEIGHT             64
 
 #define STATUS_INTERVAL_MS      30000
-#define OLED_UPDATE_MS          500
+#define OLED_UPDATE_MS          1000
 
 // Forward declarations
 void mqtt_pub(const char *topic_suffix, const char *data);
@@ -122,15 +123,85 @@ static void zb_app_event_send(const zb_app_event_t *event)
 // ==================== OLED SSD1306 ====================
 // Minimal local text driver for this 128x64 yellow/blue SSD1306 panel.
 // The installed espressif/ssd1306 1.0.5 text/font path produced garbled glyphs
-// on this board.  Use a standard 5x7 font, normal page-order framebuffer,
-// vertical addressing, and one continuous 1024-byte I2C transaction per frame.
+// on this board.  Use a standard 5x7 font, page-order framebuffer, horizontal
+// addressing, and short retried I2C strips with local bus/panel recovery.
 
 #define OLED_FB_SIZE            (OLED_WIDTH * OLED_HEIGHT / 8)
+#define OLED_I2C_FREQ_HZ        100000
+#define OLED_I2C_TIMEOUT_MS     200
+#define OLED_CHUNK_COLS         32
+#define OLED_TX_ATTEMPTS        3
+#define OLED_BUS_RECOVERY_PULSES 9
 
 static uint8_t s_fb[OLED_FB_SIZE];
-static uint8_t s_gram[OLED_FB_SIZE];
+static uint32_t s_oled_tx_retry_count;
+static uint32_t s_oled_tx_failure_count;
+static uint32_t s_oled_recovery_count;
+static uint32_t s_oled_consecutive_flush_failures;
 
-static esp_err_t oled_i2c_write(uint8_t control, const uint8_t *data, size_t len)
+static esp_err_t oled_i2c_force_bus_idle(void)
+{
+    // If a transfer was interrupted and the SSD1306 holds SDA low, temporarily
+    // bit-bang nine SCL pulses followed by STOP, then return the pins to I2C.
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << I2C_SDA_PIN) | (1ULL << I2C_SCL_PIN),
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t ret = gpio_config(&io);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    gpio_set_level(I2C_SDA_PIN, 1);
+    gpio_set_level(I2C_SCL_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    for (int i = 0; i < OLED_BUS_RECOVERY_PULSES; i++) {
+        gpio_set_level(I2C_SCL_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(1));
+        gpio_set_level(I2C_SCL_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    gpio_set_level(I2C_SDA_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    gpio_set_level(I2C_SCL_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    gpio_set_level(I2C_SDA_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    gpio_reset_pin(I2C_SDA_PIN);
+    gpio_reset_pin(I2C_SCL_PIN);
+    return ESP_OK;
+}
+
+static esp_err_t oled_i2c_init(void)
+{
+    i2c_config_t i2c_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_PIN,
+        .scl_io_num = I2C_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = OLED_I2C_FREQ_HZ,
+    };
+
+    esp_err_t ret = i2c_param_config(I2C_NUM_0, &i2c_cfg);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        return ESP_OK;
+    }
+    return ret;
+}
+
+static esp_err_t oled_i2c_write_once(uint8_t control, const uint8_t *data, size_t len)
 {
     i2c_cmd_handle_t h = i2c_cmd_link_create();
     if (h == NULL) {
@@ -145,8 +216,26 @@ static esp_err_t oled_i2c_write(uint8_t control, const uint8_t *data, size_t len
     }
     i2c_master_stop(h);
 
-    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(1000));
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, h,
+                                         pdMS_TO_TICKS(OLED_I2C_TIMEOUT_MS));
     i2c_cmd_link_delete(h);
+    return ret;
+}
+
+static esp_err_t oled_i2c_write(uint8_t control, const uint8_t *data, size_t len)
+{
+    esp_err_t ret = ESP_FAIL;
+
+    for (int attempt = 0; attempt < OLED_TX_ATTEMPTS; attempt++) {
+        ret = oled_i2c_write_once(control, data, len);
+        if (ret == ESP_OK) {
+            return ESP_OK;
+        }
+        s_oled_tx_retry_count++;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    s_oled_tx_failure_count++;
     return ret;
 }
 
@@ -156,7 +245,7 @@ static bool oled_check_device(void)
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
     i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(100));
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(OLED_I2C_TIMEOUT_MS));
     i2c_cmd_link_delete(cmd);
     return (ret == ESP_OK);
 }
@@ -180,7 +269,7 @@ static bool oled_init(void)
         0x8D, 0x14,       // enable charge pump
         0xA4,             // output follows GDDRAM
         0xA6,             // normal display (not inverse)
-        0x20, 0x01,       // vertical addressing mode
+        0x20, 0x00,       // horizontal addressing mode
         0x21, 0x00, 0x7F, // column window 0..127
         0x22, 0x00, 0x07, // page window 0..7
         0xAF,             // display on
@@ -188,33 +277,90 @@ static bool oled_init(void)
 
     esp_err_t ret = oled_i2c_write(0x00, init_cmds, sizeof(init_cmds));
     memset(s_fb, 0, sizeof(s_fb));
-    memset(s_gram, 0, sizeof(s_gram));
     return (ret == ESP_OK);
+}
+
+static bool oled_recover_bus_and_panel(void)
+{
+    s_oled_recovery_count++;
+    ESP_LOGW(TAG, "OLED refresh failed; local recovery #%lu (retries=%lu failures=%lu)",
+             (unsigned long)s_oled_recovery_count,
+             (unsigned long)s_oled_tx_retry_count,
+             (unsigned long)s_oled_tx_failure_count);
+
+    // Keep Zigbee, Wi-Fi and MQTT alive; only rebuild the I2C bus/display.
+    i2c_driver_delete(I2C_NUM_0);
+    vTaskDelay(pdMS_TO_TICKS(80));
+    (void)oled_i2c_force_bus_idle();
+
+    if (oled_i2c_init() != ESP_OK) {
+        ESP_LOGE(TAG, "OLED I2C driver recovery failed");
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(80));
+
+    if (!oled_check_device()) {
+        ESP_LOGW(TAG, "OLED did not ACK after I2C bus recovery");
+        return false;
+    }
+    if (!oled_init()) {
+        ESP_LOGW(TAG, "OLED SSD1306 reinitialization failed");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "OLED recovered by I2C/SSD1306 local reset");
+    return true;
+}
+
+static bool oled_flush_once(void)
+{
+    // Refresh in short horizontal strips. Every strip sets an explicit
+    // window, so a retry cannot continue at the wrong GDDRAM location and
+    // turn later columns into horizontal garbage.
+    for (int page = 0; page < OLED_HEIGHT / 8; page++) {
+        for (int x0 = 0; x0 < OLED_WIDTH; x0 += OLED_CHUNK_COLS) {
+            int x1 = x0 + OLED_CHUNK_COLS - 1;
+            uint8_t window_cmds[] = {
+                0x20, 0x00,                     // horizontal addressing
+                0x21, (uint8_t)x0, (uint8_t)x1,
+                0x22, (uint8_t)page, (uint8_t)page,
+            };
+
+            esp_err_t ret = oled_i2c_write(0x00, window_cmds, sizeof(window_cmds));
+            if (ret != ESP_OK) {
+                return false;
+            }
+
+            const uint8_t *chunk = &s_fb[page * OLED_WIDTH + x0];
+            ret = oled_i2c_write(0x40, chunk, OLED_CHUNK_COLS);
+            if (ret != ESP_OK) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 static bool oled_flush(void)
 {
-    static const uint8_t window_cmds[] = {
-        0x20, 0x01,       // vertical addressing mode
-        0x21, 0x00, 0x7F, // column window 0..127
-        0x22, 0x00, 0x07, // page window 0..7
-    };
-
-    // Vertical addressing consumes data as column 0 pages 0..7, then
-    // column 1 pages 0..7, etc. Convert from page-major framebuffer.
-    for (int x = 0; x < OLED_WIDTH; x++) {
-        for (int page = 0; page < OLED_HEIGHT / 8; page++) {
-            s_gram[x * (OLED_HEIGHT / 8) + page] = s_fb[page * OLED_WIDTH + x];
+    if (oled_flush_once()) {
+        if (s_oled_consecutive_flush_failures > 0) {
+            ESP_LOGI(TAG, "OLED refresh recovered after %lu failed frame(s)",
+                     (unsigned long)s_oled_consecutive_flush_failures);
         }
+        s_oled_consecutive_flush_failures = 0;
+        return true;
     }
 
-    esp_err_t ret = oled_i2c_write(0x00, window_cmds, sizeof(window_cmds));
-    if (ret != ESP_OK) {
+    s_oled_consecutive_flush_failures++;
+    if (!oled_recover_bus_and_panel()) {
         return false;
     }
-    return oled_i2c_write(0x40, s_gram, sizeof(s_gram)) == ESP_OK;
-}
 
+    // s_fb is preserved, so the next task tick redraws the complete screen.
+    return oled_flush_once();
+}
 static void oled_clear(void)
 {
     memset(s_fb, 0, sizeof(s_fb));
@@ -1331,18 +1477,14 @@ void app_main(void)
     ESP_LOGW(TAG, "ZB-only RF diagnostic: Wi-Fi/coexistence disabled");
 #endif
     
-    // I2C
-    i2c_config_t i2c_cfg = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 100000,
-    };
-    i2c_param_config(I2C_NUM_0, &i2c_cfg);
-    i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
-    ESP_LOGI(TAG, "I2C init OK (SDA=%d SCL=%d)", I2C_SDA_PIN, I2C_SCL_PIN);
+    // I2C / OLED bus
+    ret = oled_i2c_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "I2C init failed (SDA=%d SCL=%d): %s",
+                 I2C_SDA_PIN, I2C_SCL_PIN, esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "I2C init OK (SDA=%d SCL=%d)", I2C_SDA_PIN, I2C_SCL_PIN);
+    }
     
     // OLED: local verified SSD1306 128x64 text driver
     if (oled_check_device() && oled_init()) {

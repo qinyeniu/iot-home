@@ -140,6 +140,8 @@ class MQTTService:
         """处理设备状态"""
         device_id = f"{gateway_id}-{node_id}"
         status = payload.get("status", "unknown")
+        if status not in {"online", "offline", "unknown"}:
+            status = "unknown"
         
         async with async_session_factory() as session:
             try:

@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.models.session import init_db, close_db
 from app.services.mqtt import mqtt_service
+from app.services.device_status import device_status_monitor
 from app.routers.devices import router as devices_router
 
 # 配置日志
@@ -31,11 +32,18 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("数据库初始化完成")
     
-    # 启动 MQTT 客户端（后台任务）
+    # 启动后台任务
     mqtt_task = asyncio.create_task(mqtt_service.start())
-    logger.info("MQTT 客户端已启动")
-    
+    status_task = asyncio.create_task(device_status_monitor())
+    logger.info("MQTT 客户端和设备状态检查已启动")
+
     yield
+
+    status_task.cancel()
+    try:
+        await status_task
+    except asyncio.CancelledError:
+        pass
     
     # 关闭 MQTT 客户端
     await mqtt_service.stop()

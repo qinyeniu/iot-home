@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     
     # FastAPI 配置
     API_PORT: int = 8000
+
+    # 设备在线状态：调试期约 10 秒上报，3 分钟无心跳才判离线。
+    DEVICE_OFFLINE_TIMEOUT_SECONDS: int = 180
+    DEVICE_STATUS_CHECK_INTERVAL_SECONDS: int = 20
     
     # Grafana 配置
     GRAFANA_ADMIN_USER: str = "admin"

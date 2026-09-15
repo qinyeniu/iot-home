@@ -77,7 +77,7 @@ cd C:\Users\HJB\Documents\iot-home\server
 - 访问：http://localhost:3000
 - 登录：
   - 用户名：admin
-  - 密码：grafana_2024
+  - 密码：见 server/.env，不写入文档
 
 ### 3. 运行模拟设备
 - 打开新的 PowerShell 窗口

@@ -120,7 +120,7 @@
 | 项目 | 值 |
 |------|-----|
 | WiFi SSID | DESKTOP-O6O2BC0 8856 |
-| WiFi 密码 | 12341234 |
+| WiFi 密码 | 见被忽略的 wifi_secrets.h / 仓库外备份 |
 | MQTT Broker | mqtt://8.163.110.27:1883 |
 
 ## 参考文档

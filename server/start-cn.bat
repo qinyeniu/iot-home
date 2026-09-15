@@ -47,7 +47,7 @@ echo    * Grafana:   http://localhost:3000
 echo.
 echo Grafana 登录:
 echo    * 用户名: admin
-echo    * 密码:   grafana_2024
+echo    * 密码:   见 server\.env，不写入文档
 echo.
 echo 下一步:
 echo    1. 运行模拟设备: python tools\simulator.py

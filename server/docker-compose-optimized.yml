@@ -1,4 +1,4 @@
-﻿version: '3.8'
+version: '3.8'
 
 services:
   mosquitto:
@@ -25,10 +25,10 @@ services:
     ports:
       - "3307:3306"
     environment:
-      - MYSQL_ROOT_PASSWORD=20051030hjbHJB
-      - MYSQL_DATABASE=iot_home
-      - MYSQL_USER=iot_home
-      - MYSQL_PASSWORD=20051030hjbHJB
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
       - TZ=Asia/Shanghai
     volumes:
       - mysql_data:/var/lib/mysql
@@ -48,14 +48,16 @@ services:
     environment:
       - MQTT_HOST=mosquitto
       - MQTT_PORT=1883
-      - MQTT_USER=iot_user
-      - MQTT_PASSWORD=20051030hjbHJB
-      - MQTT_TOPIC_PREFIX=iot-home
+      - MQTT_USER=${MQTT_USER}
+      - MQTT_PASSWORD=${MQTT_PASSWORD}
+      - MQTT_TOPIC_PREFIX=${MQTT_TOPIC_PREFIX}
+      - DEVICE_OFFLINE_TIMEOUT_SECONDS=${DEVICE_OFFLINE_TIMEOUT_SECONDS:-180}
+      - DEVICE_STATUS_CHECK_INTERVAL_SECONDS=${DEVICE_STATUS_CHECK_INTERVAL_SECONDS:-20}
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
-      - MYSQL_DATABASE=iot_home
-      - MYSQL_USER=iot_home
-      - MYSQL_PASSWORD=20051030hjbHJB
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
       - TZ=Asia/Shanghai
     volumes:
       - ./backend:/app
@@ -72,8 +74,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=20051030hjbHJB
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
       - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
       - TZ=Asia/Shanghai
     volumes:

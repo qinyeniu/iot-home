@@ -50,3 +50,6 @@ firmware/**/main/wifi_secrets.h
 *.bak
 firmware/gateway/main/main_backup.c
 firmware/gateway/main/main_v2.c
+
+# Generated Mosquitto credentials (create locally from server/.env)
+server/mosquitto/config/password.txt

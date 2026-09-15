@@ -1,10 +1,10 @@
-﻿version: '3.8'
+version: '3.8'
 
 services:
   mosquitto:
     image: eclipse-mosquitto:2.0
     container_name: iot-mosquitto
-    restart: no
+    restart: unless-stopped
     ports:
       - "1883:1883"
     volumes:
@@ -24,24 +24,43 @@ services:
   mysql:
     image: mysql:8.0
     container_name: iot-mysql
-    restart: no
+    restart: unless-stopped
     ports:
       - "3307:3306"
     environment:
-      - MYSQL_ROOT_PASSWORD=20051030hjbHJB
-      - MYSQL_DATABASE=iot_home
-      - MYSQL_USER=iot_home
-      - MYSQL_PASSWORD=20051030hjbHJB
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
       - TZ=Asia/Shanghai
     volumes:
       - mysql_data:/var/lib/mysql
       - ./mysql/init:/docker-entrypoint-initdb.d
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-authentication-plugin=mysql_native_password --innodb_buffer_pool_size=32M --max_connections=20
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-authentication-plugin=mysql_native_password
+      --innodb_buffer_pool_size=48M
+      --innodb_log_buffer_size=4M
+      --max_connections=15
+      --table_open_cache=32
+      --performance_schema=OFF
+      --skip-log-bin
+      --sort-buffer-size=256K
+      --read-buffer-size=256K
+      --join-buffer-size=256K
+      --thread-cache-size=4
     deploy:
       resources:
         limits:
-          cpus: '0.1'
-          memory: 64M
+          cpus: '0.15'
+          memory: 160M
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
     networks:
       - iot-network
 
@@ -50,55 +69,61 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: iot-backend
-    restart: no
+    restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
       - MQTT_HOST=mosquitto
       - MQTT_PORT=1883
-      - MQTT_USER=iot_user
-      - MQTT_PASSWORD=20051030hjbHJB
-      - MQTT_TOPIC_PREFIX=iot-home
+      - MQTT_USER=${MQTT_USER}
+      - MQTT_PASSWORD=${MQTT_PASSWORD}
+      - MQTT_TOPIC_PREFIX=${MQTT_TOPIC_PREFIX}
+      - DEVICE_OFFLINE_TIMEOUT_SECONDS=${DEVICE_OFFLINE_TIMEOUT_SECONDS:-180}
+      - DEVICE_STATUS_CHECK_INTERVAL_SECONDS=${DEVICE_STATUS_CHECK_INTERVAL_SECONDS:-20}
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
-      - MYSQL_DATABASE=iot_home
-      - MYSQL_USER=iot_home
-      - MYSQL_PASSWORD=20051030hjbHJB
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
       - TZ=Asia/Shanghai
     volumes:
       - ./backend:/app
     depends_on:
-      - mosquitto
-      - mysql
+      mosquitto:
+        condition: service_started
+      mysql:
+        condition: service_healthy
     deploy:
       resources:
         limits:
-          cpus: '0.1'
-          memory: 64M
+          cpus: '0.15'
+          memory: 160M
     networks:
       - iot-network
 
   grafana:
     image: grafana/grafana:11.2.0
     container_name: iot-grafana
-    restart: no
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=20051030hjbHJB
-      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
       - TZ=Asia/Shanghai
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
     deploy:
       resources:
         limits:
-          cpus: '0.1'
-          memory: 64M
+          cpus: '0.15'
+          memory: 96M
     networks:
       - iot-network
 

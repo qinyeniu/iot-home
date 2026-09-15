@@ -50,9 +50,9 @@ python tools/simulator.py
 
 | 服务 | 用户名 | 密码 |
 |------|--------|------|
-| Grafana | admin | grafana_2024 |
-| MySQL | iot_home | iot_mysql_2024 |
-| MQTT | iot_user | iot_mqtt_2024 |
+| Grafana | admin | 见 server/.env |
+| MySQL | iot_home | 见 server/.env |
+| MQTT | iot_user | 见 server/.env |
 
 ## 目录结构
 

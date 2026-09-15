@@ -85,7 +85,7 @@ idf.py -p COM3 monitor
 
 ### Wi-Fi 配置
 - SSID: qyn
-- Password: 20051030
+- Password: 见仓库外 Wi‑Fi 凭据备份和本机被忽略的 wifi_secrets.h，不写入文档
 
 ### MQTT 配置
 - Broker: mqtt://localhost:1883

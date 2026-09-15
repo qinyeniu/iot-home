@@ -58,9 +58,9 @@ echo    * MQTT Port:       localhost:1883
 echo    * MySQL Port:      localhost:3307
 echo.
 echo Default Login:
-echo    * Grafana: admin / grafana_2024
-echo    * MySQL:   iot_home / iot_mysql_2024
-echo    * MQTT:    iot_user / iot_mqtt_2024
+echo    * Grafana: admin - see server\.env
+echo    * MySQL:   iot_home - see server\.env
+echo    * MQTT:    iot_user - see server\.env
 echo.
 echo Next Steps:
 echo    1. Run simulator: python tools\simulator.py

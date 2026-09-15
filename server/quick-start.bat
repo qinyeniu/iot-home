@@ -47,7 +47,7 @@ echo    * Grafana:   http://localhost:3000
 echo.
 echo Grafana Login:
 echo    * Username: admin
-echo    * Password: grafana_2024
+echo    * Password: see server/.env
 echo.
 echo Next Steps:
 echo    1. Run simulator: python tools\simulator.py

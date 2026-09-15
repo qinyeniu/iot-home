@@ -6,8 +6,8 @@ datasources:
     access: proxy
     url: mysql:3306
     database: iot_home
-    user: iot_home
+    user: ${MYSQL_USER}
     secureJsonData:
-      password: iot_mysql_2024
+      password: ${MYSQL_PASSWORD}
     isDefault: true
     editable: true

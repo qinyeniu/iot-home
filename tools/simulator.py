@@ -5,17 +5,18 @@ IoT-Home 模拟设备脚本
 """
 
 import json
+import os
 import time
 import random
 from datetime import datetime
 import paho.mqtt.client as mqtt
 
 # MQTT 配置
-MQTT_HOST = "localhost"
-MQTT_PORT = 1883
-MQTT_USER = "iot_user"
-MQTT_PASSWORD = "iot_mqtt_2024"
-MQTT_TOPIC_PREFIX = "iot-home"
+MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USER = os.getenv("MQTT_USER", "iot_user")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+MQTT_TOPIC_PREFIX = os.getenv("MQTT_TOPIC_PREFIX", "iot-home")
 
 # 模拟设备配置
 GATEWAY_ID = "gw-001"

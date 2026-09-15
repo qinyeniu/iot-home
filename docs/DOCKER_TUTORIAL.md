@@ -173,7 +173,7 @@ iot-grafana         Up 2 minutes    0.0.0.0:3000->3000/tcp
 2. 访问：http://localhost:3000
 3. 登录：
    - 用户名：admin
-   - 密码：grafana_2024
+   - 密码：见 server/.env，不写入文档
 4. 点击左侧菜单 **"Dashboards"**
 5. 找到 **"IoT-Home 环境监测"** 看板
 
@@ -259,7 +259,7 @@ docker compose restart backend
 ### 进入容器
 `powershell
 # 进入 MySQL 容器
-docker compose exec mysql mysql -u iot_home -piot_mysql_2024 iot_home
+docker compose exec mysql mysql -u iot_home -p iot_home
 
 # 进入 Mosquitto 容器
 docker compose exec mosquitto sh

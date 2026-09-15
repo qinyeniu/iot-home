@@ -1,10 +1,10 @@
-﻿# IoT-Home 服务器部署文档
+# IoT-Home 服务器部署文档
 
 ## 服务器信息
 
 - 公网IP: 8.163.110.27
 - 用户名: root
-- 密码: 20051030hjbHJB.
+- 密码: 见仓库外凭据保存位置；不要写入仓库（建议使用 SSH key）
 
 ## 登录方式
 
@@ -15,7 +15,7 @@ ssh root@8.163.110.27
 ### VNC 登录
 - 通过阿里云控制台 VNC 连接
 - 用户名：root
-- 密码：20051030hjbHJB.
+- 密码：见仓库外凭据保存位置；不要写入仓库（建议使用 SSH key）
 
 ## 项目信息
 
@@ -31,15 +31,18 @@ ssh root@8.163.110.27
 - Grafana: 3000
 
 ### 登录信息
-- MQTT: iot_user / 20051030hjbHJB
-- MySQL: iot_home / 20051030hjbHJB
-- Grafana: admin / 20051030hjbHJB
+
+用户名保留在本节，真实密码统一放在服务器的 `/root/iot-home/server/.env`，不要写入文档或 Git：
+
+- MQTT 用户名: iot_user
+- MySQL 用户名: iot_home
+- Grafana 用户名: admin
 
 ## 启动服务
 
 cd /root/iot-home/server
-cp docker-compose-minimal.yml docker-compose.yml
-docker compose up -d
+test -f .env || cp .env.example .env  # 首次部署：编辑 .env 填入真实值
+docker compose -f docker-compose-minimal.yml up -d
 
 ## 停止服务
 

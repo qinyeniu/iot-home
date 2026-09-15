@@ -1,11 +1,12 @@
-#!/bin/bash
-# 生成 Mosquitto 密码文件
-# 在 Docker 容器启动时执行
+#!/bin/sh
+# Generate a Mosquitto password file from environment variables.
+# Example: MQTT_USER=iot_user MQTT_PASSWORD='...' ./generate_password.sh
+set -eu
 
-# 创建密码文件
-mosquitto_passwd -c -b /mosquitto/config/password.txt iot_user iot_mqtt_2024
+: "${MQTT_USER:?MQTT_USER is required}"
+: "${MQTT_PASSWORD:?MQTT_PASSWORD is required}"
 
-# 设置权限
+mosquitto_passwd -c -b /mosquitto/config/password.txt "$MQTT_USER" "$MQTT_PASSWORD"
 chmod 600 /mosquitto/config/password.txt
 
-echo "MQTT 密码文件已生成"
+echo "MQTT password file generated"

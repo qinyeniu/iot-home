@@ -107,7 +107,7 @@ python tools/simulator.py
 
 **Grafana 看板**:
 - 打开 http://localhost:3000
-- 登录: admin / grafana_2024
+- 登录: admin；密码见本机 server/.env，不写入文档
 - 查看 "IoT-Home 环境监测" 看板
 
 ## 开发工作流
@@ -147,10 +147,10 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 **连接 MySQL**:
 `ash
 # 使用 Docker exec
-docker compose exec mysql mysql -u iot_home -piot_mysql_2024 iot_home
+docker compose exec mysql mysql -u iot_home -p iot_home
 
 # 或使用 MySQL 客户端
-mysql -h localhost -P 3306 -u iot_home -piot_mysql_2024 iot_home
+mysql -h localhost -P 3306 -u iot_home -p iot_home
 `
 
 **查看表结构**:
@@ -171,17 +171,19 @@ SELECT * FROM commands;
 ### MQTT 调试
 
 **订阅所有主题**:
+
+先在当前 shell 导出 `server/.env` 中的 `MQTT_PASSWORD`；不要把真实密码追加到命令里。
 `ash
 # 使用 mosquitto_sub
-mosquitto_sub -h localhost -p 1883 -u iot_user -P iot_mqtt_2024 -t "iot-home/#" -v
+mosquitto_sub -h localhost -p 1883 -u iot_user -P $MQTT_PASSWORD -t "iot-home/#" -v
 
 # 或使用 Docker
-docker compose exec mosquitto mosquitto_sub -h localhost -u iot_user -P iot_mqtt_2024 -t "iot-home/#" -v
+docker compose exec mosquitto mosquitto_sub -h localhost -u iot_user -P $MQTT_PASSWORD -t "iot-home/#" -v
 `
 
 **发布测试消息**:
 `ash
-mosquitto_pub -h localhost -p 1883 -u iot_user -P iot_mqtt_2024 \
+mosquitto_pub -h localhost -p 1883 -u iot_user -P $MQTT_PASSWORD \
   -t "iot-home/gw-001/nodes/sensor-01/telemetry" \
   -m '{"ts":"2026-08-25T12:00:00","data":{"temperature":25.0,"humidity":60.0}}'
 `

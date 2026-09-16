@@ -157,4 +157,12 @@ Copy-Item main/wifi_secrets.h.example main/wifi_secrets.h
 
 然后编辑 `main/wifi_secrets.h`，填入一个 2.4GHz SSID 和密码。该文件已被 `.gitignore` 忽略。
 
+## MQTT 凭据配置（2026-09-16 起）
+
+```powershell
+Copy-Item main/mqtt_secrets.h.example main/mqtt_secrets.h
+```
+
+然后编辑 `main/mqtt_secrets.h`，填入与服务器 `server/.env` 一致的 MQTT 用户名和密码。该文件已被 `.gitignore` 忽略，不能提交。Broker 关闭匿名访问前，必须先烧录携带该凭据的网关固件。
+
 若 OLED 显示 `WIFI:NO`，先看 `docs/GATEWAY_WIFI_RECOVERY.md`，不要直接判断为 MQTT 或 OLED 故障。

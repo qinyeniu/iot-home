@@ -13,8 +13,13 @@ services:
       - mosquitto_data:/mosquitto/data
       - mosquitto_log:/mosquitto/log
     environment:
+      - MQTT_USER=${MQTT_USER}
+      - MQTT_PASSWORD=${MQTT_PASSWORD}
+      - MQTT_TOPIC_PREFIX=${MQTT_TOPIC_PREFIX}
+      - MQTT_ALLOW_ANONYMOUS=${MQTT_ALLOW_ANONYMOUS:-false}
       - TZ=Asia/Shanghai
-    command: mosquitto -c /mosquitto/config/mosquitto.conf
+    entrypoint: ["/bin/sh"]
+    command: ["/mosquitto/config/start.sh"]
     networks:
       - iot-network
 

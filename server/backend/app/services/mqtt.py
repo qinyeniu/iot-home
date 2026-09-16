@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Optional
 import aiomqtt
 from app.config import settings
+from app.services.topics import device_command_topic
 from app.models.session import async_session_factory
 from app.models.database import Device, Metric
 
@@ -183,23 +184,10 @@ class MQTTService:
             return False
         
         try:
-            # 命令主题：iot-home/{gateway_id}/nodes/{node_id}/cmd
-            # 设备ID格式: gw-001-combined-01 或 gw-001-sensor-01
-            # 需要解析为: gateway_id=gw-001, node_id=combined-01
-            parts = device_id.split("-", 2)  # 最多分成3部分: gw, 001, combined-01
-            if len(parts) < 3:
-                # 兼容旧格式: sensor-01
-                parts = device_id.split("-", 1)
-                if len(parts) != 2:
-                    logger.error(f"无效的设备ID: {device_id}")
-                    return False
-                gateway_id = "gw-001"  # 默认网关
-                node_id = parts[1]
-            else:
-                gateway_id = f"{parts[0]}-{parts[1]}"  # gw-001
-                node_id = parts[2]  # combined-01
-            
-            topic = f"{settings.MQTT_TOPIC_PREFIX}/{gateway_id}/nodes/{node_id}/cmd"
+            topic = device_command_topic(settings.MQTT_TOPIC_PREFIX, device_id)
+            if topic is None:
+                logger.error(f"无效的设备ID: {device_id}")
+                return False
             
             message = {
                 "command": command,

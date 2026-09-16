@@ -36,6 +36,7 @@
 #include "esp_coexist.h"
 #include "esp_ieee802154.h"
 #include "wifi_secrets.h"
+#include "mqtt_secrets.h"
 
 // ==================== Configuration ====================
 
@@ -1041,6 +1042,8 @@ static void mqtt_start(void)
         "{\"status\":\"offline\",\"event\":\"lwt\"}";
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
+        .credentials.username = MQTT_USERNAME,
+        .credentials.authentication.password = MQTT_PASSWORD,
         .session.last_will = {
             .topic = MQTT_TOPIC_PREFIX "/" MQTT_GW_STATUS_SUFFIX,
             .msg = gw_lwt_payload,

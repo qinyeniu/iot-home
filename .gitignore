@@ -45,6 +45,7 @@ Thumbs.db
 
 # Local firmware secrets
 firmware/**/main/wifi_secrets.h
+firmware/**/main/mqtt_secrets.h
 
 # One-off debugging backups (Git tags/commits are the version checkpoint)
 *.bak
@@ -53,3 +54,4 @@ firmware/gateway/main/main_v2.c
 
 # Generated Mosquitto credentials (create locally from server/.env)
 server/mosquitto/config/password.txt
+server/mosquitto/config/acl.conf

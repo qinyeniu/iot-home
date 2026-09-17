@@ -32,6 +32,9 @@
 
 #define AHT20_STATUS_BUSY       0x80
 #define AHT20_STATUS_CALIBRATED 0x08
+#define AHT20_DATA_LEN          7
+#define AHT20_CRC_INIT          0xff
+#define AHT20_CRC_POLYNOMIAL    0x31
 #define AHT20_POWERUP_DELAY_MS  40
 #define AHT20_MEASURE_DELAY_MS  80
 
@@ -141,12 +144,27 @@ static bool aht20_init(void)
     return true;
 }
 
+static bool aht20_crc_valid(const uint8_t data[static AHT20_DATA_LEN])
+{
+    uint8_t crc = AHT20_CRC_INIT;
+
+    // The final byte is the CRC; it covers status plus five measurement bytes.
+    for (size_t i = 0; i < AHT20_DATA_LEN - 1; ++i) {
+        crc ^= data[i];
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            crc = (crc & 0x80U) != 0 ? (uint8_t)((crc << 1) ^ AHT20_CRC_POLYNOMIAL)
+                                     : (uint8_t)(crc << 1);
+        }
+    }
+
+    return crc == data[AHT20_DATA_LEN - 1];
+}
+
 static sensor_read_status_t aht20_read(float *temp, float *hum)
 {
     uint8_t trig_cmd[] = {0xAC, 0x33, 0x00};
-    // Six bytes is status + five measurement bytes. CRC is intentionally not
-    // read by this legacy I2C driver path; status/range checks reject bad samples.
-    uint8_t data[6];
+    // Status + five measurement bytes + CRC-8.
+    uint8_t data[AHT20_DATA_LEN];
 
     i2c_cmd_handle_t h = i2c_cmd_link_create();
     i2c_master_start(h);
@@ -178,6 +196,12 @@ static sensor_read_status_t aht20_read(float *temp, float *hum)
     if ((data[0] & AHT20_STATUS_CALIBRATED) == 0) {
         ESP_LOGW(TAG, "AHT20: not calibrated, status=0x%02x; reinitializing", data[0]);
         aht20_init();
+        return SENSOR_READ_INVALID;
+    }
+    if (!aht20_crc_valid(data)) {
+        ESP_LOGW(TAG,
+                 "AHT20: bad measurement CRC, data=%02x %02x %02x %02x %02x %02x crc=%02x",
+                 data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
         return SENSOR_READ_INVALID;
     }
 

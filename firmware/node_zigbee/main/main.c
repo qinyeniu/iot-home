@@ -118,6 +118,8 @@ static uint32_t s_i2c_th_failures = 0;
 static uint32_t s_i2c_lux_failures = 0;
 static uint32_t s_sensor_th_invalid = 0;
 static uint32_t s_sensor_lux_invalid = 0;
+static uint32_t s_th_fail_streak = 0;
+static uint32_t s_lux_fail_streak = 0;
 static uint32_t s_report_attempts = 0;
 static uint32_t s_report_enqueued = 0;
 static uint32_t s_report_enqueue_failures = 0;
@@ -174,6 +176,20 @@ static esp_err_t i2c_sensor_bus_init(void)
     return ESP_OK;
 }
 
+static void i2c_maybe_recover_bus(const char *sensor, esp_err_t err)
+{
+    if (err != ESP_ERR_TIMEOUT) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "I2C: %s transaction timed out; resetting bus", sensor);
+    esp_err_t reset_err = i2c_master_bus_reset(s_i2c_bus);
+    if (reset_err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C: bus reset failed after %s timeout: %s",
+                 sensor, esp_err_to_name(reset_err));
+    }
+}
+
 // ==================== AHT20 ====================
 
 static bool aht20_init(void)
@@ -217,6 +233,7 @@ static sensor_read_status_t aht20_read(float *temp, float *hum)
                                         I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "AHT20: measurement trigger failed: %s", esp_err_to_name(err));
+        i2c_maybe_recover_bus("AHT20 trigger", err);
         return SENSOR_READ_BUS_ERROR;
     }
     vTaskDelay(pdMS_TO_TICKS(AHT20_MEASURE_DELAY_MS));
@@ -224,6 +241,7 @@ static sensor_read_status_t aht20_read(float *temp, float *hum)
     err = i2c_master_receive(s_aht20_dev, data, sizeof(data), I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "AHT20: measurement receive failed: %s", esp_err_to_name(err));
+        i2c_maybe_recover_bus("AHT20 receive", err);
         return SENSOR_READ_BUS_ERROR;
     }
 
@@ -271,6 +289,7 @@ static sensor_read_status_t bh1750_read(float *lux)
     esp_err_t err = i2c_master_transmit(s_bh1750_dev, &cmd, sizeof(cmd), I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "BH1750: measurement trigger failed: %s", esp_err_to_name(err));
+        i2c_maybe_recover_bus("BH1750 trigger", err);
         return SENSOR_READ_BUS_ERROR;
     }
     vTaskDelay(pdMS_TO_TICKS(180));
@@ -279,6 +298,7 @@ static sensor_read_status_t bh1750_read(float *lux)
     err = i2c_master_receive(s_bh1750_dev, data, sizeof(data), I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "BH1750: measurement receive failed: %s", esp_err_to_name(err));
+        i2c_maybe_recover_bus("BH1750 receive", err);
         return SENSOR_READ_BUS_ERROR;
     }
 
@@ -615,7 +635,7 @@ static void log_report_stats(TickType_t now)
     ESP_LOGI(TAG,
              "REPORT_STATS: rounds=%lu repairs=%lu i2c_th_fail=%lu i2c_lux_fail=%lu "
              "attempts=%lu queued=%lu queue_fail=%lu items_failed=%lu aps_ok=%lu aps_fail=%lu "
-             "th_invalid=%lu lux_invalid=%lu",
+             "th_invalid=%lu lux_invalid=%lu th_streak=%lu lux_streak=%lu",
              (unsigned long)s_report_rounds,
              (unsigned long)s_report_repairs,
              (unsigned long)s_i2c_th_failures,
@@ -627,7 +647,9 @@ static void log_report_stats(TickType_t now)
              (unsigned long)s_aps_confirm_success,
              (unsigned long)s_aps_confirm_failure,
              (unsigned long)s_sensor_th_invalid,
-             (unsigned long)s_sensor_lux_invalid);
+             (unsigned long)s_sensor_lux_invalid,
+             (unsigned long)s_th_fail_streak,
+             (unsigned long)s_lux_fail_streak);
 }
 
 static void sensor_task(void *arg)
@@ -652,6 +674,11 @@ static void sensor_task(void *arg)
         sensor_read_status_t th_status = SENSOR_READ_BUS_ERROR;
         if (aht20_ready) {
             th_status = aht20_read(&temp, &hum);
+            if (th_status == SENSOR_READ_BUS_ERROR) {
+                // Reinitialize once on the next round after NACK/timeout. A
+                // timeout has already attempted an I2C bus reset inside read.
+                aht20_ready = false;
+            }
         } else {
             aht20_ready = aht20_init();
             if (aht20_ready) {
@@ -664,6 +691,11 @@ static void sensor_task(void *arg)
         uint8_t report_flags = 0;
 
         if (have_temp_hum) {
+            if (s_th_fail_streak != 0) {
+                ESP_LOGI(TAG, "AHT20: readings recovered after %lu failed round(s)",
+                         (unsigned long)s_th_fail_streak);
+            }
+            s_th_fail_streak = 0;
             // ZCL scaling: temp int16 in 0.01 C; humidity uint16 in 0.01 %.
             s_last_sample.temp = (int16_t)(temp * 100.0f);
             s_last_sample.hum = (uint16_t)(hum * 100.0f);
@@ -671,12 +703,19 @@ static void sensor_task(void *arg)
             report_flags |= SAMPLE_FLAG_TEMP | SAMPLE_FLAG_HUM;
         } else if (th_status == SENSOR_READ_INVALID) {
             s_sensor_th_invalid++;
+            s_th_fail_streak++;
         } else {
             s_i2c_th_failures++;
+            s_th_fail_streak++;
             ESP_LOGW(TAG, "AHT20: temperature/humidity bus read unavailable");
         }
 
         if (have_lux) {
+            if (s_lux_fail_streak != 0) {
+                ESP_LOGI(TAG, "BH1750: readings recovered after %lu failed round(s)",
+                         (unsigned long)s_lux_fail_streak);
+            }
+            s_lux_fail_streak = 0;
             // Illuminance uses the Zigbee log scale: 10000 * log10(lux + 1).
             float log_val = lux > 0.0f ? 10000.0f * log10f(lux + 1.0f) : 0.0f;
             s_last_sample.lux = (uint16_t)log_val;
@@ -684,8 +723,10 @@ static void sensor_task(void *arg)
             report_flags |= SAMPLE_FLAG_LUX;
         } else if (lux_status == SENSOR_READ_INVALID) {
             s_sensor_lux_invalid++;
+            s_lux_fail_streak++;
         } else {
             s_i2c_lux_failures++;
+            s_lux_fail_streak++;
             ESP_LOGW(TAG, "BH1750: illuminance bus read unavailable");
         }
 

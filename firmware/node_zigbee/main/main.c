@@ -28,6 +28,7 @@
 #define I2C_FREQ_HZ             100000
 #define I2C_TIMEOUT_MS          100
 #define I2C_SCAN_TIMEOUT_MS     50
+#define I2C_BUS_REINIT_FAILURES 3
 
 #define AHT20_ADDR              0x38
 #define BH1750_ADDR             0x23
@@ -120,6 +121,8 @@ static uint32_t s_sensor_th_invalid = 0;
 static uint32_t s_sensor_lux_invalid = 0;
 static uint32_t s_th_fail_streak = 0;
 static uint32_t s_lux_fail_streak = 0;
+static uint32_t s_i2c_bus_resets = 0;
+static uint32_t s_i2c_bus_reinits = 0;
 static uint32_t s_report_attempts = 0;
 static uint32_t s_report_enqueued = 0;
 static uint32_t s_report_enqueue_failures = 0;
@@ -133,6 +136,38 @@ static i2c_master_dev_handle_t s_bh1750_dev = NULL;
 
 // ==================== I2C bus / sensors ====================
 
+static void i2c_sensor_bus_deinit(void)
+{
+    esp_err_t err;
+
+    if (s_aht20_dev != NULL) {
+        err = i2c_master_bus_rm_device(s_aht20_dev);
+        if (err == ESP_OK) {
+            s_aht20_dev = NULL;
+        } else {
+            ESP_LOGE(TAG, "I2C: remove AHT20 device failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    if (s_bh1750_dev != NULL) {
+        err = i2c_master_bus_rm_device(s_bh1750_dev);
+        if (err == ESP_OK) {
+            s_bh1750_dev = NULL;
+        } else {
+            ESP_LOGE(TAG, "I2C: remove BH1750 device failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    if (s_i2c_bus != NULL) {
+        err = i2c_del_master_bus(s_i2c_bus);
+        if (err == ESP_OK) {
+            s_i2c_bus = NULL;
+        } else {
+            ESP_LOGE(TAG, "I2C: delete bus failed: %s", esp_err_to_name(err));
+        }
+    }
+}
+
 static esp_err_t i2c_sensor_bus_init(void)
 {
     i2c_master_bus_config_t bus_config = {
@@ -145,44 +180,75 @@ static esp_err_t i2c_sensor_bus_init(void)
         .trans_queue_depth = 0,
         .flags.enable_internal_pullup = true,
     };
-    esp_err_t err = i2c_new_master_bus(&bus_config, &s_i2c_bus);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2C: create bus failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
     i2c_device_config_t aht20_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = AHT20_ADDR,
         .scl_speed_hz = I2C_FREQ_HZ,
     };
-    err = i2c_master_bus_add_device(s_i2c_bus, &aht20_config, &s_aht20_dev);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2C: add AHT20 failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
     i2c_device_config_t bh1750_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = BH1750_ADDR,
         .scl_speed_hz = I2C_FREQ_HZ,
     };
+    esp_err_t err;
+
+    // Rebuilding is only called from the sensor task, but make repeated calls
+    // safe and ensure a partially initialized previous attempt is released.
+    i2c_sensor_bus_deinit();
+
+    err = i2c_new_master_bus(&bus_config, &s_i2c_bus);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C: create bus failed: %s", esp_err_to_name(err));
+        i2c_sensor_bus_deinit();
+        return err;
+    }
+
+    err = i2c_master_bus_add_device(s_i2c_bus, &aht20_config, &s_aht20_dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C: add AHT20 failed: %s", esp_err_to_name(err));
+        i2c_sensor_bus_deinit();
+        return err;
+    }
+
     err = i2c_master_bus_add_device(s_i2c_bus, &bh1750_config, &s_bh1750_dev);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "I2C: add BH1750 failed: %s", esp_err_to_name(err));
+        i2c_sensor_bus_deinit();
         return err;
     }
 
     return ESP_OK;
 }
 
+static bool i2c_sensor_bus_ready(void)
+{
+    return s_i2c_bus != NULL && s_aht20_dev != NULL && s_bh1750_dev != NULL;
+}
+
+static esp_err_t i2c_sensor_bus_rebuild(const char *reason)
+{
+    s_i2c_bus_reinits++;
+    ESP_LOGW(TAG, "I2C: rebuilding bus because %s (#%lu)",
+             reason, (unsigned long)s_i2c_bus_reinits);
+
+    esp_err_t err = i2c_sensor_bus_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C: rebuild after %s failed: %s",
+                 reason, esp_err_to_name(err));
+    }
+
+    return err;
+}
+
 static void i2c_maybe_recover_bus(const char *sensor, esp_err_t err)
 {
-    if (err != ESP_ERR_TIMEOUT) {
+    if (err != ESP_ERR_TIMEOUT || s_i2c_bus == NULL) {
         return;
     }
 
-    ESP_LOGW(TAG, "I2C: %s transaction timed out; resetting bus", sensor);
+    s_i2c_bus_resets++;
+    ESP_LOGW(TAG, "I2C: %s transaction timed out; resetting bus (#%lu)",
+             sensor, (unsigned long)s_i2c_bus_resets);
     esp_err_t reset_err = i2c_master_bus_reset(s_i2c_bus);
     if (reset_err != ESP_OK) {
         ESP_LOGE(TAG, "I2C: bus reset failed after %s timeout: %s",
@@ -195,6 +261,11 @@ static void i2c_maybe_recover_bus(const char *sensor, esp_err_t err)
 static bool aht20_init(void)
 {
     uint8_t init_cmd[] = {0xBE, 0x08, 0x00};
+
+    if (s_aht20_dev == NULL) {
+        ESP_LOGW(TAG, "AHT20: init skipped because I2C device is not ready");
+        return false;
+    }
 
     esp_err_t err = i2c_master_transmit(s_aht20_dev, init_cmd, sizeof(init_cmd),
                                         I2C_TIMEOUT_MS);
@@ -226,6 +297,11 @@ static bool aht20_crc_valid(const uint8_t data[static AHT20_DATA_LEN])
 static sensor_read_status_t aht20_read(float *temp, float *hum)
 {
     uint8_t trig_cmd[] = {0xAC, 0x33, 0x00};
+
+    if (s_aht20_dev == NULL) {
+        ESP_LOGW(TAG, "AHT20: measurement skipped because I2C device is not ready");
+        return SENSOR_READ_BUS_ERROR;
+    }
     // Status + five measurement bytes + CRC-8.
     uint8_t data[AHT20_DATA_LEN];
 
@@ -285,6 +361,11 @@ static sensor_read_status_t aht20_read(float *temp, float *hum)
 static sensor_read_status_t bh1750_read(float *lux)
 {
     uint8_t cmd = 0x10;
+
+    if (s_bh1750_dev == NULL) {
+        ESP_LOGW(TAG, "BH1750: measurement skipped because I2C device is not ready");
+        return SENSOR_READ_BUS_ERROR;
+    }
 
     esp_err_t err = i2c_master_transmit(s_bh1750_dev, &cmd, sizeof(cmd), I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
@@ -634,12 +715,15 @@ static void log_report_stats(TickType_t now)
 
     ESP_LOGI(TAG,
              "REPORT_STATS: rounds=%lu repairs=%lu i2c_th_fail=%lu i2c_lux_fail=%lu "
+             "i2c_resets=%lu i2c_reinits=%lu "
              "attempts=%lu queued=%lu queue_fail=%lu items_failed=%lu aps_ok=%lu aps_fail=%lu "
              "th_invalid=%lu lux_invalid=%lu th_streak=%lu lux_streak=%lu",
              (unsigned long)s_report_rounds,
              (unsigned long)s_report_repairs,
              (unsigned long)s_i2c_th_failures,
              (unsigned long)s_i2c_lux_failures,
+             (unsigned long)s_i2c_bus_resets,
+             (unsigned long)s_i2c_bus_reinits,
              (unsigned long)s_report_attempts,
              (unsigned long)s_report_enqueued,
              (unsigned long)s_report_enqueue_failures,
@@ -656,10 +740,26 @@ static void sensor_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    bool aht20_ready = aht20_init();
-    ESP_LOGI(TAG, "AHT20 initial setup: %s", aht20_ready ? "OK" : "failed; will retry");
+    bool aht20_ready = false;
+    if (i2c_sensor_bus_ready()) {
+        aht20_ready = aht20_init();
+        ESP_LOGI(TAG, "AHT20 initial setup: %s", aht20_ready ? "OK" : "failed; will retry");
+    } else {
+        ESP_LOGE(TAG, "I2C: bus is not ready at sensor task start; will retry");
+    }
 
     while (1) {
+        if (!i2c_sensor_bus_ready()) {
+            esp_err_t bus_err = i2c_sensor_bus_rebuild("bus was unavailable");
+            if (bus_err != ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
+            aht20_ready = aht20_init();
+            ESP_LOGI(TAG, "I2C: bus recovered; AHT20 setup=%s",
+                     aht20_ready ? "OK" : "failed; will retry");
+        }
+
         if (!s_zigbee_connected) {
             ESP_LOGI(TAG, "Waiting for Zigbee network...");
             vTaskDelay(pdMS_TO_TICKS(2000));
@@ -675,14 +775,19 @@ static void sensor_task(void *arg)
         if (aht20_ready) {
             th_status = aht20_read(&temp, &hum);
             if (th_status == SENSOR_READ_BUS_ERROR) {
-                // Reinitialize once on the next round after NACK/timeout. A
-                // timeout has already attempted an I2C bus reset inside read.
+                // Reinitialize on the next round after NACK/timeout. A timeout
+                // has already attempted an I2C bus reset inside read.
                 aht20_ready = false;
             }
         } else {
             aht20_ready = aht20_init();
             if (aht20_ready) {
                 ESP_LOGI(TAG, "AHT20 setup recovered");
+                // Do not charge a healthy setup round to the failure streak.
+                th_status = aht20_read(&temp, &hum);
+                if (th_status == SENSOR_READ_BUS_ERROR) {
+                    aht20_ready = false;
+                }
             }
         }
         sensor_read_status_t lux_status = bh1750_read(&lux);
@@ -785,6 +890,22 @@ static void sensor_task(void *arg)
         }
 
         report_window_close();
+
+        bool th_bus_error = th_status == SENSOR_READ_BUS_ERROR;
+        bool lux_bus_error = lux_status == SENSOR_READ_BUS_ERROR;
+        bool bus_reinit_due =
+            (th_bus_error && s_th_fail_streak > 0 &&
+             (s_th_fail_streak % I2C_BUS_REINIT_FAILURES) == 0) ||
+            (lux_bus_error && s_lux_fail_streak > 0 &&
+             (s_lux_fail_streak % I2C_BUS_REINIT_FAILURES) == 0);
+
+        if (bus_reinit_due) {
+            esp_err_t bus_err = i2c_sensor_bus_rebuild("consecutive sensor bus failures");
+            aht20_ready = false;
+            if (bus_err == ESP_OK) {
+                ESP_LOGI(TAG, "I2C: scheduled bus rebuild succeeded; AHT20 will initialize next round");
+            }
+        }
     }
 }
 
@@ -803,16 +924,23 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_ERROR_CHECK(i2c_sensor_bus_init());
-    ESP_LOGI(TAG, "I2C init OK (SDA=%d SCL=%d)", I2C_SDA_PIN, I2C_SCL_PIN);
+    esp_err_t i2c_err = i2c_sensor_bus_init();
+    if (i2c_err != ESP_OK) {
+        // A damaged or temporarily unresponsive sensor bus must not prevent
+        // Zigbee from starting; the sensor task keeps rebuilding the bus.
+        ESP_LOGE(TAG, "I2C init unavailable at startup: %s; Zigbee will continue",
+                 esp_err_to_name(i2c_err));
+    } else {
+        ESP_LOGI(TAG, "I2C init OK (SDA=%d SCL=%d)", I2C_SDA_PIN, I2C_SCL_PIN);
 
-    // Temporary wiring diagnostic: scan bus for AHT20 (0x38) / BH1750 (0x23)
-    for (uint8_t a = 1; a < 127; a++) {
-        if (i2c_master_probe(s_i2c_bus, a, I2C_SCAN_TIMEOUT_MS) == ESP_OK) {
-            ESP_LOGW(TAG, "I2C SCAN: found 0x%02x", a);
+        // Temporary wiring diagnostic: scan bus for AHT20 (0x38) / BH1750 (0x23)
+        for (uint8_t a = 1; a < 127; a++) {
+            if (i2c_master_probe(s_i2c_bus, a, I2C_SCAN_TIMEOUT_MS) == ESP_OK) {
+                ESP_LOGW(TAG, "I2C SCAN: found 0x%02x", a);
+            }
         }
+        ESP_LOGW(TAG, "I2C SCAN: expect AHT20=0x38 BH1750=0x23");
     }
-    ESP_LOGW(TAG, "I2C SCAN: expect AHT20=0x38 BH1750=0x23");
 
     // Create the sensor task first so its notification handle exists before
     // the Zigbee task registers the APS confirm callback.

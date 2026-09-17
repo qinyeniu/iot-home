@@ -1,7 +1,7 @@
 /**
  * IoT-Home Zigbee Sensor Node v3.0
  *
- * - Joins Zigbee network (End Device, channel 25)
+ * - Joins Zigbee network (End Device, channel 26)
  * - Reads AHT20 (temp/hum) + BH1750 (lux) over I2C
  * - Reports sensor values via standard ZCL attribute reports to coordinator
  *   (EP10, HA profile, Temperature/Humidity/Illuminance Measurement clusters)
@@ -29,6 +29,17 @@
 
 #define AHT20_ADDR              0x38
 #define BH1750_ADDR             0x23
+
+#define AHT20_STATUS_BUSY       0x80
+#define AHT20_STATUS_CALIBRATED 0x08
+#define AHT20_POWERUP_DELAY_MS  40
+#define AHT20_MEASURE_DELAY_MS  80
+
+#define AHT20_TEMP_MIN_C        (-40.0f)
+#define AHT20_TEMP_MAX_C        85.0f
+#define AHT20_HUM_MIN_PCT       0.0f
+#define AHT20_HUM_MAX_PCT       100.0f
+#define BH1750_LUX_MAX          60000.0f
 
 #define SENSOR_INTERVAL_MS      10000   // debug period; deep-sleep phase will change this
 #define REPORT_GAP_MS           200     // gap between the 3 ZCL reports
@@ -84,6 +95,12 @@ typedef struct {
 #define SAMPLE_FLAG_HUM         (1u << 1)
 #define SAMPLE_FLAG_LUX         (1u << 2)
 
+typedef enum {
+    SENSOR_READ_OK = 0,
+    SENSOR_READ_BUS_ERROR,
+    SENSOR_READ_INVALID,
+} sensor_read_status_t;
+
 static sensor_sample_t s_last_sample = {0};
 
 static portMUX_TYPE s_report_state_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -94,6 +111,8 @@ static volatile uint32_t s_aps_confirm_failure = 0;
 
 static uint32_t s_i2c_th_failures = 0;
 static uint32_t s_i2c_lux_failures = 0;
+static uint32_t s_sensor_th_invalid = 0;
+static uint32_t s_sensor_lux_invalid = 0;
 static uint32_t s_report_attempts = 0;
 static uint32_t s_report_enqueued = 0;
 static uint32_t s_report_enqueue_failures = 0;
@@ -103,59 +122,87 @@ static uint32_t s_report_repairs = 0;
 
 // ==================== AHT20 ====================
 
-static bool aht20_read(float *temp, float *hum)
+static bool aht20_init(void)
 {
     uint8_t init_cmd[] = {0xBE, 0x08, 0x00};
+
+    i2c_cmd_handle_t h = i2c_cmd_link_create();
+    i2c_master_start(h);
+    i2c_master_write_byte(h, (AHT20_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write(h, init_cmd, sizeof(init_cmd), true);
+    i2c_master_stop(h);
+    esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(h);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(AHT20_POWERUP_DELAY_MS));
+    return true;
+}
+
+static sensor_read_status_t aht20_read(float *temp, float *hum)
+{
     uint8_t trig_cmd[] = {0xAC, 0x33, 0x00};
+    // Six bytes is status + five measurement bytes. CRC is intentionally not
+    // read by this legacy I2C driver path; status/range checks reject bad samples.
     uint8_t data[6];
 
     i2c_cmd_handle_t h = i2c_cmd_link_create();
     i2c_master_start(h);
     i2c_master_write_byte(h, (AHT20_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write(h, init_cmd, 3, true);
+    i2c_master_write(h, trig_cmd, sizeof(trig_cmd), true);
     i2c_master_stop(h);
     if (i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100)) != ESP_OK) {
         i2c_cmd_link_delete(h);
-        return false;
+        return SENSOR_READ_BUS_ERROR;
     }
     i2c_cmd_link_delete(h);
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    h = i2c_cmd_link_create();
-    i2c_master_start(h);
-    i2c_master_write_byte(h, (AHT20_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write(h, trig_cmd, 3, true);
-    i2c_master_stop(h);
-    if (i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100)) != ESP_OK) {
-        i2c_cmd_link_delete(h);
-        return false;
-    }
-    i2c_cmd_link_delete(h);
-    vTaskDelay(pdMS_TO_TICKS(80));
+    vTaskDelay(pdMS_TO_TICKS(AHT20_MEASURE_DELAY_MS));
 
     h = i2c_cmd_link_create();
     i2c_master_start(h);
     i2c_master_write_byte(h, (AHT20_ADDR << 1) | I2C_MASTER_READ, true);
-    i2c_master_read(h, data, 6, I2C_MASTER_LAST_NACK);
+    i2c_master_read(h, data, sizeof(data), I2C_MASTER_LAST_NACK);
     i2c_master_stop(h);
     if (i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100)) != ESP_OK) {
         i2c_cmd_link_delete(h);
-        return false;
+        return SENSOR_READ_BUS_ERROR;
     }
     i2c_cmd_link_delete(h);
+
+    if ((data[0] & AHT20_STATUS_BUSY) != 0) {
+        ESP_LOGW(TAG, "AHT20: measurement still busy, status=0x%02x", data[0]);
+        return SENSOR_READ_INVALID;
+    }
+    if ((data[0] & AHT20_STATUS_CALIBRATED) == 0) {
+        ESP_LOGW(TAG, "AHT20: not calibrated, status=0x%02x; reinitializing", data[0]);
+        aht20_init();
+        return SENSOR_READ_INVALID;
+    }
 
     uint32_t hum_raw = ((uint32_t)data[1] << 12) | ((uint32_t)data[2] << 4) | (data[3] >> 4);
     uint32_t temp_raw = (((uint32_t)data[3] & 0x0F) << 16) | ((uint32_t)data[4] << 8) | data[5];
 
-    *temp = (float)temp_raw / 1048576.0f * 200.0f - 50.0f;
-    *hum = (float)hum_raw / 1048576.0f * 100.0f;
+    float measured_temp = (float)temp_raw / 1048576.0f * 200.0f - 50.0f;
+    float measured_hum = (float)hum_raw / 1048576.0f * 100.0f;
 
-    return true;
+    if (measured_temp < AHT20_TEMP_MIN_C || measured_temp > AHT20_TEMP_MAX_C ||
+        measured_hum < AHT20_HUM_MIN_PCT || measured_hum > AHT20_HUM_MAX_PCT) {
+        ESP_LOGW(TAG,
+                 "AHT20: rejecting out-of-range sample temp=%.2f hum=%.2f status=0x%02x",
+                 measured_temp, measured_hum, data[0]);
+        return SENSOR_READ_INVALID;
+    }
+
+    *temp = measured_temp;
+    *hum = measured_hum;
+    return SENSOR_READ_OK;
 }
 
 // ==================== BH1750 ====================
 
-static bool bh1750_read(float *lux)
+static sensor_read_status_t bh1750_read(float *lux)
 {
     uint8_t cmd = 0x10;
 
@@ -166,7 +213,7 @@ static bool bh1750_read(float *lux)
     i2c_master_stop(h);
     if (i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100)) != ESP_OK) {
         i2c_cmd_link_delete(h);
-        return false;
+        return SENSOR_READ_BUS_ERROR;
     }
     i2c_cmd_link_delete(h);
     vTaskDelay(pdMS_TO_TICKS(180));
@@ -179,14 +226,20 @@ static bool bh1750_read(float *lux)
     i2c_master_stop(h);
     if (i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100)) != ESP_OK) {
         i2c_cmd_link_delete(h);
-        return false;
+        return SENSOR_READ_BUS_ERROR;
     }
     i2c_cmd_link_delete(h);
 
     uint16_t raw = ((uint16_t)data[0] << 8) | data[1];
-    *lux = (float)raw / 1.2f;
+    float measured_lux = (float)raw / 1.2f;
+    if (measured_lux < 0.0f || measured_lux > BH1750_LUX_MAX) {
+        ESP_LOGW(TAG, "BH1750: rejecting out-of-range lux=%.1f raw=0x%04x",
+                 measured_lux, raw);
+        return SENSOR_READ_INVALID;
+    }
 
-    return true;
+    *lux = measured_lux;
+    return SENSOR_READ_OK;
 }
 
 // ==================== Zigbee endpoint / clusters ====================
@@ -509,7 +562,8 @@ static void log_report_stats(TickType_t now)
 
     ESP_LOGI(TAG,
              "REPORT_STATS: rounds=%lu repairs=%lu i2c_th_fail=%lu i2c_lux_fail=%lu "
-             "attempts=%lu queued=%lu queue_fail=%lu items_failed=%lu aps_ok=%lu aps_fail=%lu",
+             "attempts=%lu queued=%lu queue_fail=%lu items_failed=%lu aps_ok=%lu aps_fail=%lu "
+             "th_invalid=%lu lux_invalid=%lu",
              (unsigned long)s_report_rounds,
              (unsigned long)s_report_repairs,
              (unsigned long)s_i2c_th_failures,
@@ -519,12 +573,17 @@ static void log_report_stats(TickType_t now)
              (unsigned long)s_report_enqueue_failures,
              (unsigned long)s_report_items_failed,
              (unsigned long)s_aps_confirm_success,
-             (unsigned long)s_aps_confirm_failure);
+             (unsigned long)s_aps_confirm_failure,
+             (unsigned long)s_sensor_th_invalid,
+             (unsigned long)s_sensor_lux_invalid);
 }
 
 static void sensor_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(5000));
+
+    bool aht20_ready = aht20_init();
+    ESP_LOGI(TAG, "AHT20 initial setup: %s", aht20_ready ? "OK" : "failed; will retry");
 
     while (1) {
         if (!s_zigbee_connected) {
@@ -538,8 +597,18 @@ static void sensor_task(void *arg)
         report_window_close();
 
         float temp = 0, hum = 0, lux = 0;
-        bool have_temp_hum = aht20_read(&temp, &hum);
-        bool have_lux = bh1750_read(&lux);
+        sensor_read_status_t th_status = SENSOR_READ_BUS_ERROR;
+        if (aht20_ready) {
+            th_status = aht20_read(&temp, &hum);
+        } else {
+            aht20_ready = aht20_init();
+            if (aht20_ready) {
+                ESP_LOGI(TAG, "AHT20 setup recovered");
+            }
+        }
+        sensor_read_status_t lux_status = bh1750_read(&lux);
+        bool have_temp_hum = th_status == SENSOR_READ_OK;
+        bool have_lux = lux_status == SENSOR_READ_OK;
         uint8_t report_flags = 0;
 
         if (have_temp_hum) {
@@ -548,9 +617,11 @@ static void sensor_task(void *arg)
             s_last_sample.hum = (uint16_t)(hum * 100.0f);
             s_last_sample.valid_flags |= SAMPLE_FLAG_TEMP | SAMPLE_FLAG_HUM;
             report_flags |= SAMPLE_FLAG_TEMP | SAMPLE_FLAG_HUM;
+        } else if (th_status == SENSOR_READ_INVALID) {
+            s_sensor_th_invalid++;
         } else {
             s_i2c_th_failures++;
-            ESP_LOGW(TAG, "I2C: AHT20 temperature/humidity read failed");
+            ESP_LOGW(TAG, "AHT20: temperature/humidity bus read unavailable");
         }
 
         if (have_lux) {
@@ -559,9 +630,11 @@ static void sensor_task(void *arg)
             s_last_sample.lux = (uint16_t)log_val;
             s_last_sample.valid_flags |= SAMPLE_FLAG_LUX;
             report_flags |= SAMPLE_FLAG_LUX;
+        } else if (lux_status == SENSOR_READ_INVALID) {
+            s_sensor_lux_invalid++;
         } else {
             s_i2c_lux_failures++;
-            ESP_LOGW(TAG, "I2C: BH1750 illuminance read failed");
+            ESP_LOGW(TAG, "BH1750: illuminance bus read unavailable");
         }
 
         ESP_LOGI(TAG,

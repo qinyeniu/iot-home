@@ -18,6 +18,7 @@
 #include "nvs_flash.h"
 #include "esp_zigbee_core.h"
 #include "nwk/esp_zigbee_nwk.h"
+#include "aps/esp_zigbee_aps.h"
 #include "driver/i2c.h"
 
 // ==================== Configuration ====================
@@ -31,6 +32,17 @@
 
 #define SENSOR_INTERVAL_MS      10000   // debug period; deep-sleep phase will change this
 #define REPORT_GAP_MS           200     // gap between the 3 ZCL reports
+#define REPORT_SEND_ATTEMPTS    3       // immediate retries if the ZCL stack refuses a report
+#define REPORT_RETRY_DELAY_MS   200
+#define REPORT_APS_REPAIRS      2       // extra full-cache repairs after APS send failure
+#define REPORT_STATS_MS         60000
+#define REPORT_APS_RADIUS       10
+
+// Minimal ZCL Report Attributes frame used by the raw APS path below.
+#define ZCL_FRAME_REPORT_SERVER_TO_CLIENT  0x18
+#define ZCL_CMD_REPORT_ATTRIBUTES          0x0a
+#define ZCL_TYPE_UNSIGNED_16BIT            0x21
+#define ZCL_TYPE_SIGNED_16BIT              0x29
 
 #define EP_SENSOR               10      // endpoint on both node and gateway
 #define COORDINATOR_SHORT_ADDR  0x0000
@@ -55,6 +67,39 @@ static const char *TAG = "zb-sensor";
 
 static volatile bool s_zigbee_connected = false;
 static uint16_t s_short_addr = 0;
+static TaskHandle_t s_sensor_task_handle = NULL;
+static uint8_t s_zcl_report_sequence = 0;
+
+// Latest valid scaled ZCL values. They are used only to repair a report that
+// was accepted but later failed at APS level; a fresh I2C failure does not
+// publish stale readings as a new sample.
+typedef struct {
+    int16_t temp;
+    uint16_t hum;
+    uint16_t lux;
+    uint8_t valid_flags;
+} sensor_sample_t;
+
+#define SAMPLE_FLAG_TEMP        (1u << 0)
+#define SAMPLE_FLAG_HUM         (1u << 1)
+#define SAMPLE_FLAG_LUX         (1u << 2)
+
+static sensor_sample_t s_last_sample = {0};
+
+static portMUX_TYPE s_report_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_report_window_open = false;
+static volatile uint8_t s_reports_in_flight = 0;
+static volatile uint32_t s_aps_confirm_success = 0;
+static volatile uint32_t s_aps_confirm_failure = 0;
+
+static uint32_t s_i2c_th_failures = 0;
+static uint32_t s_i2c_lux_failures = 0;
+static uint32_t s_report_attempts = 0;
+static uint32_t s_report_enqueued = 0;
+static uint32_t s_report_enqueue_failures = 0;
+static uint32_t s_report_items_failed = 0;
+static uint32_t s_report_rounds = 0;
+static uint32_t s_report_repairs = 0;
 
 // ==================== AHT20 ====================
 
@@ -253,6 +298,44 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     }
 }
 
+static bool aps_confirm_is_sensor_report(const esp_zb_apsde_data_confirm_t *confirm)
+{
+    return confirm->dst_addr_mode == ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT
+        && confirm->dst_addr.addr_short == COORDINATOR_SHORT_ADDR
+        && confirm->dst_endpoint == EP_SENSOR
+        && confirm->src_endpoint == EP_SENSOR;
+}
+
+// Runs in Zigbee stack context. Keep it short: only record the APS result and
+// wake the sensor task. Never send another Zigbee frame directly from here.
+static void aps_data_confirm_cb(esp_zb_apsde_data_confirm_t confirm)
+{
+    bool app_report = false;
+
+    if (aps_confirm_is_sensor_report(&confirm)) {
+        taskENTER_CRITICAL(&s_report_state_lock);
+        if (s_report_window_open && s_reports_in_flight > 0) {
+            app_report = true;
+            s_reports_in_flight--;
+        }
+        taskEXIT_CRITICAL(&s_report_state_lock);
+    }
+
+    if (!app_report) {
+        return;
+    }
+
+    if (confirm.status == 0) {
+        s_aps_confirm_success++;
+        return;
+    }
+
+    s_aps_confirm_failure++;
+    if (s_sensor_task_handle != NULL) {
+        xTaskNotify(s_sensor_task_handle, 0, eNoAction);
+    }
+}
+
 static void zigbee_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(3000));
@@ -265,6 +348,7 @@ static void zigbee_task(void *arg)
     ESP_LOGI(TAG, "RX-on-when-idle=%d", esp_zb_get_rx_on_when_idle());
     esp_zb_set_primary_network_channel_set(ESP_ZB_CHANNEL_MASK);
     esp_zb_device_register(create_sensor_ep());
+    esp_zb_aps_data_confirm_handler_register(aps_data_confirm_cb);
     esp_zb_start(false);
 
     ESP_LOGI(TAG, "Zigbee stack started");
@@ -277,25 +361,165 @@ static void zigbee_task(void *arg)
 
 // ==================== ZCL reporting ====================
 
-// Update local attribute value then unicast a Report Attributes command to
-// the coordinator. Must be called while holding the Zigbee stack lock.
-static void report_one_attribute(uint16_t cluster_id, uint16_t attr_id, const void *value)
+static void report_window_reset(void)
 {
+    taskENTER_CRITICAL(&s_report_state_lock);
+    s_report_window_open = true;
+    s_reports_in_flight = 0;
+    taskEXIT_CRITICAL(&s_report_state_lock);
+}
+
+static void report_window_close(void)
+{
+    taskENTER_CRITICAL(&s_report_state_lock);
+    s_report_window_open = false;
+    s_reports_in_flight = 0;
+    taskEXIT_CRITICAL(&s_report_state_lock);
+}
+
+// Update the local ZCL attribute and send a Report Attributes frame through
+// the raw APSDE-DATA service. The high-level ZCL helper does not produce the
+// APS user-payload transmit confirmation used by the self-heal path; the raw
+// request uses APS acknowledgement and invokes aps_data_confirm_cb().
+static esp_err_t report_one_attribute(uint16_t cluster_id,
+                                      uint16_t attr_id,
+                                      const void *value)
+{
+    uint8_t attr_type = (cluster_id == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT)
+                      ? ZCL_TYPE_SIGNED_16BIT : ZCL_TYPE_UNSIGNED_16BIT;
+    uint8_t asdu[3 + 2 + 1 + 2] = {
+        ZCL_FRAME_REPORT_SERVER_TO_CLIENT,
+        ++s_zcl_report_sequence,
+        ZCL_CMD_REPORT_ATTRIBUTES,
+        (uint8_t)(attr_id & 0xff),
+        (uint8_t)(attr_id >> 8),
+        attr_type,
+        0, 0,
+    };
+    memcpy(&asdu[6], value, sizeof(uint16_t));
+
+    esp_zb_apsde_data_req_t req = {
+        .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .dst_addr.addr_short = COORDINATOR_SHORT_ADDR,
+        .dst_endpoint = EP_SENSOR,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .cluster_id = cluster_id,
+        .src_endpoint = EP_SENSOR,
+        .asdu_length = sizeof(asdu),
+        .asdu = asdu,
+        .tx_options = ESP_ZB_APSDE_TX_OPT_SECURITY_ENABLED | ESP_ZB_APSDE_TX_OPT_ACK_TX,
+        .use_alias = false,
+        .alias_src_addr = 0,
+        .alias_seq_num = 0,
+        .radius = REPORT_APS_RADIUS,
+    };
+    esp_err_t err;
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    // Reserve the confirmation slot before the request so an unusually early APS
+    // confirm cannot arrive before the in-flight counter has been incremented.
+    taskENTER_CRITICAL(&s_report_state_lock);
+    s_reports_in_flight++;
+    taskEXIT_CRITICAL(&s_report_state_lock);
+
     esp_zb_zcl_set_attribute_val(EP_SENSOR, cluster_id, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  attr_id, (void *)value, false);
+    err = esp_zb_aps_data_request(&req);
+    if (err != ESP_OK) {
+        taskENTER_CRITICAL(&s_report_state_lock);
+        s_reports_in_flight--;
+        taskEXIT_CRITICAL(&s_report_state_lock);
+    }
+    esp_zb_lock_release();
 
-    esp_zb_zcl_report_attr_cmd_t cmd = {
-        .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = COORDINATOR_SHORT_ADDR,
-            .dst_endpoint = EP_SENSOR,
-            .src_endpoint = EP_SENSOR,
-        },
-        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
-        .clusterID = cluster_id,
-        .attributeID = attr_id,
-        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
-    };
-    esp_zb_zcl_report_attr_cmd_req(&cmd);
+    return err;
+}
+
+static bool report_one_attribute_with_retry(uint16_t cluster_id,
+                                            uint16_t attr_id,
+                                            const void *value,
+                                            const char *name)
+{
+    for (int attempt = 1; attempt <= REPORT_SEND_ATTEMPTS; ++attempt) {
+        esp_err_t err;
+
+        s_report_attempts++;
+        err = report_one_attribute(cluster_id, attr_id, value);
+        if (err == ESP_OK) {
+            s_report_enqueued++;
+            return true;
+        }
+
+        s_report_enqueue_failures++;
+        ESP_LOGW(TAG, "REPORT_QUEUE: %s attempt %d/%d failed: %s",
+                 name, attempt, REPORT_SEND_ATTEMPTS, esp_err_to_name(err));
+        if (attempt < REPORT_SEND_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(REPORT_RETRY_DELAY_MS));
+        }
+    }
+
+    s_report_items_failed++;
+    return false;
+}
+
+static bool send_sensor_reports(uint8_t flags, const char *reason)
+{
+    bool all_ok = true;
+
+    ESP_LOGI(TAG, "REPORT_SEND: reason=%s flags=0x%02x", reason, flags);
+
+    if ((flags & SAMPLE_FLAG_TEMP) != 0) {
+        all_ok &= report_one_attribute_with_retry(
+            ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+            ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+            &s_last_sample.temp, "temperature");
+        vTaskDelay(pdMS_TO_TICKS(REPORT_GAP_MS));
+    }
+
+    if ((flags & SAMPLE_FLAG_HUM) != 0) {
+        all_ok &= report_one_attribute_with_retry(
+            ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
+            ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID,
+            &s_last_sample.hum, "humidity");
+        vTaskDelay(pdMS_TO_TICKS(REPORT_GAP_MS));
+    }
+
+    if ((flags & SAMPLE_FLAG_LUX) != 0) {
+        all_ok &= report_one_attribute_with_retry(
+            ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT,
+            ESP_ZB_ZCL_ATTR_ILLUMINANCE_MEASUREMENT_MEASURED_VALUE_ID,
+            &s_last_sample.lux, "illuminance");
+    }
+
+    return all_ok;
+}
+
+static void log_report_stats(TickType_t now)
+{
+    static TickType_t last_stats_tick = 0;
+
+    if (last_stats_tick == 0) {
+        last_stats_tick = now;
+        return;
+    }
+    if ((TickType_t)(now - last_stats_tick) < pdMS_TO_TICKS(REPORT_STATS_MS)) {
+        return;
+    }
+    last_stats_tick = now;
+
+    ESP_LOGI(TAG,
+             "REPORT_STATS: rounds=%lu repairs=%lu i2c_th_fail=%lu i2c_lux_fail=%lu "
+             "attempts=%lu queued=%lu queue_fail=%lu items_failed=%lu aps_ok=%lu aps_fail=%lu",
+             (unsigned long)s_report_rounds,
+             (unsigned long)s_report_repairs,
+             (unsigned long)s_i2c_th_failures,
+             (unsigned long)s_i2c_lux_failures,
+             (unsigned long)s_report_attempts,
+             (unsigned long)s_report_enqueued,
+             (unsigned long)s_report_enqueue_failures,
+             (unsigned long)s_report_items_failed,
+             (unsigned long)s_aps_confirm_success,
+             (unsigned long)s_aps_confirm_failure);
 }
 
 static void sensor_task(void *arg)
@@ -309,38 +533,92 @@ static void sensor_task(void *arg)
             continue;
         }
 
+        // Drop a notification left by a report from an earlier reporting window.
+        xTaskNotifyWait(0, 0, NULL, 0);
+        report_window_close();
+
         float temp = 0, hum = 0, lux = 0;
-        bool have_temp = aht20_read(&temp, &hum);
+        bool have_temp_hum = aht20_read(&temp, &hum);
         bool have_lux = bh1750_read(&lux);
+        uint8_t report_flags = 0;
 
-        ESP_LOGI(TAG, "DATA: {\"temp\":%.1f,\"hum\":%.1f,\"lux\":%.1f,\"addr\":\"0x%04x\"}",
-                 have_temp ? temp : 0.0f, have_temp ? hum : 0.0f,
-                 have_lux ? lux : 0.0f, s_short_addr);
-
-        // ZCL scaling: temp int16 in 0.01 C; hum uint16 in 0.01 %;
-        // illuminance uint16 on Zigbee log scale: 10000 * log10(lux + 1)
-        esp_zb_lock_acquire(portMAX_DELAY);
-
-        if (have_temp) {
-            int16_t temp_raw = (int16_t)(temp * 100.0f);
-            uint16_t hum_raw = (uint16_t)(hum * 100.0f);
-            report_one_attribute(ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-                                 ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, &temp_raw);
-            vTaskDelay(pdMS_TO_TICKS(REPORT_GAP_MS));
-            report_one_attribute(ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
-                                 ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID, &hum_raw);
-            vTaskDelay(pdMS_TO_TICKS(REPORT_GAP_MS));
+        if (have_temp_hum) {
+            // ZCL scaling: temp int16 in 0.01 C; humidity uint16 in 0.01 %.
+            s_last_sample.temp = (int16_t)(temp * 100.0f);
+            s_last_sample.hum = (uint16_t)(hum * 100.0f);
+            s_last_sample.valid_flags |= SAMPLE_FLAG_TEMP | SAMPLE_FLAG_HUM;
+            report_flags |= SAMPLE_FLAG_TEMP | SAMPLE_FLAG_HUM;
+        } else {
+            s_i2c_th_failures++;
+            ESP_LOGW(TAG, "I2C: AHT20 temperature/humidity read failed");
         }
+
         if (have_lux) {
+            // Illuminance uses the Zigbee log scale: 10000 * log10(lux + 1).
             float log_val = lux > 0.0f ? 10000.0f * log10f(lux + 1.0f) : 0.0f;
-            uint16_t lux_raw = (uint16_t)log_val;
-            report_one_attribute(ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT,
-                                 ESP_ZB_ZCL_ATTR_ILLUMINANCE_MEASUREMENT_MEASURED_VALUE_ID, &lux_raw);
+            s_last_sample.lux = (uint16_t)log_val;
+            s_last_sample.valid_flags |= SAMPLE_FLAG_LUX;
+            report_flags |= SAMPLE_FLAG_LUX;
+        } else {
+            s_i2c_lux_failures++;
+            ESP_LOGW(TAG, "I2C: BH1750 illuminance read failed");
         }
 
-        esp_zb_lock_release();
+        ESP_LOGI(TAG,
+                 "DATA: {\"temp\":%.1f,\"hum\":%.1f,\"lux\":%.1f,\"addr\":\"0x%04x\","
+                 "\"th_ok\":%s,\"lux_ok\":%s}",
+                 have_temp_hum ? temp : 0.0f,
+                 have_temp_hum ? hum : 0.0f,
+                 have_lux ? lux : 0.0f,
+                 s_short_addr,
+                 have_temp_hum ? "true" : "false",
+                 have_lux ? "true" : "false");
 
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
+        s_report_rounds++;
+        report_window_reset();
+        bool queued = send_sensor_reports(report_flags, "sample");
+        log_report_stats(xTaskGetTickCount());
+
+        if (!queued) {
+            // The next sample is taken quickly. If I2C is healthy it supersedes
+            // the failed values; if I2C also fails, APS repair can still use cache.
+            report_window_close();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SENSOR_INTERVAL_MS);
+        uint32_t repairs_this_round = 0;
+
+        while (repairs_this_round < REPORT_APS_REPAIRS) {
+            TickType_t now = xTaskGetTickCount();
+            TickType_t remaining = (TickType_t)(deadline - now);
+            if ((int32_t)remaining <= 0) {
+                break;
+            }
+
+            if (xTaskNotifyWait(0, 0, NULL, remaining) != pdTRUE) {
+                break;  // Normal 10-second reporting period elapsed.
+            }
+
+            repairs_this_round++;
+            s_report_repairs++;
+            ESP_LOGW(TAG,
+                     "REPORT_APS: send failure #%lu confirmed; repair %lu/%u",
+                     (unsigned long)s_aps_confirm_failure,
+                     (unsigned long)repairs_this_round,
+                     REPORT_APS_REPAIRS);
+
+            vTaskDelay(pdMS_TO_TICKS(1000 * repairs_this_round));
+            report_window_reset();
+            if (!send_sensor_reports(s_last_sample.valid_flags, "aps-repair")) {
+                ESP_LOGE(TAG, "REPORT_APS: repair reports could not be queued");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                break;
+            }
+        }
+
+        report_window_close();
     }
 }
 
@@ -383,8 +661,10 @@ void app_main(void)
     }
     ESP_LOGW(TAG, "I2C SCAN: expect AHT20=0x38 BH1750=0x23");
 
+    // Create the sensor task first so its notification handle exists before
+    // the Zigbee task registers the APS confirm callback.
+    xTaskCreate(sensor_task, "sensor", 4096, NULL, 5, &s_sensor_task_handle);
     xTaskCreate(zigbee_task, "zigbee", 16384, NULL, 5, NULL);
-    xTaskCreate(sensor_task, "sensor", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "Zigbee sensor node ready!");
 }

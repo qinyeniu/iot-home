@@ -19,13 +19,15 @@
 #include "esp_zigbee_core.h"
 #include "nwk/esp_zigbee_nwk.h"
 #include "aps/esp_zigbee_aps.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 
 // ==================== Configuration ====================
 
 #define I2C_SDA_PIN             2
 #define I2C_SCL_PIN             3
 #define I2C_FREQ_HZ             100000
+#define I2C_TIMEOUT_MS          100
+#define I2C_SCAN_TIMEOUT_MS     50
 
 #define AHT20_ADDR              0x38
 #define BH1750_ADDR             0x23
@@ -123,20 +125,65 @@ static uint32_t s_report_items_failed = 0;
 static uint32_t s_report_rounds = 0;
 static uint32_t s_report_repairs = 0;
 
+static i2c_master_bus_handle_t s_i2c_bus = NULL;
+static i2c_master_dev_handle_t s_aht20_dev = NULL;
+static i2c_master_dev_handle_t s_bh1750_dev = NULL;
+
+// ==================== I2C bus / sensors ====================
+
+static esp_err_t i2c_sensor_bus_init(void)
+{
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = I2C_SDA_PIN,
+        .scl_io_num = I2C_SCL_PIN,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .intr_priority = 0,
+        .trans_queue_depth = 0,
+        .flags.enable_internal_pullup = true,
+    };
+    esp_err_t err = i2c_new_master_bus(&bus_config, &s_i2c_bus);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C: create bus failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    i2c_device_config_t aht20_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = AHT20_ADDR,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+    err = i2c_master_bus_add_device(s_i2c_bus, &aht20_config, &s_aht20_dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C: add AHT20 failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    i2c_device_config_t bh1750_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = BH1750_ADDR,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+    err = i2c_master_bus_add_device(s_i2c_bus, &bh1750_config, &s_bh1750_dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C: add BH1750 failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
 // ==================== AHT20 ====================
 
 static bool aht20_init(void)
 {
     uint8_t init_cmd[] = {0xBE, 0x08, 0x00};
 
-    i2c_cmd_handle_t h = i2c_cmd_link_create();
-    i2c_master_start(h);
-    i2c_master_write_byte(h, (AHT20_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write(h, init_cmd, sizeof(init_cmd), true);
-    i2c_master_stop(h);
-    esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(h);
+    esp_err_t err = i2c_master_transmit(s_aht20_dev, init_cmd, sizeof(init_cmd),
+                                        I2C_TIMEOUT_MS);
     if (err != ESP_OK) {
+        ESP_LOGW(TAG, "AHT20: init command failed: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -166,28 +213,19 @@ static sensor_read_status_t aht20_read(float *temp, float *hum)
     // Status + five measurement bytes + CRC-8.
     uint8_t data[AHT20_DATA_LEN];
 
-    i2c_cmd_handle_t h = i2c_cmd_link_create();
-    i2c_master_start(h);
-    i2c_master_write_byte(h, (AHT20_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write(h, trig_cmd, sizeof(trig_cmd), true);
-    i2c_master_stop(h);
-    if (i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100)) != ESP_OK) {
-        i2c_cmd_link_delete(h);
+    esp_err_t err = i2c_master_transmit(s_aht20_dev, trig_cmd, sizeof(trig_cmd),
+                                        I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "AHT20: measurement trigger failed: %s", esp_err_to_name(err));
         return SENSOR_READ_BUS_ERROR;
     }
-    i2c_cmd_link_delete(h);
     vTaskDelay(pdMS_TO_TICKS(AHT20_MEASURE_DELAY_MS));
 
-    h = i2c_cmd_link_create();
-    i2c_master_start(h);
-    i2c_master_write_byte(h, (AHT20_ADDR << 1) | I2C_MASTER_READ, true);
-    i2c_master_read(h, data, sizeof(data), I2C_MASTER_LAST_NACK);
-    i2c_master_stop(h);
-    if (i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100)) != ESP_OK) {
-        i2c_cmd_link_delete(h);
+    err = i2c_master_receive(s_aht20_dev, data, sizeof(data), I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "AHT20: measurement receive failed: %s", esp_err_to_name(err));
         return SENSOR_READ_BUS_ERROR;
     }
-    i2c_cmd_link_delete(h);
 
     if ((data[0] & AHT20_STATUS_BUSY) != 0) {
         ESP_LOGW(TAG, "AHT20: measurement still busy, status=0x%02x", data[0]);
@@ -230,29 +268,19 @@ static sensor_read_status_t bh1750_read(float *lux)
 {
     uint8_t cmd = 0x10;
 
-    i2c_cmd_handle_t h = i2c_cmd_link_create();
-    i2c_master_start(h);
-    i2c_master_write_byte(h, (BH1750_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(h, cmd, true);
-    i2c_master_stop(h);
-    if (i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100)) != ESP_OK) {
-        i2c_cmd_link_delete(h);
+    esp_err_t err = i2c_master_transmit(s_bh1750_dev, &cmd, sizeof(cmd), I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "BH1750: measurement trigger failed: %s", esp_err_to_name(err));
         return SENSOR_READ_BUS_ERROR;
     }
-    i2c_cmd_link_delete(h);
     vTaskDelay(pdMS_TO_TICKS(180));
 
     uint8_t data[2];
-    h = i2c_cmd_link_create();
-    i2c_master_start(h);
-    i2c_master_write_byte(h, (BH1750_ADDR << 1) | I2C_MASTER_READ, true);
-    i2c_master_read(h, data, 2, I2C_MASTER_LAST_NACK);
-    i2c_master_stop(h);
-    if (i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100)) != ESP_OK) {
-        i2c_cmd_link_delete(h);
+    err = i2c_master_receive(s_bh1750_dev, data, sizeof(data), I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "BH1750: measurement receive failed: %s", esp_err_to_name(err));
         return SENSOR_READ_BUS_ERROR;
     }
-    i2c_cmd_link_delete(h);
 
     uint16_t raw = ((uint16_t)data[0] << 8) | data[1];
     float measured_lux = (float)raw / 1.2f;
@@ -734,27 +762,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    i2c_config_t i2c_cfg = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
-    };
-    i2c_param_config(I2C_NUM_0, &i2c_cfg);
-    i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
+    ESP_ERROR_CHECK(i2c_sensor_bus_init());
     ESP_LOGI(TAG, "I2C init OK (SDA=%d SCL=%d)", I2C_SDA_PIN, I2C_SCL_PIN);
 
     // Temporary wiring diagnostic: scan bus for AHT20 (0x38) / BH1750 (0x23)
     for (uint8_t a = 1; a < 127; a++) {
-        i2c_cmd_handle_t hh = i2c_cmd_link_create();
-        i2c_master_start(hh);
-        i2c_master_write_byte(hh, (a << 1) | I2C_MASTER_WRITE, true);
-        i2c_master_stop(hh);
-        esp_err_t r = i2c_master_cmd_begin(I2C_NUM_0, hh, pdMS_TO_TICKS(50));
-        i2c_cmd_link_delete(hh);
-        if (r == ESP_OK) ESP_LOGW(TAG, "I2C SCAN: found 0x%02x", a);
+        if (i2c_master_probe(s_i2c_bus, a, I2C_SCAN_TIMEOUT_MS) == ESP_OK) {
+            ESP_LOGW(TAG, "I2C SCAN: found 0x%02x", a);
+        }
     }
     ESP_LOGW(TAG, "I2C SCAN: expect AHT20=0x38 BH1750=0x23");
 

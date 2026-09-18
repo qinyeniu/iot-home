@@ -54,6 +54,8 @@
 #define REPORT_APS_REPAIRS      2       // extra full-cache repairs after APS send failure
 #define REPORT_STATS_MS         60000
 #define REPORT_APS_RADIUS       10
+#define ZIGBEE_LINK_RESTEER_DELAY_MS  1000
+#define ZIGBEE_STEERING_FAIL_RETRY_MS 5000
 
 // Minimal ZCL Report Attributes frame used by the raw APS path below.
 #define ZCL_FRAME_REPORT_SERVER_TO_CLIENT  0x18
@@ -83,6 +85,8 @@
 static const char *TAG = "zb-sensor";
 
 static volatile bool s_zigbee_connected = false;
+static volatile bool s_network_steering_pending = false;
+static volatile bool s_link_resteer_forced = false;
 static uint16_t s_short_addr = 0;
 static TaskHandle_t s_sensor_task_handle = NULL;
 static uint8_t s_zcl_report_sequence = 0;
@@ -444,9 +448,75 @@ static esp_zb_ep_list_t *create_sensor_ep(void)
 
 // ==================== Zigbee signals ====================
 
-static void bdb_commissioning_cb(uint8_t mode_mask)
+static void network_steering_timer_cb(uint8_t mode_mask);
+static void schedule_network_steering(uint32_t delay_ms);
+
+static void zigbee_mark_connected(const char *reason)
 {
-    esp_zb_bdb_start_top_level_commissioning(mode_mask);
+    s_link_resteer_forced = false;
+    s_network_steering_pending = false;
+    s_zigbee_connected = true;
+    s_short_addr = esp_zb_get_short_address();
+    esp_zb_scheduler_alarm_cancel(network_steering_timer_cb,
+                                  ESP_ZB_BDB_MODE_NETWORK_STEERING);
+    ESP_LOGI(TAG, "Zigbee: connected (%s); short addr=0x%04x", reason, s_short_addr);
+}
+
+static void network_steering_timer_cb(uint8_t mode_mask)
+{
+    esp_zb_bdb_commissioning_status_t bdb_status;
+    esp_err_t err;
+
+    s_network_steering_pending = false;
+    bdb_status = esp_zb_get_bdb_commissioning_status();
+    ESP_LOGI(TAG, "Zigbee: steering timer, bdb status=%d forced=%d",
+             (int)bdb_status, (int)s_link_resteer_forced);
+
+    if (bdb_status == ESP_ZB_BDB_STATUS_ON_A_NETWORK && !s_link_resteer_forced) {
+        zigbee_mark_connected("already on network");
+        return;
+    }
+
+    err = esp_zb_bdb_start_top_level_commissioning(mode_mask);
+    if (err != ESP_OK) {
+        bdb_status = esp_zb_get_bdb_commissioning_status();
+        ESP_LOGW(TAG, "Zigbee: steering start failed: %s; bdb status=%d",
+                 esp_err_to_name(err), (int)bdb_status);
+        if (bdb_status == ESP_ZB_BDB_STATUS_ON_A_NETWORK && !s_link_resteer_forced) {
+            zigbee_mark_connected("steering rejected");
+        } else {
+            schedule_network_steering(ZIGBEE_STEERING_FAIL_RETRY_MS);
+        }
+    }
+}
+
+static void schedule_network_steering(uint32_t delay_ms)
+{
+    if (s_network_steering_pending) {
+        ESP_LOGI(TAG, "Zigbee: network steering already pending");
+        return;
+    }
+
+    s_network_steering_pending = true;
+    esp_zb_scheduler_alarm_cancel(network_steering_timer_cb,
+                                  ESP_ZB_BDB_MODE_NETWORK_STEERING);
+    esp_zb_scheduler_alarm(network_steering_timer_cb,
+                           ESP_ZB_BDB_MODE_NETWORK_STEERING,
+                           delay_ms);
+}
+
+static void report_window_close(void);
+
+static void zigbee_link_lost(esp_zb_app_signal_type_t signal, esp_err_t status)
+{
+    ESP_LOGW(TAG,
+             "Zigbee: link lost signal=%d status=0x%x; mark offline and steer again",
+             (int)signal, (unsigned)status);
+    s_link_resteer_forced = true;
+    s_zigbee_connected = false;
+    s_short_addr = 0;
+    report_window_close();
+    schedule_network_steering(ZIGBEE_LINK_RESTEER_DELAY_MS);
 }
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
@@ -468,35 +538,49 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 ESP_LOGI(TAG, "Zigbee: Start steering");
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
             } else {
-                ESP_LOGI(TAG, "Zigbee: Rebooted, connected");
-                s_zigbee_connected = true;
-                s_short_addr = esp_zb_get_short_address();
-                ESP_LOGI(TAG, "Zigbee: Short addr=0x%04x", s_short_addr);
+                zigbee_mark_connected("device reboot");
             }
         } else {
-            ESP_LOGW(TAG, "Zigbee: Startup/rejoin failed (0x%x), retry steering", (unsigned)err_status);
-            // A previously commissioned ZED first attempts a silent rejoin.
-            // If that parent/rejoin attempt fails, explicitly run network
-            // steering instead of waiting forever for another signal.
-            if (sig_type == ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT) {
-                esp_zb_scheduler_alarm(bdb_commissioning_cb,
-                                       ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+            esp_zb_bdb_commissioning_status_t bdb_status =
+                esp_zb_get_bdb_commissioning_status();
+            ESP_LOGW(TAG,
+                     "Zigbee: Startup/rejoin failed (0x%x), bdb status=%d; retry steering",
+                     (unsigned)err_status, (int)bdb_status);
+            if (bdb_status == ESP_ZB_BDB_STATUS_ON_A_NETWORK && !s_link_resteer_forced) {
+                zigbee_mark_connected("reboot bdb status");
+            } else if (sig_type == ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT) {
+                // A previously commissioned ZED first attempts a silent rejoin.
+                // If that parent/rejoin attempt fails, explicitly run network
+                // steering instead of waiting forever for another signal.
+                schedule_network_steering(ZIGBEE_LINK_RESTEER_DELAY_MS);
             }
         }
         break;
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err_status == ESP_OK) {
             ESP_LOGI(TAG, "Zigbee: Connected to network!");
-            s_zigbee_connected = true;
-            s_short_addr = esp_zb_get_short_address();
-            ESP_LOGI(TAG, "Zigbee: Short addr=0x%04x", s_short_addr);
-            esp_zb_scheduler_alarm_cancel(bdb_commissioning_cb,
-                                          ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            zigbee_mark_connected("network steering");
         } else {
-            ESP_LOGW(TAG, "Zigbee: Steering failed (0x%x), retry in 5s", (unsigned)err_status);
-            esp_zb_scheduler_alarm(bdb_commissioning_cb,
-                                   ESP_ZB_BDB_MODE_NETWORK_STEERING, 5000);
+            esp_zb_bdb_commissioning_status_t bdb_status =
+                esp_zb_get_bdb_commissioning_status();
+            ESP_LOGW(TAG,
+                     "Zigbee: Steering failed (0x%x), bdb status=%d; retry in 5s",
+                     (unsigned)err_status, (int)bdb_status);
+            if (bdb_status == ESP_ZB_BDB_STATUS_ON_A_NETWORK && !s_link_resteer_forced) {
+                zigbee_mark_connected("steering bdb status");
+            } else {
+                schedule_network_steering(ZIGBEE_STEERING_FAIL_RETRY_MS);
+            }
         }
+        break;
+    case ESP_ZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT:
+    case ESP_ZB_ZDO_DEVICE_UNAVAILABLE:
+        zigbee_link_lost(sig_type, err_status);
+        break;
+    case ESP_ZB_NLME_STATUS_INDICATION:
+        // A healthy centralized network can emit periodic NWK status/address
+        // verification indications. Link loss is handled by the explicit
+        // signals above, so do not spam the log every few seconds here.
         break;
     default:
         ESP_LOGI(TAG, "Zigbee signal: %d", sig_type);
@@ -671,6 +755,11 @@ static bool report_one_attribute_with_retry(uint16_t cluster_id,
 static bool send_sensor_reports(uint8_t flags, const char *reason)
 {
     bool all_ok = true;
+
+    if (!s_zigbee_connected) {
+        ESP_LOGI(TAG, "REPORT_SEND: skipped reason=%s while Zigbee is offline", reason);
+        return false;
+    }
 
     ESP_LOGI(TAG, "REPORT_SEND: reason=%s flags=0x%02x", reason, flags);
 
@@ -870,6 +959,12 @@ static void sensor_task(void *arg)
 
             if (xTaskNotifyWait(0, 0, NULL, remaining) != pdTRUE) {
                 break;  // Normal 10-second reporting period elapsed.
+            }
+
+            if (!s_zigbee_connected) {
+                ESP_LOGI(TAG, "REPORT_APS: stop repair; Zigbee link is offline");
+                report_window_close();
+                break;
             }
 
             repairs_this_round++;

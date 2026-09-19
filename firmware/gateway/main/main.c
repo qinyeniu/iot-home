@@ -16,6 +16,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -94,6 +95,7 @@ typedef enum {
     ZB_APP_EVENT_JOIN = 1,
     ZB_APP_EVENT_REPORT,
     ZB_APP_EVENT_LEAVE,
+    ZB_APP_EVENT_SIGNAL,
 } zb_app_event_type_t;
 
 typedef struct {
@@ -102,23 +104,136 @@ typedef struct {
     uint16_t cluster;
     uint16_t raw;
     uint8_t ieee[8];
+    uint8_t signal;
+    uint8_t value;
+    int32_t status;
 } zb_app_event_t;
 
-static QueueHandle_t s_zb_app_q;
-static uint32_t s_zb_report_events;
+_Static_assert((int)ESP_ZB_SIGNAL_END <= 0xff,
+               "Widen zb_app_event_t.signal for the installed Zigbee SDK");
 
-static void zb_app_event_send(const zb_app_event_t *event)
+#define ZB_APP_QUEUE_LEN            32
+#define ZB_SIGNAL_QUEUE_LEN         16
+
+static QueueHandle_t s_zb_app_q;
+static QueueHandle_t s_zb_signal_q;
+static QueueSetHandle_t s_zb_queue_set;
+static uint32_t s_zb_report_events;
+// Keep task- and ISR-like-context drops separate so the counters themselves do
+// not need a lock or non-atomic read-modify-write.
+static volatile uint32_t s_zb_app_drops_task;
+static volatile uint32_t s_zb_app_drops_isr;
+static volatile uint32_t s_zb_signal_drops_task;
+static volatile uint32_t s_zb_signal_drops_isr;
+
+// ZBOSS may invoke callbacks from task or restricted/ISR-like context.
+// Non-blocking delivery must never stall the stack; count rare queue drops.
+static bool zb_queue_try_send(QueueHandle_t queue,
+                              const zb_app_event_t *event,
+                              volatile uint32_t *task_drops,
+                              volatile uint32_t *isr_drops)
 {
-    if (s_zb_app_q == NULL) {
-        return;
+    bool from_isr = !xPortCanYield();
+
+    if (queue == NULL) {
+        if (from_isr) {
+            (*isr_drops)++;
+        } else {
+            (*task_drops)++;
+        }
+        return false;
     }
-    if (xPortCanYield()) {
-        (void)xQueueSend(s_zb_app_q, event, 0);
-    } else {
+
+    bool queued;
+    if (from_isr) {
         BaseType_t higher_woken = pdFALSE;
-        (void)xQueueSendFromISR(s_zb_app_q, event, &higher_woken);
+        queued = xQueueSendFromISR(queue, event, &higher_woken) == pdTRUE;
         portYIELD_FROM_ISR(higher_woken);
+    } else {
+        queued = xQueueSend(queue, event, 0) == pdTRUE;
     }
+
+    if (!queued) {
+        if (from_isr) {
+            (*isr_drops)++;
+        } else {
+            (*task_drops)++;
+        }
+    }
+    return queued;
+}
+
+static bool zb_app_event_send(const zb_app_event_t *event)
+{
+    return zb_queue_try_send(s_zb_app_q, event,
+                             &s_zb_app_drops_task,
+                             &s_zb_app_drops_isr);
+}
+
+// Diagnostic events use a separate queue. Even a pathological signal storm can
+// only discard diagnostics; join/report/leave events keep their own capacity.
+static bool zb_signal_event_send(const zb_app_event_t *event)
+{
+    return zb_queue_try_send(s_zb_signal_q, event,
+                             &s_zb_signal_drops_task,
+                             &s_zb_signal_drops_isr);
+}
+
+// Some ZBOSS callbacks run with scheduling/preemption restricted. Keep them
+// free of logging/VFS and defer diagnostic output to zb_forward_task().
+static void zb_app_signal_event_send(esp_zb_app_signal_type_t signal,
+                                     esp_err_t status,
+                                     uint8_t value)
+{
+    zb_app_event_t event = {
+        .type = ZB_APP_EVENT_SIGNAL,
+        .signal = (uint8_t)signal,
+        .status = (int32_t)status,
+        .value = value,
+    };
+    (void)zb_signal_event_send(&event);
+}
+
+// Minimal ABI-compatible view of the private ZBOSS NLME payload for the
+// installed esp-zboss-lib version. Avoid including internal ZBOSS headers
+// from application code. The short address is read byte-by-byte so the packed
+// offset-one field never generates an unaligned scalar access.
+typedef struct __attribute__((packed)) {
+    uint8_t status;
+    uint8_t network_addr_le[2];
+    uint8_t unknown_command_id;
+} gw_zb_nlme_status_indication_t;
+
+typedef struct {
+    gw_zb_nlme_status_indication_t nlme_status;
+} gw_zb_nlme_status_signal_params_t;
+
+_Static_assert(sizeof(gw_zb_nlme_status_indication_t) == 4,
+               "NLME status indication ABI size mismatch");
+_Static_assert(offsetof(gw_zb_nlme_status_indication_t, status) == 0,
+               "NLME status offset mismatch");
+_Static_assert(offsetof(gw_zb_nlme_status_indication_t,
+                        network_addr_le) == 1,
+               "NLME network address offset mismatch");
+_Static_assert(offsetof(gw_zb_nlme_status_indication_t,
+                        unknown_command_id) == 3,
+               "NLME command id offset mismatch");
+_Static_assert(sizeof(gw_zb_nlme_status_signal_params_t) == 4,
+               "NLME signal params wrapper size mismatch");
+
+// NLME indications can repeat on a healthy small network. Keep at most one
+// non-zero indication per minute even if distinct status codes alternate.
+static bool zb_nlme_diagnostic_allowed(void)
+{
+    static TickType_t last_kept_tick = 0;
+    TickType_t now = xPortCanYield() ? xTaskGetTickCount()
+                                     : xTaskGetTickCountFromISR();
+
+    if ((TickType_t)(now - last_kept_tick) >= pdMS_TO_TICKS(60000)) {
+        last_kept_tick = now;
+        return true;
+    }
+    return false;
 }
 
 // ==================== OLED SSD1306 ====================
@@ -558,6 +673,50 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             }
         }
         break;
+    case ESP_ZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
+        if (err_status == ESP_OK) {
+            const uint8_t *permit_duration =
+                (const uint8_t *)esp_zb_app_signal_get_params(p_sg_p);
+            if (permit_duration != NULL) {
+                zb_app_signal_event_send(sig_type, err_status, *permit_duration);
+            }
+        } else {
+            zb_app_signal_event_send(sig_type, err_status, 0);
+        }
+        break;
+    case ESP_ZB_SE_SIGNAL_REJOIN:
+    case ESP_ZB_SE_SIGNAL_CHILD_REJOIN:
+    case ESP_ZB_BDB_SIGNAL_TC_REJOIN_DONE:
+    case ESP_ZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT:
+    case ESP_ZB_ZDO_DEVICE_UNAVAILABLE:
+        zb_app_signal_event_send(sig_type, err_status, 0);
+        break;
+    case ESP_ZB_NLME_STATUS_INDICATION:
+        {
+            // The real NWK status code is in the signal payload, not in
+            // err_status. Rate-limit all non-zero indications globally.
+            const gw_zb_nlme_status_signal_params_t *nlme_params =
+                (const gw_zb_nlme_status_signal_params_t *)
+                    esp_zb_app_signal_get_params(p_sg_p);
+            if (nlme_params != NULL &&
+                nlme_params->nlme_status.status != 0x00 &&
+                zb_nlme_diagnostic_allowed()) {
+                uint8_t nlme_status = nlme_params->nlme_status.status;
+                uint16_t network_addr =
+                    (uint16_t)nlme_params->nlme_status.network_addr_le[0] |
+                    ((uint16_t)nlme_params->nlme_status.network_addr_le[1] << 8);
+                zb_app_event_t event = {
+                    .type = ZB_APP_EVENT_SIGNAL,
+                    .signal = (uint8_t)sig_type,
+                    .status = (int32_t)err_status,
+                    .value = nlme_status,
+                    .addr = network_addr,
+                    .raw = nlme_params->nlme_status.unknown_command_id,
+                };
+                (void)zb_signal_event_send(&event);
+            }
+        }
+        break;
     default:
         ESP_LOGI(TAG, "Zigbee signal: %d", sig_type);
         break;
@@ -702,24 +861,26 @@ static void zigbee_task(void *arg)
 
     ESP_LOGI(TAG, "Starting Zigbee coordinator...");
     
-    esp_zb_cfg_t zb_cfg;
-    zb_cfg.esp_zb_role = ESP_ZB_DEVICE_TYPE_COORDINATOR;
-    zb_cfg.install_code_policy = INSTALLCODE_POLICY_ENABLE;
-    zb_cfg.nwk_cfg.zczr_cfg.max_children = MAX_CHILDREN;
+    esp_zb_cfg_t zb_cfg = {
+        .esp_zb_role = ESP_ZB_DEVICE_TYPE_COORDINATOR,
+        .install_code_policy = INSTALLCODE_POLICY_ENABLE,
+        .nwk_cfg.zczr_cfg.max_children = MAX_CHILDREN,
+    };
     
     esp_zb_init(&zb_cfg);
     esp_zb_set_primary_network_channel_set(ESP_ZB_CHANNEL_MASK);
     esp_zb_device_register(create_gateway_ep());
     esp_zb_core_action_handler_register(zb_action_handler);
 
-    esp_zb_start(false);
-    
+    ESP_ERROR_CHECK(esp_zb_start(false));
+
     ESP_LOGI(TAG, "Zigbee stack started with ZCL reporting");
-    
-    while (1) {
-        esp_zb_main_loop_iteration();
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
+
+    // The dedicated stack loop is the entry point recommended by ESP-Zigbee
+    // 1.6. Polling the deprecated one-shot iteration every 100 ms adds latency
+    // to coordinator timers and child/rejoin responses under Wi-Fi traffic.
+    esp_zb_stack_main_loop();
+    vTaskDelete(NULL);
 }
 
 // ==================== WiFi ====================
@@ -1329,6 +1490,59 @@ static void zb_handle_report_event(const zb_app_event_t *event)
 static uint32_t s_zb_last_telemetry_ms[MAX_ZB_NODES];
 static char s_zb_last_telemetry_payload[MAX_ZB_NODES][128];
 
+static void zb_handle_signal_event(const zb_app_event_t *event)
+{
+    esp_err_t status = (esp_err_t)event->status;
+    esp_zb_app_signal_type_t signal =
+        (esp_zb_app_signal_type_t)event->signal;
+
+    switch (signal) {
+    case ESP_ZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
+        if (status == ESP_OK) {
+            if (event->value == 0) {
+                ESP_LOGI(TAG, "Zigbee: permit joining closed; secure rejoin may still use existing credentials");
+            } else if (event->value == 0xff) {
+                ESP_LOGI(TAG, "Zigbee: permit joining enabled (duration=0xff)");
+            } else {
+                ESP_LOGI(TAG, "Zigbee: permit joining open for %u seconds",
+                         (unsigned)event->value);
+            }
+        } else {
+            ESP_LOGW(TAG, "Zigbee: permit join status failed: %s",
+                     esp_err_to_name(status));
+        }
+        break;
+    case ESP_ZB_SE_SIGNAL_REJOIN:
+        ESP_LOGI(TAG, "Zigbee: security rejoin event signal=%d status=%s",
+                 (int)signal, esp_err_to_name(status));
+        break;
+    case ESP_ZB_SE_SIGNAL_CHILD_REJOIN:
+        ESP_LOGI(TAG, "Zigbee: security child rejoin signal=%d status=%s",
+                 (int)signal, esp_err_to_name(status));
+        break;
+    case ESP_ZB_BDB_SIGNAL_TC_REJOIN_DONE:
+        ESP_LOGI(TAG, "Zigbee: Trust Center rejoin done status=%s",
+                 esp_err_to_name(status));
+        break;
+    case ESP_ZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT:
+    case ESP_ZB_ZDO_DEVICE_UNAVAILABLE:
+        ESP_LOGW(TAG, "Zigbee: link/service unavailable signal=%d status=%s",
+                 (int)signal, esp_err_to_name(status));
+        break;
+    case ESP_ZB_NLME_STATUS_INDICATION:
+        ESP_LOGW(TAG,
+                 "Zigbee: NLME status indication nwk_status=0x%02x "
+                 "network_addr=0x%04x unknown_cmd=%u signal_status=%s",
+                 (unsigned)event->value, event->addr,
+                 (unsigned)event->raw, esp_err_to_name(status));
+        break;
+    default:
+        ESP_LOGI(TAG, "Zigbee: diagnostic signal=%d status=%s",
+                 (int)signal, esp_err_to_name(status));
+        break;
+    }
+}
+
 static void zb_forward_pending(void)
 {
     if (!s_mqtt_ok) {
@@ -1416,20 +1630,41 @@ static bool zb_have_full_active_sample(void)
     return ready;
 }
 
+static void zb_handle_app_event(const zb_app_event_t *event)
+{
+    if (event->type == ZB_APP_EVENT_JOIN) {
+        zb_handle_join_event(event);
+    } else if (event->type == ZB_APP_EVENT_REPORT) {
+        zb_handle_report_event(event);
+    } else if (event->type == ZB_APP_EVENT_LEAVE) {
+        zb_handle_leave_event(event);
+    } else {
+        ESP_LOGW(TAG, "Zigbee: unexpected business event type=%d",
+                 (int)event->type);
+    }
+}
+
 static void zb_forward_task(void *arg)
 {
+    TickType_t last_app_drop_log_tick = xTaskGetTickCount();
+    TickType_t last_signal_drop_log_tick = xTaskGetTickCount();
+    uint32_t reported_app_drops = 0;
+    uint32_t reported_signal_drops = 0;
+
     while (1) {
         zb_app_event_t event;
-        if (xQueueReceive(s_zb_app_q, &event, pdMS_TO_TICKS(ZB_FORWARD_INTERVAL_MS))) {
-            do {
-                if (event.type == ZB_APP_EVENT_JOIN) {
-                    zb_handle_join_event(&event);
-                } else if (event.type == ZB_APP_EVENT_REPORT) {
-                    zb_handle_report_event(&event);
-                } else if (event.type == ZB_APP_EVENT_LEAVE) {
-                    zb_handle_leave_event(&event);
-                }
-            } while (xQueueReceive(s_zb_app_q, &event, 0) == pdTRUE);
+        QueueSetMemberHandle_t active_queue =
+            xQueueSelectFromSet(s_zb_queue_set,
+                                pdMS_TO_TICKS(ZB_FORWARD_INTERVAL_MS));
+
+        if (active_queue == s_zb_app_q) {
+            if (xQueueReceive(s_zb_app_q, &event, 0) == pdTRUE) {
+                zb_handle_app_event(&event);
+            }
+        } else if (active_queue == s_zb_signal_q) {
+            if (xQueueReceive(s_zb_signal_q, &event, 0) == pdTRUE) {
+                zb_handle_signal_event(&event);
+            }
         }
 
         if (s_zb_status_resync && s_mqtt_ok) {
@@ -1437,6 +1672,32 @@ static void zb_forward_task(void *arg)
             zb_publish_known_statuses();
         }
         zb_forward_pending();
+
+        uint32_t app_drops = s_zb_app_drops_task + s_zb_app_drops_isr;
+        if (app_drops != reported_app_drops &&
+            (TickType_t)(xTaskGetTickCount() - last_app_drop_log_tick)
+                >= pdMS_TO_TICKS(60000)) {
+            ESP_LOGW(TAG,
+                     "Zigbee: business event queue drops=%lu (task=%lu isr=%lu)",
+                     (unsigned long)app_drops,
+                     (unsigned long)s_zb_app_drops_task,
+                     (unsigned long)s_zb_app_drops_isr);
+            reported_app_drops = app_drops;
+            last_app_drop_log_tick = xTaskGetTickCount();
+        }
+
+        uint32_t signal_drops = s_zb_signal_drops_task + s_zb_signal_drops_isr;
+        if (signal_drops != reported_signal_drops &&
+            (TickType_t)(xTaskGetTickCount() - last_signal_drop_log_tick)
+                >= pdMS_TO_TICKS(60000)) {
+            ESP_LOGW(TAG,
+                     "Zigbee: diagnostic event queue drops=%lu (task=%lu isr=%lu)",
+                     (unsigned long)signal_drops,
+                     (unsigned long)s_zb_signal_drops_task,
+                     (unsigned long)s_zb_signal_drops_isr);
+            reported_signal_drops = signal_drops;
+            last_signal_drop_log_tick = xTaskGetTickCount();
+        }
     }
 }
 
@@ -1516,10 +1777,20 @@ void app_main(void)
     ESP_LOGW(TAG, "ZB-only RF diagnostic: WiFi and MQTT not started");
 #endif
 
-    // Application events are queued before the Zigbee task can produce them.
-    s_zb_app_q = xQueueCreate(32, sizeof(zb_app_event_t));
-    if (s_zb_app_q == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate Zigbee application event queue");
+    // Business and diagnostic events use independent queues. A signal storm
+    // can never consume business-event capacity or block Zigbee callbacks.
+    s_zb_queue_set = xQueueCreateSet(ZB_APP_QUEUE_LEN + ZB_SIGNAL_QUEUE_LEN);
+    if (s_zb_queue_set == NULL) {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+    s_zb_app_q = xQueueCreate(ZB_APP_QUEUE_LEN, sizeof(zb_app_event_t));
+    s_zb_signal_q = xQueueCreate(ZB_SIGNAL_QUEUE_LEN, sizeof(zb_app_event_t));
+    if (s_zb_app_q == NULL || s_zb_signal_q == NULL) {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+    if (xQueueAddToSet(s_zb_app_q, s_zb_queue_set) != pdTRUE ||
+        xQueueAddToSet(s_zb_signal_q, s_zb_queue_set) != pdTRUE) {
+        ESP_ERROR_CHECK(ESP_FAIL);
     }
 
     // Tasks

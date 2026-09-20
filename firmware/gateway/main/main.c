@@ -1733,10 +1733,10 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_coex_wifi_i154_enable());
     esp_ieee802154_set_coex_config((esp_ieee802154_coex_config_t){
         .idle = IEEE802154_IDLE,
-        .txrx = IEEE802154_HIGH,
-        .txrx_at = IEEE802154_HIGH,
+        .txrx = IEEE802154_LOW,
+        .txrx_at = IEEE802154_MIDDLE,
     });
-    ESP_LOGI(TAG, "Wi-Fi/IEEE 802.15.4 coexistence enabled (15.4 priority HIGH/HIGH)");
+    ESP_LOGI(TAG, "Wi-Fi/IEEE 802.15.4 coexistence enabled (15.4 priority LOW/MIDDLE; Wi-Fi MAX_MODEM)");
 #else
     ESP_LOGW(TAG, "ZB-only RF diagnostic: Wi-Fi/coexistence disabled");
 #endif

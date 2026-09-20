@@ -587,7 +587,7 @@ static void oled_text(int x, int y, const char *s)
 #define ZB_ONLY_RF_DIAG             0  // Temporary RF/coexistence diagnostic
 #define ZB_JOIN_BEFORE_WIFI         1  // Commission on 802.15.4 before enabling Wi-Fi
 #define ZB_JOIN_FIRST_TIMEOUT_MS    180000
-#define ZB_REJOIN_FIRST_TIMEOUT_MS  180000
+#define ZB_REJOIN_FIRST_TIMEOUT_MS 300000
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 {
@@ -1833,7 +1833,9 @@ void app_main(void)
     } else if (first_sample_ready) {
         ESP_LOGI(TAG, "Full Zigbee sample received at %d ms; start IP stack after cache window",
                  join_wait_ms);
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        // Allow two 10-second node samples to receive APS confirmation before
+        // Wi-Fi association adds RF coexistence pressure during startup.
+        vTaskDelay(pdMS_TO_TICKS(12000));
     } else {
         ESP_LOGW(TAG, "Join seen but no full sample in %d ms; start Wi-Fi anyway",
                  join_first_timeout_ms);

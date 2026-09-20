@@ -58,7 +58,9 @@
 #define ZIGBEE_LINK_RESTEER_DELAY_MS  1000
 #define ZIGBEE_STEERING_FAIL_RETRY_MS 5000
 #define ZIGBEE_BDB_BUSY_RETRY_MS   60000
-#define ZB_UNAVAILABLE_VERIFY_DELAY_MS 5000
+#define ZB_UNAVAILABLE_VERIFY_DELAY_MS 10000
+#define LINK_PROBE_MAX_ATTEMPTS    4
+#define LINK_PROBE_RETRY_MS        1500
 #define LINK_PROBE_RETIRED_COUNT 16
 #define LINK_PROBE_RETIRED_TICKS pdMS_TO_TICKS(60000)
 
@@ -117,6 +119,7 @@ static volatile uint32_t s_link_probe_aps_failures = 0;
 static portMUX_TYPE s_link_probe_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile link_probe_state_t s_link_probe_state = LINK_PROBE_IDLE;
 static volatile uint8_t s_link_probe_expected_sequence = 0;
+static volatile uint8_t s_link_probe_attempts = 0;
 static volatile bool s_link_probe_in_flight = false;
 static uint8_t s_zcl_report_sequence = 0;
 
@@ -132,6 +135,7 @@ static void link_probe_reset_locked(void)
 {
     s_link_probe_state = LINK_PROBE_IDLE;
     s_link_probe_expected_sequence = 0;
+    s_link_probe_attempts = 0;
     s_link_probe_in_flight = false;
 }
 
@@ -211,6 +215,7 @@ static bool link_probe_claim_send(uint8_t *sequence)
     if (s_link_probe_state == LINK_PROBE_ACTIVE && s_zigbee_connected) {
         *sequence = ++s_zcl_report_sequence;
         s_link_probe_expected_sequence = *sequence;
+        s_link_probe_attempts++;
         s_link_probe_in_flight = true;
         claimed = true;
     }
@@ -1042,6 +1047,7 @@ static bool aps_confirm_consume_link_probe(
     bool current_match = false;
     bool retired_match = false;
     bool current_success = false;
+    bool retry = false;
     uint8_t sequence = 0;
     TickType_t now = xTaskGetTickCount();
 
@@ -1059,7 +1065,11 @@ static bool aps_confirm_consume_link_probe(
         if (current_success) {
             link_probe_reset_locked();
         } else {
+            bool can_retry = s_link_probe_attempts < LINK_PROBE_MAX_ATTEMPTS;
             s_link_probe_in_flight = false;
+            if (can_retry) {
+                retry = true;
+            }
         }
     } else {
         retired_match = link_probe_take_retired_locked(sequence, now);
@@ -1079,9 +1089,21 @@ static bool aps_confirm_consume_link_probe(
 
     if (current_match) {
         s_link_probe_aps_failures++;
-        ESP_LOGW(TAG,
-                 "Zigbee: active parent-link probe seq=%u failed APS; wait for verification timeout",
-                 (unsigned)sequence);
+        if (retry) {
+            ESP_LOGW(TAG,
+                     "Zigbee: active parent-link probe seq=%u failed APS; retry %u/%u in %d ms",
+                     (unsigned)sequence,
+                     (unsigned)(s_link_probe_attempts + 1),
+                     LINK_PROBE_MAX_ATTEMPTS,
+                     LINK_PROBE_RETRY_MS);
+            esp_zb_scheduler_alarm_cancel(link_probe_send_timer_cb, 0);
+            esp_zb_scheduler_alarm(link_probe_send_timer_cb, 0,
+                                   LINK_PROBE_RETRY_MS);
+        } else {
+            ESP_LOGW(TAG,
+                     "Zigbee: active parent-link probe seq=%u failed APS after %u attempts; wait for verification timeout",
+                     (unsigned)sequence, LINK_PROBE_MAX_ATTEMPTS);
+        }
         return true;
     }
 

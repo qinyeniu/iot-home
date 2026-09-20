@@ -34,6 +34,7 @@
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "esp_zigbee_core.h"
+#include "nwk/esp_zigbee_nwk.h"
 #include "esp_coexist.h"
 #include "esp_ieee802154.h"
 #include "wifi_secrets.h"
@@ -869,6 +870,13 @@ static void zigbee_task(void *arg)
     
     esp_zb_init(&zb_cfg);
     esp_zb_set_primary_network_channel_set(ESP_ZB_CHANNEL_MASK);
+    if (!s_network_formed) {
+        // Re-formation after an explicit pairing-state reset preserves the
+        // documented laboratory PAN ID. With clean ZBOSS NVRAM, the stack
+        // regenerates extended identity/key material.
+        esp_zb_set_pan_id(0x2b9e);
+        ESP_LOGI(TAG, "Zigbee: fresh formation requested; request PANID=0x%04x channel=26", 0x2b9e);
+    }
     esp_zb_device_register(create_gateway_ep());
     esp_zb_core_action_handler_register(zb_action_handler);
 
@@ -1727,6 +1735,7 @@ void app_main(void)
         }
         s_network_formed = (formed != 0);
         s_child_seen = (child != 0);
+
     }
 
 #if !ZB_ONLY_RF_DIAG && CONFIG_ESP_COEX_SW_COEXIST_ENABLE && CONFIG_SOC_IEEE802154_SUPPORTED

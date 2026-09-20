@@ -1149,10 +1149,10 @@ static void wifi_start(void)
         ESP_LOGW(TAG, "WiFi set country failed: %s", esp_err_to_name(err));
     }
 
-    // Temporary coexistence test: the ESP-Zigbee gateway example uses
-    // MIN_MODEM so Wi-Fi yields the shared radio for 802.15.4 time slots.
-    // WIFI_PS_NONE was starving Zigbee association on this board/hotspot.
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    // Give the active 802.15.4 coordinator as much shared-radio time as
+    // possible. MAX_MODEM lets Wi-Fi sleep between DTIM/listen windows; MQTT
+    // traffic here is low-rate, while ZED rejoin scans are latency sensitive.
+    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
     esp_wifi_set_config(WIFI_IF_STA, &wcfg);
     esp_wifi_start();
 
@@ -1733,10 +1733,10 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_coex_wifi_i154_enable());
     esp_ieee802154_set_coex_config((esp_ieee802154_coex_config_t){
         .idle = IEEE802154_IDLE,
-        .txrx = IEEE802154_LOW,
-        .txrx_at = IEEE802154_MIDDLE,
+        .txrx = IEEE802154_HIGH,
+        .txrx_at = IEEE802154_HIGH,
     });
-    ESP_LOGI(TAG, "Wi-Fi/IEEE 802.15.4 coexistence enabled (15.4 priority LOW/MIDDLE)");
+    ESP_LOGI(TAG, "Wi-Fi/IEEE 802.15.4 coexistence enabled (15.4 priority HIGH/HIGH)");
 #else
     ESP_LOGW(TAG, "ZB-only RF diagnostic: Wi-Fi/coexistence disabled");
 #endif

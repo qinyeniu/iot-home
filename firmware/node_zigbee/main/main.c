@@ -61,6 +61,9 @@
 #define ZB_UNAVAILABLE_VERIFY_DELAY_MS 10000
 #define LINK_PROBE_MAX_ATTEMPTS    4
 #define LINK_PROBE_RETRY_MS        1500
+#define ZB_REJOIN_CANDIDATE_VERIFY_DELAY_MS 30000
+#define ZB_REJOIN_CANDIDATE_PROBE_MAX_ATTEMPTS 6
+#define ZB_REJOIN_CANDIDATE_PROBE_RETRY_MS 5000
 #define LINK_PROBE_RETIRED_COUNT 16
 #define LINK_PROBE_RETIRED_TICKS pdMS_TO_TICKS(60000)
 #define ZIGBEE_RECENT_STEERING_ATTEMPT_MS 90000
@@ -127,6 +130,9 @@ static volatile link_probe_state_t s_link_probe_state = LINK_PROBE_IDLE;
 static volatile uint8_t s_link_probe_expected_sequence = 0;
 static volatile uint8_t s_link_probe_attempts = 0;
 static volatile bool s_link_probe_in_flight = false;
+static uint32_t s_link_probe_timeout_ms = ZB_UNAVAILABLE_VERIFY_DELAY_MS;
+static uint32_t s_link_probe_retry_ms = LINK_PROBE_RETRY_MS;
+static uint8_t s_link_probe_max_attempts = LINK_PROBE_MAX_ATTEMPTS;
 static uint8_t s_zcl_report_sequence = 0;
 
 typedef struct {
@@ -729,11 +735,20 @@ static void link_probe_send_timer_cb(uint8_t unused)
     taskEXIT_CRITICAL(&s_link_probe_lock);
 }
 
+static void link_probe_configure_verification(uint32_t timeout_ms,
+                                               uint32_t retry_ms,
+                                               uint8_t max_attempts)
+{
+    s_link_probe_timeout_ms = timeout_ms;
+    s_link_probe_retry_ms = retry_ms;
+    s_link_probe_max_attempts = max_attempts;
+}
+
 static void schedule_device_unavailable_verify(void)
 {
     esp_zb_scheduler_alarm_cancel(device_unavailable_verify_timer_cb, 0);
     esp_zb_scheduler_alarm(device_unavailable_verify_timer_cb, 0,
-                           ZB_UNAVAILABLE_VERIFY_DELAY_MS);
+                           s_link_probe_timeout_ms);
     // The zero-delay scheduler callback performs the actual transmit in stack
     // context. Sensor sampling does not need to be involved.
     esp_zb_scheduler_alarm_cancel(link_probe_send_timer_cb, 0);
@@ -742,6 +757,24 @@ static void schedule_device_unavailable_verify(void)
 
 static void link_probe_start_verification(void)
 {
+    link_probe_configure_verification(ZB_UNAVAILABLE_VERIFY_DELAY_MS,
+                                      LINK_PROBE_RETRY_MS,
+                                      LINK_PROBE_MAX_ATTEMPTS);
+    taskENTER_CRITICAL(&s_link_probe_lock);
+    link_probe_reset_locked();
+    s_link_probe_state = LINK_PROBE_ACTIVE;
+    taskEXIT_CRITICAL(&s_link_probe_lock);
+    schedule_device_unavailable_verify();
+}
+
+static void link_probe_start_candidate_verification(void)
+{
+    // A rejoin can be visible at NWK/BDB level several seconds before APS
+    // routing/security is ready. Give the parent a longer settle window than a
+    // normal running-link outage before tearing down the new association.
+    link_probe_configure_verification(ZB_REJOIN_CANDIDATE_VERIFY_DELAY_MS,
+                                      ZB_REJOIN_CANDIDATE_PROBE_RETRY_MS,
+                                      ZB_REJOIN_CANDIDATE_PROBE_MAX_ATTEMPTS);
     taskENTER_CRITICAL(&s_link_probe_lock);
     link_probe_reset_locked();
     s_link_probe_state = LINK_PROBE_ACTIVE;
@@ -806,9 +839,16 @@ static bool commissioning_status_has_usable_network(
 static bool commissioning_status_requires_candidate_verification(
     esp_zb_bdb_commissioning_status_t bdb_status)
 {
-    return s_link_resteer_forced &&
-           bdb_status == ESP_ZB_BDB_STATUS_DEV_ANNCE_SEND_FAILURE &&
-           node_short_address_is_usable() &&
+    // Both a fresh silent rejoin and a forced recovery can report NWK success
+    // followed by DEV_ANNCE_SEND_FAILURE. Validate that new APS path with the
+    // longer candidate window; forced recovery is allowed here only after an
+    // application-issued steering attempt.
+    if (bdb_status != ESP_ZB_BDB_STATUS_DEV_ANNCE_SEND_FAILURE ||
+        !node_short_address_is_usable()) {
+        return false;
+    }
+
+    return !s_link_resteer_forced ||
            commissioning_event_is_recent(s_last_steering_attempt_ms,
                                          ZIGBEE_RECENT_STEERING_ATTEMPT_MS);
 }
@@ -824,7 +864,7 @@ static void zigbee_accept_commissioning_network(
     if (verify_candidate) {
         ESP_LOGI(TAG,
                  "Zigbee: provisional rejoin accepted; verify with active APS probe");
-        link_probe_start_verification();
+        link_probe_start_candidate_verification();
     }
 }
 
@@ -995,11 +1035,11 @@ static void zigbee_handle_device_unavailable(uint32_t *signal_p,
         xTaskNotify(s_sensor_task_handle,
                     SENSOR_NOTIFY_LINK_PROBE_BIT, eSetBits);
     }
-    ESP_LOGW(TAG,
-             "Zigbee: parent unavailable event=%lu; send active probe, verify in %d ms",
-             (unsigned long)event_count,
-             ZB_UNAVAILABLE_VERIFY_DELAY_MS);
     link_probe_start_verification();
+    ESP_LOGW(TAG,
+             "Zigbee: parent unavailable event=%lu; send active probe, verify in %lu ms",
+             (unsigned long)event_count,
+             (unsigned long)s_link_probe_timeout_ms);
 }
 
 static void device_unavailable_verify_timer_cb(uint8_t unused)
@@ -1157,7 +1197,7 @@ static bool aps_confirm_consume_link_probe(
         if (current_success) {
             link_probe_reset_locked();
         } else {
-            bool can_retry = s_link_probe_attempts < LINK_PROBE_MAX_ATTEMPTS;
+            bool can_retry = s_link_probe_attempts < s_link_probe_max_attempts;
             s_link_probe_in_flight = false;
             if (can_retry) {
                 retry = true;
@@ -1183,18 +1223,20 @@ static bool aps_confirm_consume_link_probe(
         s_link_probe_aps_failures++;
         if (retry) {
             ESP_LOGW(TAG,
-                     "Zigbee: active parent-link probe seq=%u failed APS; retry %u/%u in %d ms",
+                     "Zigbee: active parent-link probe seq=%u failed APS; retry %u/%u in %lu ms",
                      (unsigned)sequence,
                      (unsigned)(s_link_probe_attempts + 1),
-                     LINK_PROBE_MAX_ATTEMPTS,
-                     LINK_PROBE_RETRY_MS);
+                     (unsigned)s_link_probe_max_attempts,
+                     (unsigned long)s_link_probe_retry_ms);
             esp_zb_scheduler_alarm_cancel(link_probe_send_timer_cb, 0);
             esp_zb_scheduler_alarm(link_probe_send_timer_cb, 0,
-                                   LINK_PROBE_RETRY_MS);
+                                   s_link_probe_retry_ms);
         } else {
             ESP_LOGW(TAG,
-                     "Zigbee: active parent-link probe seq=%u failed APS after %u attempts; wait for verification timeout",
-                     (unsigned)sequence, LINK_PROBE_MAX_ATTEMPTS);
+                     "Zigbee: active parent-link probe seq=%u failed APS after %u attempts; wait for %lu ms verification timeout",
+                     (unsigned)sequence,
+                     (unsigned)s_link_probe_max_attempts,
+                     (unsigned long)s_link_probe_timeout_ms);
         }
         return true;
     }

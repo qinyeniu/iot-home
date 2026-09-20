@@ -62,6 +62,9 @@
 #define LINK_PROBE_MAX_ATTEMPTS    4
 #define LINK_PROBE_RETRY_MS        1500
 #define ZB_REJOIN_CANDIDATE_VERIFY_DELAY_MS 30000
+#define ZB_REJOIN_CANDIDATE_FIRST_PROBE_MS 2000
+#define ZB_REJOIN_CANDIDATE_PROBE_MAX_ATTEMPTS 10
+#define ZB_REJOIN_CANDIDATE_PROBE_RETRY_MS 2500
 #define LINK_PROBE_RETIRED_COUNT 16
 #define LINK_PROBE_RETIRED_TICKS pdMS_TO_TICKS(60000)
 #define ZIGBEE_RECENT_STEERING_ATTEMPT_MS 90000
@@ -129,7 +132,6 @@ static volatile uint8_t s_link_probe_expected_sequence = 0;
 static volatile uint8_t s_link_probe_attempts = 0;
 static volatile bool s_link_probe_in_flight = false;
 static volatile bool s_link_probe_candidate = false;
-static uint32_t s_candidate_report_sequence_mask[8];
 static uint32_t s_link_probe_timeout_ms = ZB_UNAVAILABLE_VERIFY_DELAY_MS;
 static uint32_t s_link_probe_retry_ms = LINK_PROBE_RETRY_MS;
 static uint8_t s_link_probe_max_attempts = LINK_PROBE_MAX_ATTEMPTS;
@@ -143,25 +145,6 @@ typedef struct {
 
 static link_probe_retired_t s_link_probe_retired[LINK_PROBE_RETIRED_COUNT];
 
-static void candidate_report_sequences_clear_locked(void)
-{
-    for (int i = 0; i < 8; ++i) {
-        s_candidate_report_sequence_mask[i] = 0;
-    }
-}
-
-static void candidate_report_sequence_mark_locked(uint8_t sequence)
-{
-    s_candidate_report_sequence_mask[sequence >> 5] |=
-        1UL << (sequence & 0x1f);
-}
-
-static bool candidate_report_sequence_is_expected_locked(uint8_t sequence)
-{
-    return (s_candidate_report_sequence_mask[sequence >> 5] &
-            (1UL << (sequence & 0x1f))) != 0;
-}
-
 static void link_probe_reset_locked(void)
 {
     s_link_probe_state = LINK_PROBE_IDLE;
@@ -169,7 +152,6 @@ static void link_probe_reset_locked(void)
     s_link_probe_attempts = 0;
     s_link_probe_in_flight = false;
     s_link_probe_candidate = false;
-    candidate_report_sequences_clear_locked();
 }
 
 static void link_probe_retire_locked(uint8_t sequence, TickType_t now)
@@ -231,16 +213,15 @@ static void link_probe_cancel_active_preserve_retired(void)
 }
 
 
-// A provisional rejoin is verified by ordinary sensor APS traffic, so the
-// sensor task must still take and report a fresh sample. A running-link probe
-// owns the radio window and continues to block normal report batches.
+// Both running-link probes and provisional-rejoin probes own the radio window.
+// Keeping normal three-attribute batches out prevents the storm observed after
+// a rejoin (dozens of failed APS frames before the parent path has settled).
 static bool link_probe_blocks_reports(void)
 {
     bool blocked;
 
     taskENTER_CRITICAL(&s_link_probe_lock);
-    blocked = s_link_probe_state == LINK_PROBE_ACTIVE &&
-              !s_link_probe_candidate;
+    blocked = s_link_probe_state == LINK_PROBE_ACTIVE;
     taskEXIT_CRITICAL(&s_link_probe_lock);
     return blocked;
 }
@@ -266,17 +247,44 @@ static bool zcl_report_sequence_allocate(uint8_t *sequence)
     bool allocated = false;
 
     taskENTER_CRITICAL(&s_link_probe_lock);
-    if (s_link_probe_state == LINK_PROBE_IDLE ||
-        (s_link_probe_state == LINK_PROBE_ACTIVE && s_link_probe_candidate)) {
+    if (s_link_probe_state == LINK_PROBE_IDLE) {
         *sequence = ++s_zcl_report_sequence;
-        if (s_link_probe_state == LINK_PROBE_ACTIVE &&
-            s_link_probe_candidate) {
-            candidate_report_sequence_mark_locked(*sequence);
-        }
         allocated = true;
     }
     taskEXIT_CRITICAL(&s_link_probe_lock);
     return allocated;
+}
+
+static void link_probe_send_timer_cb(uint8_t unused);
+
+// A local submission rejection means no APS transaction was started. Do not
+// spend one of the APS retry attempts; release the in-flight slot and re-arm
+// the same probe from the serialized ZBOSS scheduler callback.
+static void link_probe_handle_local_submit_failure(uint8_t sequence,
+                                                   const char *reason)
+{
+    bool retry = false;
+
+    taskENTER_CRITICAL(&s_link_probe_lock);
+    if (s_link_probe_state == LINK_PROBE_ACTIVE &&
+        s_link_probe_expected_sequence == sequence) {
+        if (s_link_probe_attempts > 0) {
+            s_link_probe_attempts--;
+        }
+        s_link_probe_in_flight = false;
+        retry = true;
+    }
+    taskEXIT_CRITICAL(&s_link_probe_lock);
+
+    if (retry) {
+        ESP_LOGW(TAG,
+                 "Zigbee: %s probe seq=%u locally; retry in %lu ms",
+                 reason, (unsigned)sequence,
+                 (unsigned long)s_link_probe_retry_ms);
+        esp_zb_scheduler_alarm_cancel(link_probe_send_timer_cb, 0);
+        esp_zb_scheduler_alarm(link_probe_send_timer_cb, 0,
+                               s_link_probe_retry_ms);
+    }
 }
 
 // Latest valid scaled ZCL values. They are used only to repair a report that
@@ -659,7 +667,8 @@ _Static_assert(offsetof(node_zb_device_unavailable_params_t, short_addr) == 8,
 
 static bool link_probe_build_frame(uint8_t asdu[3 + 2 + 1 + 2],
                                    uint16_t *cluster_id,
-                                   uint16_t *attr_id)
+                                   uint16_t *attr_id,
+                                   bool allow_invalid_candidate_value)
 {
     uint16_t value;
     uint8_t attr_type;
@@ -679,10 +688,18 @@ static bool link_probe_build_frame(uint8_t asdu[3 + 2 + 1 + 2],
         *attr_id = ESP_ZB_ZCL_ATTR_ILLUMINANCE_MEASUREMENT_MEASURED_VALUE_ID;
         attr_type = ZCL_TYPE_UNSIGNED_16BIT;
         value = s_last_sample.lux;
+    } else if (allow_invalid_candidate_value) {
+        // A fresh reboot has not sampled the sensors yet. Verify the parent path
+        // with the temperature measurement cluster using its standard invalid
+        // value (0x8000). The gateway explicitly discards this value, so it only
+        // exercises APS/ZCL delivery and is never published as telemetry.
+        *cluster_id = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT;
+        *attr_id = ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID;
+        attr_type = ZCL_TYPE_SIGNED_16BIT;
+        value = 0x8000;
     } else {
         // Do not use a Basic-cluster fallback: the gateway application does not
-        // ACK that report reliably. Candidate rejoins are verified passively by
-        // a real sensor report, while running-link probes always have a cache.
+        // process that report as a sensor measurement.
         return false;
     }
 
@@ -714,14 +731,10 @@ static void link_probe_send_timer_cb(uint8_t unused)
         return;
     }
 
-    if (!link_probe_build_frame(asdu, &cluster_id, &attr_id)) {
+    if (!link_probe_build_frame(asdu, &cluster_id, &attr_id,
+                               s_link_probe_candidate)) {
         ESP_LOGW(TAG, "Zigbee: parent-link probe has no cached sensor value");
-        taskENTER_CRITICAL(&s_link_probe_lock);
-        if (s_link_probe_state == LINK_PROBE_ACTIVE &&
-            s_link_probe_expected_sequence == sequence) {
-            s_link_probe_in_flight = false;
-        }
-        taskEXIT_CRITICAL(&s_link_probe_lock);
+        link_probe_handle_local_submit_failure(sequence, "no cached value for");
         return;
     }
     asdu[1] = sequence;
@@ -754,12 +767,7 @@ static void link_probe_send_timer_cb(uint8_t unused)
 
     ESP_LOGW(TAG, "Zigbee: active parent-link probe was rejected: %s",
              esp_err_to_name(err));
-    taskENTER_CRITICAL(&s_link_probe_lock);
-    if (s_link_probe_state == LINK_PROBE_ACTIVE &&
-        s_link_probe_expected_sequence == sequence) {
-        s_link_probe_in_flight = false;
-    }
-    taskEXIT_CRITICAL(&s_link_probe_lock);
+    link_probe_handle_local_submit_failure(sequence, "stack rejected");
 }
 
 static void link_probe_configure_verification(uint32_t timeout_ms,
@@ -801,12 +809,13 @@ static void link_probe_start_verification(void)
 
 static void link_probe_start_candidate_verification(void)
 {
-    // A rejoin can be visible at NWK/BDB level several seconds before APS
-    // routing/security is ready. Let real sensor reports verify the new path;
-    // never tear it down based on an unsupported Basic-cluster probe.
+    // A rejoin can be visible at NWK/BDB level before APS routing/security is
+    // ready. Give the parent relationship a short settle period, then verify it
+    // with sparse single-attribute probes instead of an immediate three-frame
+    // sensor batch and aggressive APS repairs.
     link_probe_configure_verification(ZB_REJOIN_CANDIDATE_VERIFY_DELAY_MS,
-                                      LINK_PROBE_RETRY_MS,
-                                      LINK_PROBE_MAX_ATTEMPTS);
+                                      ZB_REJOIN_CANDIDATE_PROBE_RETRY_MS,
+                                      ZB_REJOIN_CANDIDATE_PROBE_MAX_ATTEMPTS);
     taskENTER_CRITICAL(&s_link_probe_lock);
     link_probe_reset_locked();
     s_link_probe_state = LINK_PROBE_ACTIVE;
@@ -815,6 +824,8 @@ static void link_probe_start_candidate_verification(void)
     taskEXIT_CRITICAL(&s_link_probe_lock);
     esp_zb_scheduler_alarm_cancel(link_probe_send_timer_cb, 0);
     schedule_verification_timeout();
+    esp_zb_scheduler_alarm(link_probe_send_timer_cb, 0,
+                           ZB_REJOIN_CANDIDATE_FIRST_PROBE_MS);
 }
 
 static bool node_short_address_is_usable(void)
@@ -898,7 +909,7 @@ static void zigbee_accept_commissioning_network(
     zigbee_mark_connected(reason);
     if (verify_candidate) {
         ESP_LOGI(TAG,
-                 "Zigbee: provisional rejoin accepted; verify with real sensor APS report");
+                 "Zigbee: provisional rejoin accepted; verify with sparse APS probe");
         link_probe_start_candidate_verification();
     }
 }
@@ -1208,71 +1219,13 @@ static bool aps_confirm_is_link_probe_frame(
         && aps_confirm_is_sensor_report(confirm);
 }
 
-static bool aps_confirm_is_candidate_sensor_report(
-    const esp_zb_apsde_data_confirm_t *confirm,
-    uint8_t *sequence)
-{
-    if (confirm->status != 0 ||
-        !aps_confirm_is_sensor_report(confirm) ||
-        confirm->asdu == NULL ||
-        confirm->asdu_length != (3 + 2 + 1 + 2)) {
-        return false;
-    }
-
-    // The APS confirm does not carry cluster ID. Our three measured-value
-    // reports all use attribute 0x0000 and an int16/uint16 value; candidate
-    // sequence tracking below ensures this cannot match an older report.
-    if (confirm->asdu[0] != ZCL_FRAME_REPORT_SERVER_TO_CLIENT ||
-        confirm->asdu[2] != ZCL_CMD_REPORT_ATTRIBUTES ||
-        confirm->asdu[3] != 0x00 ||
-        confirm->asdu[4] != 0x00 ||
-        (confirm->asdu[5] != ZCL_TYPE_SIGNED_16BIT &&
-         confirm->asdu[5] != ZCL_TYPE_UNSIGNED_16BIT)) {
-        return false;
-    }
-
-    *sequence = confirm->asdu[1];
-    return true;
-}
-
-static bool link_probe_consume_candidate_app_confirm(
-    const esp_zb_apsde_data_confirm_t *confirm)
-{
-    bool resolved = false;
-    uint8_t sequence = 0;
-
-    if (!aps_confirm_is_candidate_sensor_report(confirm, &sequence)) {
-        return false;
-    }
-
-    taskENTER_CRITICAL(&s_link_probe_lock);
-    if (s_link_probe_state == LINK_PROBE_ACTIVE &&
-        s_link_probe_candidate &&
-        candidate_report_sequence_is_expected_locked(sequence)) {
-        link_probe_reset_locked();
-        resolved = true;
-    }
-    taskEXIT_CRITICAL(&s_link_probe_lock);
-
-    if (resolved) {
-        s_candidate_rejoin_verified++;
-        esp_zb_scheduler_alarm_cancel(device_unavailable_verify_timer_cb, 0);
-        ESP_LOGI(TAG,
-                 "Zigbee: provisional rejoin verified by sensor APS report seq=%u (%lu/%lu)",
-                 (unsigned)sequence,
-                 (unsigned long)s_candidate_rejoin_verified,
-                 (unsigned long)s_candidate_rejoin_total);
-    }
-
-    return resolved;
-}
-
 static bool aps_confirm_consume_link_probe(
     const esp_zb_apsde_data_confirm_t *confirm)
 {
     bool current_match = false;
     bool retired_match = false;
     bool current_success = false;
+    bool was_candidate = false;
     bool retry = false;
     uint8_t sequence = 0;
     TickType_t now = xTaskGetTickCount();
@@ -1288,6 +1241,7 @@ static bool aps_confirm_consume_link_probe(
         && s_link_probe_expected_sequence == sequence;
     if (current_match) {
         current_success = confirm->status == 0;
+        was_candidate = s_link_probe_candidate;
         if (current_success) {
             link_probe_reset_locked();
         } else {
@@ -1303,13 +1257,22 @@ static bool aps_confirm_consume_link_probe(
     taskEXIT_CRITICAL(&s_link_probe_lock);
 
     if (current_match && current_success) {
-        s_device_unavailable_recovered++;
         esp_zb_scheduler_alarm_cancel(device_unavailable_verify_timer_cb, 0);
-        ESP_LOGI(TAG,
-                 "Zigbee: parent unavailable resolved by active probe seq=%u (total=%lu recovered=%lu)",
-                 (unsigned)sequence,
-                 (unsigned long)s_device_unavailable_total,
-                 (unsigned long)s_device_unavailable_recovered);
+        if (was_candidate) {
+            s_candidate_rejoin_verified++;
+            ESP_LOGI(TAG,
+                     "Zigbee: provisional rejoin verified by active probe seq=%u (%lu/%lu)",
+                     (unsigned)sequence,
+                     (unsigned long)s_candidate_rejoin_verified,
+                     (unsigned long)s_candidate_rejoin_total);
+        } else {
+            s_device_unavailable_recovered++;
+            ESP_LOGI(TAG,
+                     "Zigbee: parent unavailable resolved by active probe seq=%u (total=%lu recovered=%lu)",
+                     (unsigned)sequence,
+                     (unsigned long)s_device_unavailable_total,
+                     (unsigned long)s_device_unavailable_recovered);
+        }
         return true;
     }
 
@@ -1317,7 +1280,8 @@ static bool aps_confirm_consume_link_probe(
         s_link_probe_aps_failures++;
         if (retry) {
             ESP_LOGW(TAG,
-                     "Zigbee: active parent-link probe seq=%u failed APS; retry %u/%u in %lu ms",
+                     "Zigbee: %s probe seq=%u failed APS; retry %u/%u in %lu ms",
+                     was_candidate ? "provisional rejoin" : "active parent-link",
                      (unsigned)sequence,
                      (unsigned)(s_link_probe_attempts + 1),
                      (unsigned)s_link_probe_max_attempts,
@@ -1354,11 +1318,6 @@ static void aps_data_confirm_cb(esp_zb_apsde_data_confirm_t confirm)
     // Current probe results drive verification. Retired probe results are
     // swallowed after timeout so they can never trigger ordinary full-cache
     // repairs or consume a future reporting batch's in-flight slot.
-    // Observe but do not consume the confirmation: candidate verification is
-    // resolved by ordinary sensor traffic, while the report window still needs
-    // its normal success/failure accounting below.
-    link_probe_consume_candidate_app_confirm(&confirm);
-
     if (aps_confirm_consume_link_probe(&confirm)) {
         return;
     }

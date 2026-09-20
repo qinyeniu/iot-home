@@ -57,6 +57,7 @@
 #define REPORT_APS_RADIUS       10
 #define ZIGBEE_LINK_RESTEER_DELAY_MS  1000
 #define ZIGBEE_STEERING_FAIL_RETRY_MS 5000
+#define ZIGBEE_BDB_BUSY_RETRY_MS   60000
 #define ZB_UNAVAILABLE_VERIFY_DELAY_MS 5000
 #define LINK_PROBE_RETIRED_COUNT 16
 #define LINK_PROBE_RETIRED_TICKS pdMS_TO_TICKS(60000)
@@ -91,6 +92,7 @@ static const char *TAG = "zb-sensor";
 static volatile bool s_zigbee_connected = false;
 static volatile bool s_network_steering_pending = false;
 static volatile bool s_link_resteer_forced = false;
+static uint32_t s_bdb_busy_since_ms = 0;
 static uint16_t s_short_addr = 0;
 static TaskHandle_t s_sensor_task_handle = NULL;
 
@@ -719,6 +721,30 @@ static void schedule_device_unavailable_verify(void)
     esp_zb_scheduler_alarm(link_probe_send_timer_cb, 0, 0);
 }
 
+static bool node_short_address_is_usable(void)
+{
+    uint16_t short_addr = esp_zb_get_short_address();
+
+    // 0x0000 is the coordinator; 0xFFFE/0xFFFF mean "not assigned".
+    return short_addr != 0x0000 && short_addr != 0xFFFE && short_addr != 0xFFFF;
+}
+
+static bool reboot_failure_has_usable_network(
+    esp_zb_bdb_commissioning_status_t bdb_status)
+{
+    if (bdb_status == ESP_ZB_BDB_STATUS_ON_A_NETWORK) {
+        return !s_link_resteer_forced;
+    }
+
+    // A silent rejoin can have already restored NWK/APS credentials and a valid
+    // short address even if the best-effort device-announce transaction is not
+    // acknowledged. Normal APS reports and the signal-60 probe then verify the
+    // actual parent data path; restarting steering here cancels useful BDB work.
+    return !s_link_resteer_forced &&
+           bdb_status == ESP_ZB_BDB_STATUS_DEV_ANNCE_SEND_FAILURE &&
+           node_short_address_is_usable();
+}
+
 static void zigbee_mark_connected(const char *reason)
 {
     s_link_resteer_forced = false;
@@ -727,6 +753,7 @@ static void zigbee_mark_connected(const char *reason)
     esp_zb_scheduler_alarm_cancel(device_unavailable_verify_timer_cb, 0);
     esp_zb_scheduler_alarm_cancel(link_probe_send_timer_cb, 0);
     s_zigbee_connected = true;
+    s_bdb_busy_since_ms = 0;
     s_short_addr = esp_zb_get_short_address();
     esp_zb_scheduler_alarm_cancel(network_steering_timer_cb,
                                   ESP_ZB_BDB_MODE_NETWORK_STEERING);
@@ -743,6 +770,36 @@ static void network_steering_timer_cb(uint8_t mode_mask)
     ESP_LOGI(TAG, "Zigbee: steering timer, bdb status=%d forced=%d",
              (int)bdb_status, (int)s_link_resteer_forced);
 
+    if (bdb_status == ESP_ZB_BDB_STATUS_IN_PROGRESS) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        if (s_bdb_busy_since_ms == 0) {
+            s_bdb_busy_since_ms = now_ms;
+        }
+
+        if ((uint32_t)(now_ms - s_bdb_busy_since_ms) < ZIGBEE_BDB_BUSY_RETRY_MS) {
+            ESP_LOGI(TAG,
+                     "Zigbee: commissioning still in progress; check again in %d ms",
+                     ZIGBEE_STEERING_FAIL_RETRY_MS);
+            schedule_network_steering(ZIGBEE_STEERING_FAIL_RETRY_MS);
+            return;
+        }
+
+        ESP_LOGW(TAG,
+                 "Zigbee: commissioning stuck in progress for %d ms; make one controlled retry",
+                 ZIGBEE_BDB_BUSY_RETRY_MS);
+        s_bdb_busy_since_ms = 0;
+        err = esp_zb_bdb_start_top_level_commissioning(mode_mask);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Zigbee: controlled commissioning retry accepted");
+        } else {
+            ESP_LOGW(TAG, "Zigbee: controlled commissioning retry rejected: %s",
+                     esp_err_to_name(err));
+        }
+        schedule_network_steering(ZIGBEE_STEERING_FAIL_RETRY_MS);
+        return;
+    }
+
+    s_bdb_busy_since_ms = 0;
     if (bdb_status == ESP_ZB_BDB_STATUS_ON_A_NETWORK && !s_link_resteer_forced) {
         zigbee_mark_connected("already on network");
         return;
@@ -755,6 +812,11 @@ static void network_steering_timer_cb(uint8_t mode_mask)
                  esp_err_to_name(err), (int)bdb_status);
         if (bdb_status == ESP_ZB_BDB_STATUS_ON_A_NETWORK && !s_link_resteer_forced) {
             zigbee_mark_connected("steering rejected");
+        } else if (bdb_status == ESP_ZB_BDB_STATUS_IN_PROGRESS) {
+            ESP_LOGI(TAG,
+                     "Zigbee: commissioning remained in progress after steering request; check again in %d ms",
+                     ZIGBEE_STEERING_FAIL_RETRY_MS);
+            schedule_network_steering(ZIGBEE_STEERING_FAIL_RETRY_MS);
         } else {
             schedule_network_steering(ZIGBEE_STEERING_FAIL_RETRY_MS);
         }
@@ -786,6 +848,7 @@ static void zigbee_link_lost(esp_zb_app_signal_type_t signal, esp_err_t status)
     esp_zb_scheduler_alarm_cancel(link_probe_send_timer_cb, 0);
     s_link_resteer_forced = true;
     s_zigbee_connected = false;
+    s_bdb_busy_since_ms = 0;
     s_short_addr = 0;
     report_window_close();
     schedule_network_steering(ZIGBEE_LINK_RESTEER_DELAY_MS);
@@ -898,12 +961,19 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             ESP_LOGW(TAG,
                      "Zigbee: Startup/rejoin failed (0x%x), bdb status=%d; retry steering",
                      (unsigned)err_status, (int)bdb_status);
-            if (bdb_status == ESP_ZB_BDB_STATUS_ON_A_NETWORK && !s_link_resteer_forced) {
-                zigbee_mark_connected("reboot bdb status");
+            if (reboot_failure_has_usable_network(bdb_status)) {
+                zigbee_mark_connected("rejoin APS verification");
+            } else if (s_zigbee_connected &&
+                       (bdb_status == ESP_ZB_BDB_STATUS_IN_PROGRESS ||
+                        bdb_status == ESP_ZB_BDB_STATUS_CANCELLED)) {
+                ESP_LOGI(TAG,
+                         "Zigbee: ignore late reboot commissioning status=%d while connected",
+                         (int)bdb_status);
             } else if (sig_type == ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT) {
                 // A previously commissioned ZED first attempts a silent rejoin.
-                // If that parent/rejoin attempt fails, explicitly run network
-                // steering instead of waiting forever for another signal.
+                // If that parent/rejoin attempt fails without retaining a usable
+                // network address, explicitly run network steering instead of
+                // waiting forever for another signal.
                 schedule_network_steering(ZIGBEE_LINK_RESTEER_DELAY_MS);
             }
         }
@@ -920,6 +990,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      (unsigned)err_status, (int)bdb_status);
             if (bdb_status == ESP_ZB_BDB_STATUS_ON_A_NETWORK && !s_link_resteer_forced) {
                 zigbee_mark_connected("steering bdb status");
+            } else if (s_zigbee_connected &&
+                       (bdb_status == ESP_ZB_BDB_STATUS_IN_PROGRESS ||
+                        bdb_status == ESP_ZB_BDB_STATUS_CANCELLED)) {
+                ESP_LOGI(TAG,
+                         "Zigbee: ignore late steering commissioning status=%d while connected",
+                         (int)bdb_status);
             } else {
                 schedule_network_steering(ZIGBEE_STEERING_FAIL_RETRY_MS);
             }

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stddef.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -56,6 +57,9 @@
 #define REPORT_APS_RADIUS       10
 #define ZIGBEE_LINK_RESTEER_DELAY_MS  1000
 #define ZIGBEE_STEERING_FAIL_RETRY_MS 5000
+#define ZB_UNAVAILABLE_VERIFY_DELAY_MS 5000
+#define LINK_PROBE_RETIRED_COUNT 16
+#define LINK_PROBE_RETIRED_TICKS pdMS_TO_TICKS(60000)
 
 // Minimal ZCL Report Attributes frame used by the raw APS path below.
 #define ZCL_FRAME_REPORT_SERVER_TO_CLIENT  0x18
@@ -89,7 +93,141 @@ static volatile bool s_network_steering_pending = false;
 static volatile bool s_link_resteer_forced = false;
 static uint16_t s_short_addr = 0;
 static TaskHandle_t s_sensor_task_handle = NULL;
+
+#define SENSOR_NOTIFY_APS_FAIL_BIT  (1u << 0)
+#define SENSOR_NOTIFY_LINK_PROBE_BIT (1u << 1)
+
+// A single ZDO unavailable signal can refer to one failed NWK/MAC/APS packet.
+// It does not by itself prove the parent relationship is gone. The signal
+// handler sends one independent APS probe and only resteers if that probe does
+// not receive a successful APS confirmation before the verification alarm.
+typedef enum {
+    LINK_PROBE_IDLE = 0,
+    LINK_PROBE_ACTIVE,
+} link_probe_state_t;
+
+static volatile uint32_t s_device_unavailable_total = 0;
+static volatile uint32_t s_device_unavailable_recovered = 0;
+static volatile uint32_t s_device_unavailable_verify_resteers = 0;
+static volatile uint32_t s_link_probe_requests = 0;
+static volatile uint32_t s_link_probe_sent = 0;
+static volatile uint32_t s_link_probe_aps_failures = 0;
+static portMUX_TYPE s_link_probe_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile link_probe_state_t s_link_probe_state = LINK_PROBE_IDLE;
+static volatile uint8_t s_link_probe_expected_sequence = 0;
+static volatile bool s_link_probe_in_flight = false;
 static uint8_t s_zcl_report_sequence = 0;
+
+typedef struct {
+    bool used;
+    uint8_t sequence;
+    TickType_t expires_at;
+} link_probe_retired_t;
+
+static link_probe_retired_t s_link_probe_retired[LINK_PROBE_RETIRED_COUNT];
+
+static void link_probe_reset_locked(void)
+{
+    s_link_probe_state = LINK_PROBE_IDLE;
+    s_link_probe_expected_sequence = 0;
+    s_link_probe_in_flight = false;
+}
+
+static void link_probe_retire_locked(uint8_t sequence, TickType_t now)
+{
+    int slot = -1;
+    int oldest = 0;
+
+    for (int i = 0; i < LINK_PROBE_RETIRED_COUNT; ++i) {
+        if (!s_link_probe_retired[i].used ||
+            (int32_t)(now - s_link_probe_retired[i].expires_at) >= 0) {
+            slot = i;
+            break;
+        }
+        if ((int32_t)(s_link_probe_retired[i].expires_at -
+                      s_link_probe_retired[oldest].expires_at) < 0) {
+            oldest = i;
+        }
+    }
+    if (slot < 0) {
+        slot = oldest;
+    }
+
+    s_link_probe_retired[slot].used = true;
+    s_link_probe_retired[slot].sequence = sequence;
+    s_link_probe_retired[slot].expires_at =
+        (TickType_t)(now + LINK_PROBE_RETIRED_TICKS);
+}
+
+static bool link_probe_take_retired_locked(uint8_t sequence, TickType_t now)
+{
+    for (int i = 0; i < LINK_PROBE_RETIRED_COUNT; ++i) {
+        if (!s_link_probe_retired[i].used) {
+            continue;
+        }
+        if ((int32_t)(now - s_link_probe_retired[i].expires_at) >= 0) {
+            s_link_probe_retired[i].used = false;
+            continue;
+        }
+        if (s_link_probe_retired[i].sequence == sequence) {
+            s_link_probe_retired[i].used = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void link_probe_cancel_active_preserve_retired(void)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    taskENTER_CRITICAL(&s_link_probe_lock);
+    if (s_link_probe_state == LINK_PROBE_ACTIVE) {
+        if (s_link_probe_in_flight) {
+            link_probe_retire_locked(s_link_probe_expected_sequence, now);
+        }
+        link_probe_reset_locked();
+    }
+    taskEXIT_CRITICAL(&s_link_probe_lock);
+}
+
+static bool link_probe_is_active(void)
+{
+    bool active;
+
+    taskENTER_CRITICAL(&s_link_probe_lock);
+    active = s_link_probe_state == LINK_PROBE_ACTIVE;
+    taskEXIT_CRITICAL(&s_link_probe_lock);
+    return active;
+}
+
+static bool link_probe_claim_send(uint8_t *sequence)
+{
+    bool claimed = false;
+
+    taskENTER_CRITICAL(&s_link_probe_lock);
+    if (s_link_probe_state == LINK_PROBE_ACTIVE && s_zigbee_connected) {
+        *sequence = ++s_zcl_report_sequence;
+        s_link_probe_expected_sequence = *sequence;
+        s_link_probe_in_flight = true;
+        claimed = true;
+    }
+    taskEXIT_CRITICAL(&s_link_probe_lock);
+    return claimed;
+}
+
+static bool zcl_report_sequence_allocate(uint8_t *sequence)
+{
+    bool allocated = false;
+
+    taskENTER_CRITICAL(&s_link_probe_lock);
+    if (s_link_probe_state == LINK_PROBE_IDLE) {
+        *sequence = ++s_zcl_report_sequence;
+        allocated = true;
+    }
+    taskEXIT_CRITICAL(&s_link_probe_lock);
+    return allocated;
+}
 
 // Latest valid scaled ZCL values. They are used only to repair a report that
 // was accepted but later failed at APS level; a fresh I2C failure does not
@@ -450,11 +588,144 @@ static esp_zb_ep_list_t *create_sensor_ep(void)
 
 static void network_steering_timer_cb(uint8_t mode_mask);
 static void schedule_network_steering(uint32_t delay_ms);
+static void report_window_close(void);
+static void zigbee_link_lost(esp_zb_app_signal_type_t signal, esp_err_t status);
+static void device_unavailable_verify_timer_cb(uint8_t unused);
+static void link_probe_send_timer_cb(uint8_t unused);
+
+// Minimal ABI-compatible view of the private ZBOSS device-unavailable payload.
+// This node has only one peer (the coordinator), so the target address lets us
+// ignore unrelated stack signals without including an internal ZBOSS header.
+typedef struct {
+    uint8_t long_addr[8];
+    uint16_t short_addr;
+} node_zb_device_unavailable_params_t;
+
+_Static_assert(sizeof(node_zb_device_unavailable_params_t) == 10,
+               "device-unavailable payload ABI size mismatch");
+_Static_assert(offsetof(node_zb_device_unavailable_params_t, short_addr) == 8,
+               "device-unavailable short address offset mismatch");
+
+static bool link_probe_build_frame(uint8_t asdu[3 + 2 + 1 + 2],
+                                   uint16_t *cluster_id,
+                                   uint16_t *attr_id)
+{
+    uint16_t value;
+    uint8_t attr_type;
+
+    if ((s_last_sample.valid_flags & SAMPLE_FLAG_TEMP) != 0) {
+        *cluster_id = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT;
+        *attr_id = ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID;
+        attr_type = ZCL_TYPE_SIGNED_16BIT;
+        value = s_last_sample.temp;
+    } else if ((s_last_sample.valid_flags & SAMPLE_FLAG_HUM) != 0) {
+        *cluster_id = ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT;
+        *attr_id = ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID;
+        attr_type = ZCL_TYPE_UNSIGNED_16BIT;
+        value = s_last_sample.hum;
+    } else if ((s_last_sample.valid_flags & SAMPLE_FLAG_LUX) != 0) {
+        *cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT;
+        *attr_id = ESP_ZB_ZCL_ATTR_ILLUMINANCE_MEASUREMENT_MEASURED_VALUE_ID;
+        attr_type = ZCL_TYPE_UNSIGNED_16BIT;
+        value = s_last_sample.lux;
+    } else {
+        return false;
+    }
+
+    asdu[0] = ZCL_FRAME_REPORT_SERVER_TO_CLIENT;
+    // Sequence is assigned by the caller after the active probe generation has
+    // been claimed; the remaining bytes form one ZCL Report Attributes record.
+    asdu[2] = ZCL_CMD_REPORT_ATTRIBUTES;
+    asdu[3] = (uint8_t)(*attr_id & 0xff);
+    asdu[4] = (uint8_t)(*attr_id >> 8);
+    asdu[5] = attr_type;
+    memcpy(&asdu[6], &value, sizeof(value));
+    return true;
+}
+
+// Runs in the serialized ZBOSS scheduler. This probe is deliberately separate
+// from the normal sensor reporting window so a late ordinary APS confirm can
+// neither consume a probe result nor trigger the normal full-cache repair path.
+static void link_probe_send_timer_cb(uint8_t unused)
+{
+    uint8_t asdu[3 + 2 + 1 + 2] = {0};
+    uint16_t cluster_id = 0;
+    uint16_t attr_id = 0;
+    uint8_t sequence;
+    esp_err_t err;
+
+    (void)unused;
+
+    if (!link_probe_claim_send(&sequence)) {
+        return;
+    }
+
+    if (!link_probe_build_frame(asdu, &cluster_id, &attr_id)) {
+        ESP_LOGW(TAG, "Zigbee: parent-link probe has no cached sensor value");
+        taskENTER_CRITICAL(&s_link_probe_lock);
+        if (s_link_probe_state == LINK_PROBE_ACTIVE &&
+            s_link_probe_expected_sequence == sequence) {
+            s_link_probe_in_flight = false;
+        }
+        taskEXIT_CRITICAL(&s_link_probe_lock);
+        return;
+    }
+    asdu[1] = sequence;
+
+    esp_zb_apsde_data_req_t req = {
+        .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .dst_addr.addr_short = COORDINATOR_SHORT_ADDR,
+        .dst_endpoint = EP_SENSOR,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .cluster_id = cluster_id,
+        .src_endpoint = EP_SENSOR,
+        .asdu_length = sizeof(asdu),
+        .asdu = asdu,
+        .tx_options = ESP_ZB_APSDE_TX_OPT_SECURITY_ENABLED | ESP_ZB_APSDE_TX_OPT_ACK_TX,
+        .use_alias = false,
+        .alias_src_addr = 0,
+        .alias_seq_num = 0,
+        .radius = REPORT_APS_RADIUS,
+    };
+
+    err = esp_zb_aps_data_request(&req);
+    if (err == ESP_OK) {
+        s_link_probe_sent++;
+        ESP_LOGW(TAG,
+                 "Zigbee: active parent-link probe #%lu sent seq=%u cluster=0x%04x",
+                 (unsigned long)s_link_probe_sent,
+                 (unsigned)sequence, (unsigned)cluster_id);
+        return;
+    }
+
+    ESP_LOGW(TAG, "Zigbee: active parent-link probe was rejected: %s",
+             esp_err_to_name(err));
+    taskENTER_CRITICAL(&s_link_probe_lock);
+    if (s_link_probe_state == LINK_PROBE_ACTIVE &&
+        s_link_probe_expected_sequence == sequence) {
+        s_link_probe_in_flight = false;
+    }
+    taskEXIT_CRITICAL(&s_link_probe_lock);
+}
+
+static void schedule_device_unavailable_verify(void)
+{
+    esp_zb_scheduler_alarm_cancel(device_unavailable_verify_timer_cb, 0);
+    esp_zb_scheduler_alarm(device_unavailable_verify_timer_cb, 0,
+                           ZB_UNAVAILABLE_VERIFY_DELAY_MS);
+    // The zero-delay scheduler callback performs the actual transmit in stack
+    // context. Sensor sampling does not need to be involved.
+    esp_zb_scheduler_alarm_cancel(link_probe_send_timer_cb, 0);
+    esp_zb_scheduler_alarm(link_probe_send_timer_cb, 0, 0);
+}
 
 static void zigbee_mark_connected(const char *reason)
 {
     s_link_resteer_forced = false;
     s_network_steering_pending = false;
+    link_probe_cancel_active_preserve_retired();
+    esp_zb_scheduler_alarm_cancel(device_unavailable_verify_timer_cb, 0);
+    esp_zb_scheduler_alarm_cancel(link_probe_send_timer_cb, 0);
     s_zigbee_connected = true;
     s_short_addr = esp_zb_get_short_address();
     esp_zb_scheduler_alarm_cancel(network_steering_timer_cb,
@@ -505,18 +776,99 @@ static void schedule_network_steering(uint32_t delay_ms)
                            delay_ms);
 }
 
-static void report_window_close(void);
-
 static void zigbee_link_lost(esp_zb_app_signal_type_t signal, esp_err_t status)
 {
     ESP_LOGW(TAG,
              "Zigbee: link lost signal=%d status=0x%x; mark offline and steer again",
              (int)signal, (unsigned)status);
+    link_probe_cancel_active_preserve_retired();
+    esp_zb_scheduler_alarm_cancel(device_unavailable_verify_timer_cb, 0);
+    esp_zb_scheduler_alarm_cancel(link_probe_send_timer_cb, 0);
     s_link_resteer_forced = true;
     s_zigbee_connected = false;
     s_short_addr = 0;
     report_window_close();
     schedule_network_steering(ZIGBEE_LINK_RESTEER_DELAY_MS);
+}
+
+static void zigbee_handle_device_unavailable(uint32_t *signal_p,
+                                             esp_err_t status)
+{
+    const node_zb_device_unavailable_params_t *params =
+        (const node_zb_device_unavailable_params_t *)
+            esp_zb_app_signal_get_params(signal_p);
+
+    if (params != NULL && params->short_addr != COORDINATOR_SHORT_ADDR) {
+        ESP_LOGI(TAG,
+                 "Zigbee: ignore device-unavailable for non-parent 0x%04x",
+                 params->short_addr);
+        return;
+    }
+
+    uint32_t event_count = ++s_device_unavailable_total;
+    if (!s_zigbee_connected) {
+        // A steering alarm may already be pending; make sure it is not lost.
+        schedule_network_steering(ZIGBEE_LINK_RESTEER_DELAY_MS);
+        return;
+    }
+
+    taskENTER_CRITICAL(&s_link_probe_lock);
+    if (s_link_probe_state == LINK_PROBE_ACTIVE) {
+        taskEXIT_CRITICAL(&s_link_probe_lock);
+        ESP_LOGW(TAG,
+                 "Zigbee: parent unavailable event=%lu while probe verification is pending",
+                 (unsigned long)event_count);
+        return;
+    }
+    s_link_probe_expected_sequence = 0;
+    s_link_probe_in_flight = false;
+    s_link_probe_state = LINK_PROBE_ACTIVE;
+    taskEXIT_CRITICAL(&s_link_probe_lock);
+
+    s_link_probe_requests++;
+    // Detach any ordinary reporting batch. Its late confirmations must not
+    // affect probe verdict or trigger full-cache repairs during verification.
+    report_window_close();
+    if (s_sensor_task_handle != NULL) {
+        xTaskNotify(s_sensor_task_handle,
+                    SENSOR_NOTIFY_LINK_PROBE_BIT, eSetBits);
+    }
+    ESP_LOGW(TAG,
+             "Zigbee: parent unavailable event=%lu; send active probe, verify in %d ms",
+             (unsigned long)event_count,
+             ZB_UNAVAILABLE_VERIFY_DELAY_MS);
+    schedule_device_unavailable_verify();
+}
+
+static void device_unavailable_verify_timer_cb(uint8_t unused)
+{
+    bool expired = false;
+    TickType_t now = xTaskGetTickCount();
+
+    (void)unused;
+
+    taskENTER_CRITICAL(&s_link_probe_lock);
+    if (s_link_probe_state == LINK_PROBE_ACTIVE) {
+        expired = true;
+        if (s_link_probe_in_flight) {
+            link_probe_retire_locked(s_link_probe_expected_sequence, now);
+        }
+        link_probe_reset_locked();
+    }
+    taskEXIT_CRITICAL(&s_link_probe_lock);
+
+    if (!expired) {
+        return;
+    }
+    if (!s_zigbee_connected) {
+        return;
+    }
+
+    s_device_unavailable_verify_resteers++;
+    ESP_LOGW(TAG,
+             "Zigbee: parent unavailable probe had no APS success; resteer now (verify_resteers=%lu)",
+             (unsigned long)s_device_unavailable_verify_resteers);
+    zigbee_link_lost(ESP_ZB_ZDO_DEVICE_UNAVAILABLE, ESP_OK);
 }
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
@@ -574,8 +926,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         }
         break;
     case ESP_ZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT:
-    case ESP_ZB_ZDO_DEVICE_UNAVAILABLE:
         zigbee_link_lost(sig_type, err_status);
+        break;
+    case ESP_ZB_ZDO_DEVICE_UNAVAILABLE:
+        zigbee_handle_device_unavailable(p_sg_p, err_status);
         break;
     case ESP_ZB_NLME_STATUS_INDICATION:
         // A healthy centralized network can emit periodic NWK status/address
@@ -596,11 +950,87 @@ static bool aps_confirm_is_sensor_report(const esp_zb_apsde_data_confirm_t *conf
         && confirm->src_endpoint == EP_SENSOR;
 }
 
+static bool aps_confirm_is_link_probe_frame(
+    const esp_zb_apsde_data_confirm_t *confirm)
+{
+    return confirm->asdu != NULL
+        && confirm->asdu_length >= (3 + 2 + 1 + 2)
+        && confirm->asdu[0] == ZCL_FRAME_REPORT_SERVER_TO_CLIENT
+        && confirm->asdu[2] == ZCL_CMD_REPORT_ATTRIBUTES
+        && aps_confirm_is_sensor_report(confirm);
+}
+
+static bool aps_confirm_consume_link_probe(
+    const esp_zb_apsde_data_confirm_t *confirm)
+{
+    bool current_match = false;
+    bool retired_match = false;
+    bool current_success = false;
+    uint8_t sequence = 0;
+    TickType_t now = xTaskGetTickCount();
+
+    if (!aps_confirm_is_link_probe_frame(confirm)) {
+        return false;
+    }
+
+    sequence = confirm->asdu[1];
+    taskENTER_CRITICAL(&s_link_probe_lock);
+    current_match = s_link_probe_state == LINK_PROBE_ACTIVE
+        && s_link_probe_in_flight
+        && s_link_probe_expected_sequence == sequence;
+    if (current_match) {
+        current_success = confirm->status == 0;
+        if (current_success) {
+            link_probe_reset_locked();
+        } else {
+            s_link_probe_in_flight = false;
+        }
+    } else {
+        retired_match = link_probe_take_retired_locked(sequence, now);
+    }
+    taskEXIT_CRITICAL(&s_link_probe_lock);
+
+    if (current_match && current_success) {
+        s_device_unavailable_recovered++;
+        esp_zb_scheduler_alarm_cancel(device_unavailable_verify_timer_cb, 0);
+        ESP_LOGI(TAG,
+                 "Zigbee: parent unavailable resolved by active probe seq=%u (total=%lu recovered=%lu)",
+                 (unsigned)sequence,
+                 (unsigned long)s_device_unavailable_total,
+                 (unsigned long)s_device_unavailable_recovered);
+        return true;
+    }
+
+    if (current_match) {
+        s_link_probe_aps_failures++;
+        ESP_LOGW(TAG,
+                 "Zigbee: active parent-link probe seq=%u failed APS; wait for verification timeout",
+                 (unsigned)sequence);
+        return true;
+    }
+
+    if (retired_match) {
+        ESP_LOGI(TAG,
+                 "Zigbee: ignore late retired parent-link probe confirm seq=%u status=%u",
+                 (unsigned)sequence, (unsigned)confirm->status);
+        return true;
+    }
+
+    return false;
+}
+
 // Runs in Zigbee stack context. Keep it short: only record the APS result and
 // wake the sensor task. Never send another Zigbee frame directly from here.
 static void aps_data_confirm_cb(esp_zb_apsde_data_confirm_t confirm)
 {
     bool app_report = false;
+
+    // Current probe results drive verification. Retired probe results are
+    // swallowed after timeout so they can never trigger ordinary full-cache
+    // repairs or consume a future reporting batch's in-flight slot.
+    if (aps_confirm_consume_link_probe(&confirm)) {
+        return;
+    }
 
     if (aps_confirm_is_sensor_report(&confirm)) {
         taskENTER_CRITICAL(&s_report_state_lock);
@@ -611,18 +1041,14 @@ static void aps_data_confirm_cb(esp_zb_apsde_data_confirm_t confirm)
         taskEXIT_CRITICAL(&s_report_state_lock);
     }
 
-    if (!app_report) {
-        return;
-    }
-
-    if (confirm.status == 0) {
+    if (app_report && confirm.status == 0) {
         s_aps_confirm_success++;
-        return;
-    }
-
-    s_aps_confirm_failure++;
-    if (s_sensor_task_handle != NULL) {
-        xTaskNotify(s_sensor_task_handle, 0, eNoAction);
+    } else if (app_report) {
+        s_aps_confirm_failure++;
+        if (s_sensor_task_handle != NULL) {
+            xTaskNotify(s_sensor_task_handle,
+                        SENSOR_NOTIFY_APS_FAIL_BIT, eSetBits);
+        }
     }
 }
 
@@ -677,9 +1103,13 @@ static esp_err_t report_one_attribute(uint16_t cluster_id,
 {
     uint8_t attr_type = (cluster_id == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT)
                       ? ZCL_TYPE_SIGNED_16BIT : ZCL_TYPE_UNSIGNED_16BIT;
+    uint8_t report_sequence;
+    if (!zcl_report_sequence_allocate(&report_sequence)) {
+        return ESP_ERR_INVALID_STATE;
+    }
     uint8_t asdu[3 + 2 + 1 + 2] = {
         ZCL_FRAME_REPORT_SERVER_TO_CLIENT,
-        ++s_zcl_report_sequence,
+        report_sequence,
         ZCL_CMD_REPORT_ATTRIBUTES,
         (uint8_t)(attr_id & 0xff),
         (uint8_t)(attr_id >> 8),
@@ -703,6 +1133,7 @@ static esp_err_t report_one_attribute(uint16_t cluster_id,
         .alias_seq_num = 0,
         .radius = REPORT_APS_RADIUS,
     };
+
     esp_err_t err;
 
     esp_zb_lock_acquire(portMAX_DELAY);
@@ -756,8 +1187,8 @@ static bool send_sensor_reports(uint8_t flags, const char *reason)
 {
     bool all_ok = true;
 
-    if (!s_zigbee_connected) {
-        ESP_LOGI(TAG, "REPORT_SEND: skipped reason=%s while Zigbee is offline", reason);
+    if (!s_zigbee_connected || link_probe_is_active()) {
+        ESP_LOGI(TAG, "REPORT_SEND: skipped reason=%s while Zigbee link is changing", reason);
         return false;
     }
 
@@ -806,6 +1237,7 @@ static void log_report_stats(TickType_t now)
              "REPORT_STATS: rounds=%lu repairs=%lu i2c_th_fail=%lu i2c_lux_fail=%lu "
              "i2c_resets=%lu i2c_reinits=%lu "
              "attempts=%lu queued=%lu queue_fail=%lu items_failed=%lu aps_ok=%lu aps_fail=%lu "
+             "unavail=%lu recovered=%lu probe_resteer=%lu probes=%lu/%lu probe_aps_fail=%lu "
              "th_invalid=%lu lux_invalid=%lu th_streak=%lu lux_streak=%lu",
              (unsigned long)s_report_rounds,
              (unsigned long)s_report_repairs,
@@ -819,6 +1251,12 @@ static void log_report_stats(TickType_t now)
              (unsigned long)s_report_items_failed,
              (unsigned long)s_aps_confirm_success,
              (unsigned long)s_aps_confirm_failure,
+             (unsigned long)s_device_unavailable_total,
+             (unsigned long)s_device_unavailable_recovered,
+             (unsigned long)s_device_unavailable_verify_resteers,
+             (unsigned long)s_link_probe_sent,
+             (unsigned long)s_link_probe_requests,
+             (unsigned long)s_link_probe_aps_failures,
              (unsigned long)s_sensor_th_invalid,
              (unsigned long)s_sensor_lux_invalid,
              (unsigned long)s_th_fail_streak,
@@ -855,9 +1293,15 @@ static void sensor_task(void *arg)
             continue;
         }
 
-        // Drop a notification left by a report from an earlier reporting window.
-        xTaskNotifyWait(0, 0, NULL, 0);
+        xTaskNotifyWait(0, UINT32_MAX, NULL, 0);
         report_window_close();
+
+        // During verification the Zigbee task owns the only active probe. Do
+        // not sample or start an ordinary reporting batch concurrently.
+        if (link_probe_is_active()) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
 
         float temp = 0, hum = 0, lux = 0;
         sensor_read_status_t th_status = SENSOR_READ_BUS_ERROR;
@@ -953,18 +1397,23 @@ static void sensor_task(void *arg)
         while (repairs_this_round < REPORT_APS_REPAIRS) {
             TickType_t now = xTaskGetTickCount();
             TickType_t remaining = (TickType_t)(deadline - now);
+            uint32_t notify_value = 0;
             if ((int32_t)remaining <= 0) {
                 break;
             }
 
-            if (xTaskNotifyWait(0, 0, NULL, remaining) != pdTRUE) {
+            if (xTaskNotifyWait(0, UINT32_MAX, &notify_value, remaining) != pdTRUE) {
                 break;  // Normal 10-second reporting period elapsed.
             }
 
-            if (!s_zigbee_connected) {
-                ESP_LOGI(TAG, "REPORT_APS: stop repair; Zigbee link is offline");
+            if (!s_zigbee_connected || link_probe_is_active()) {
+                ESP_LOGI(TAG, "REPORT_APS: stop repair while Zigbee link is changing");
                 report_window_close();
                 break;
+            }
+
+            if ((notify_value & SENSOR_NOTIFY_APS_FAIL_BIT) == 0) {
+                continue;
             }
 
             repairs_this_round++;

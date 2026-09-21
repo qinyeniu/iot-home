@@ -18,6 +18,7 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_zigbee_core.h"
+#include "zcl/esp_zigbee_zcl_command.h"
 #include "nwk/esp_zigbee_nwk.h"
 #include "aps/esp_zigbee_aps.h"
 #include "driver/i2c_master.h"
@@ -55,6 +56,8 @@
 #define REPORT_RETRY_DELAY_MS   200
 #define REPORT_APS_REPAIRS      2       // extra full-cache repairs after APS send failure
 #define REPORT_STATS_MS         60000
+#define RELAY_REPORT_RETRY_MS   500
+#define RELAY_REPORT_MAX_TRIES  3
 #define REPORT_APS_RADIUS       10
 #define ZIGBEE_LINK_RESTEER_DELAY_MS  1000
 #define ZIGBEE_STEERING_FAIL_RETRY_MS 5000
@@ -74,6 +77,7 @@
 // Minimal ZCL Report Attributes frame used by the raw APS path below.
 #define ZCL_FRAME_REPORT_SERVER_TO_CLIENT  0x18
 #define ZCL_CMD_REPORT_ATTRIBUTES          0x0a
+#define ZCL_TYPE_BOOLEAN                0x10
 #define ZCL_TYPE_UNSIGNED_16BIT            0x21
 #define ZCL_TYPE_SIGNED_16BIT              0x29
 
@@ -603,11 +607,158 @@ static sensor_read_status_t bh1750_read(float *lux)
 // low-level triggered: drive the control pin LOW to energize it.
 static volatile bool s_relay_on = false;
 
+typedef struct {
+    bool in_flight;
+    uint8_t sequence;
+    uint8_t attempts;
+} relay_report_state_t;
+
+static portMUX_TYPE s_relay_report_lock = portMUX_INITIALIZER_UNLOCKED;
+static relay_report_state_t s_relay_report = {0};
+static void relay_state_report_timer_cb(uint8_t unused);
+
+static void relay_report_reset(void)
+{
+    taskENTER_CRITICAL(&s_relay_report_lock);
+    s_relay_report.in_flight = false;
+    s_relay_report.sequence = 0;
+    s_relay_report.attempts = 0;
+    taskEXIT_CRITICAL(&s_relay_report_lock);
+}
+
+static void relay_report_schedule_retry(void)
+{
+    esp_zb_scheduler_alarm_cancel(relay_state_report_timer_cb, 0);
+    esp_zb_scheduler_alarm(relay_state_report_timer_cb, 0,
+                           RELAY_REPORT_RETRY_MS);
+}
+
+static bool relay_report_claim(uint8_t sequence, uint8_t *attempt_number)
+{
+    bool claimed = false;
+
+    taskENTER_CRITICAL(&s_relay_report_lock);
+    if (!s_relay_report.in_flight &&
+        s_relay_report.attempts < RELAY_REPORT_MAX_TRIES) {
+        s_relay_report.in_flight = true;
+        s_relay_report.sequence = sequence;
+        s_relay_report.attempts++;
+        *attempt_number = s_relay_report.attempts;
+        claimed = true;
+    }
+    taskEXIT_CRITICAL(&s_relay_report_lock);
+    return claimed;
+}
+
+static void relay_report_release(void)
+{
+    taskENTER_CRITICAL(&s_relay_report_lock);
+    s_relay_report.in_flight = false;
+    taskEXIT_CRITICAL(&s_relay_report_lock);
+}
+
+static bool relay_report_take_confirm(uint8_t sequence,
+                                      uint8_t *attempt_number,
+                                      bool *can_retry)
+{
+    bool matched = false;
+
+    taskENTER_CRITICAL(&s_relay_report_lock);
+    if (s_relay_report.in_flight && s_relay_report.sequence == sequence) {
+        s_relay_report.in_flight = false;
+        *attempt_number = s_relay_report.attempts;
+        *can_retry = s_relay_report.attempts < RELAY_REPORT_MAX_TRIES;
+        matched = true;
+    }
+    taskEXIT_CRITICAL(&s_relay_report_lock);
+    return matched;
+}
+
 static void relay_set(bool on)
 {
     s_relay_on = on;
     gpio_set_level(RELAY_GPIO, on ? 0 : 1);
     ESP_LOGI(TAG, "RELAY %s", on ? "ON" : "OFF");
+}
+
+// Send a one-shot standard ZCL attribute report so the gateway/cloud can show
+// the actual actuator state. A short scheduler delay avoids transmitting in the
+// middle of the incoming On/Off command processing.
+static void relay_state_report_timer_cb(uint8_t unused)
+{
+    uint8_t value = s_relay_on ? 1 : 0;
+    uint8_t report_sequence;
+    uint8_t attempt_number = 0;
+    uint8_t asdu[3 + 2 + 1 + 1] = {0};
+    esp_err_t err;
+
+    (void)unused;
+
+    // Sequence allocation is blocked during active link probes. Retry from a
+    // scheduler alarm rather than dropping the already-executed state.
+    if (!zcl_report_sequence_allocate(&report_sequence)) {
+        ESP_LOGW(TAG, "RELAY state report waits for link-probe window");
+        relay_report_schedule_retry();
+        return;
+    }
+    if (!relay_report_claim(report_sequence, &attempt_number)) {
+        ESP_LOGW(TAG, "RELAY state report busy or retry budget exhausted");
+        return;
+    }
+
+    err = esp_zb_zcl_set_attribute_val(EP_SENSOR,
+                                       ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+                                       ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                       ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+                                       &value, false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RELAY local state update failed: %s", esp_err_to_name(err));
+        relay_report_release();
+        if (attempt_number < RELAY_REPORT_MAX_TRIES) {
+            relay_report_schedule_retry();
+        }
+        return;
+    }
+
+    asdu[0] = ZCL_FRAME_REPORT_SERVER_TO_CLIENT;
+    asdu[1] = report_sequence;
+    asdu[2] = ZCL_CMD_REPORT_ATTRIBUTES;
+    asdu[3] = (uint8_t)(ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID & 0xff);
+    asdu[4] = (uint8_t)(ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID >> 8);
+    asdu[5] = ZCL_TYPE_BOOLEAN;
+    asdu[6] = value;
+
+    esp_zb_apsde_data_req_t req = {
+        .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .dst_addr.addr_short = COORDINATOR_SHORT_ADDR,
+        .dst_endpoint = EP_SENSOR,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+        .src_endpoint = EP_SENSOR,
+        .asdu_length = sizeof(asdu),
+        .asdu = asdu,
+        .tx_options = ESP_ZB_APSDE_TX_OPT_SECURITY_ENABLED | ESP_ZB_APSDE_TX_OPT_ACK_TX,
+        .use_alias = false,
+        .alias_src_addr = 0,
+        .alias_seq_num = 0,
+        .radius = REPORT_APS_RADIUS,
+    };
+
+    err = esp_zb_aps_data_request(&req);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RELAY state report rejected (attempt %u/%u): %s",
+                 (unsigned)attempt_number, (unsigned)RELAY_REPORT_MAX_TRIES,
+                 esp_err_to_name(err));
+        relay_report_release();
+        if (attempt_number < RELAY_REPORT_MAX_TRIES) {
+            relay_report_schedule_retry();
+        }
+        return;
+    }
+
+    ESP_LOGI(TAG, "RELAY state report sent: %s attempt=%u/%u",
+             value ? "ON" : "OFF",
+             (unsigned)attempt_number, (unsigned)RELAY_REPORT_MAX_TRIES);
 }
 
 // The HA library delivers a standard On/Off command as an attribute-set
@@ -622,7 +773,11 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     if (msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
         msg->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID &&
         msg->attribute.data.size == 1 && msg->attribute.data.value != NULL) {
-        relay_set((*(const uint8_t *)msg->attribute.data.value) != 0);
+        bool on = (*(const uint8_t *)msg->attribute.data.value) != 0;
+        relay_set(on);
+        relay_report_reset();
+        esp_zb_scheduler_alarm_cancel(relay_state_report_timer_cb, 0);
+        esp_zb_scheduler_alarm(relay_state_report_timer_cb, 0, 100);
     }
     return ESP_OK;
 }
@@ -1237,10 +1392,66 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
 static bool aps_confirm_is_sensor_report(const esp_zb_apsde_data_confirm_t *confirm)
 {
-    return confirm->dst_addr_mode == ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT
+    // Measurement reports use an 8-byte Report Attributes ASDU. The separate
+    // relay-state report is a 7-byte Boolean frame and must not consume this
+    // reporting window's counters/self-heal notifications.
+    return confirm->asdu != NULL
+        && confirm->asdu_length >= (3 + 2 + 1 + 2)
+        && confirm->asdu[0] == ZCL_FRAME_REPORT_SERVER_TO_CLIENT
+        && confirm->asdu[2] == ZCL_CMD_REPORT_ATTRIBUTES
+        && confirm->dst_addr_mode == ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT
         && confirm->dst_addr.addr_short == COORDINATOR_SHORT_ADDR
         && confirm->dst_endpoint == EP_SENSOR
         && confirm->src_endpoint == EP_SENSOR;
+}
+
+static bool aps_confirm_is_relay_report(const esp_zb_apsde_data_confirm_t *confirm)
+{
+    return confirm->asdu != NULL
+        && confirm->asdu_length == (3 + 2 + 1 + 1)
+        && confirm->asdu[0] == ZCL_FRAME_REPORT_SERVER_TO_CLIENT
+        && confirm->asdu[2] == ZCL_CMD_REPORT_ATTRIBUTES
+        && confirm->asdu[3] == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID
+        && confirm->asdu[4] == 0
+        && confirm->asdu[5] == ZCL_TYPE_BOOLEAN
+        && confirm->asdu[6] <= 1
+        && confirm->dst_addr_mode == ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT
+        && confirm->dst_addr.addr_short == COORDINATOR_SHORT_ADDR
+        && confirm->dst_endpoint == EP_SENSOR
+        && confirm->src_endpoint == EP_SENSOR;
+}
+
+static bool aps_confirm_consume_relay_report(
+    const esp_zb_apsde_data_confirm_t *confirm)
+{
+    uint8_t attempt_number = 0;
+    bool can_retry = false;
+
+    if (!aps_confirm_is_relay_report(confirm)) {
+        return false;
+    }
+
+    // Swallow stale relay frames too; they must never become sensor reports.
+    if (!relay_report_take_confirm(confirm->asdu[1], &attempt_number,
+                                   &can_retry)) {
+        ESP_LOGW(TAG, "RELAY state confirm ignored (no pending frame seq=%u)",
+                 (unsigned)confirm->asdu[1]);
+        return true;
+    }
+
+    if (confirm->status == 0) {
+        ESP_LOGI(TAG, "RELAY state report acknowledged attempt=%u/%u",
+                 (unsigned)attempt_number, (unsigned)RELAY_REPORT_MAX_TRIES);
+        return true;
+    }
+
+    ESP_LOGW(TAG, "RELAY state report failed attempt=%u/%u status=%u",
+             (unsigned)attempt_number, (unsigned)RELAY_REPORT_MAX_TRIES,
+             (unsigned)confirm->status);
+    if (can_retry) {
+        relay_report_schedule_retry();
+    }
+    return true;
 }
 
 static bool aps_confirm_is_link_probe_frame(
@@ -1353,6 +1564,9 @@ static void aps_data_confirm_cb(esp_zb_apsde_data_confirm_t confirm)
     // swallowed after timeout so they can never trigger ordinary full-cache
     // repairs or consume a future reporting batch's in-flight slot.
     if (aps_confirm_consume_link_probe(&confirm)) {
+        return;
+    }
+    if (aps_confirm_consume_relay_report(&confirm)) {
         return;
     }
 
@@ -1784,6 +1998,19 @@ static void sensor_task(void *arg)
 
 void app_main(void)
 {
+    // Hold the low-level-triggered relay input high before anything else.
+    // The internal pull-up is a belt-and-suspenders default; an external pull-up
+    // remains preferable for loads where a startup pulse would be unsafe.
+    gpio_config_t relay_io = {
+        .pin_bit_mask = 1ULL << RELAY_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&relay_io));
+    gpio_set_level(RELAY_GPIO, 1);
+
     ESP_LOGI(TAG, "=============================");
     ESP_LOGI(TAG, "Combined Sensor + Switch Node v3.1 (ZCL)");
     ESP_LOGI(TAG, "=============================");
@@ -1795,17 +2022,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Configure the relay pin before the radio starts and hold it HIGH so
-    // the co-located relay stays released (off) at power-up.
-    gpio_config_t relay_io = {
-        .pin_bit_mask = 1ULL << RELAY_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&relay_io));
-    gpio_set_level(RELAY_GPIO, 1);
+    // GPIO4 was configured and held high at the very start of app_main.
 
     esp_err_t i2c_err = i2c_sensor_bus_init();
     if (i2c_err != ESP_OK) {

@@ -748,6 +748,8 @@ typedef struct {
     uint8_t  valid;         // fields ever received
     uint8_t  dirty;         // fields updated since last MQTT publish
     uint8_t  active;        // currently joined child
+    uint8_t  onoff_valid;   // On/Off state has been received
+    uint8_t  onoff_value;   // latest On/Off state (0=off, 1=on)
     uint32_t first_dirty_ms;
     uint32_t last_report_ms;
 } zb_node_t;
@@ -809,6 +811,17 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         event.raw = raw;
         break;
     }
+    case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF: {
+        if (m->attribute.data.size != 1) {
+            return ESP_OK;
+        }
+        uint8_t state = *(const uint8_t *)v;
+        if (state > 1) {
+            return ESP_OK;
+        }
+        event.value = state;
+        break;
+    }
     default:
         return ESP_OK;
     }
@@ -841,6 +854,8 @@ static esp_zb_ep_list_t *create_gateway_ep(void)
         esp_zb_humidity_meas_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
     esp_zb_cluster_list_add_illuminance_meas_cluster(clusters,
         esp_zb_illuminance_meas_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+    esp_zb_cluster_list_add_on_off_cluster(clusters,
+        esp_zb_on_off_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
     esp_zb_endpoint_config_t ep_cfg = {
         .endpoint = EP_GW,
@@ -1247,9 +1262,9 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
         .on_off_cmd_id = cmd_id,
     };
-    uint8_t zcl_status = esp_zb_zcl_on_off_cmd_req(&req);
-    ESP_LOGI(TAG, "CMD fwd: node=0x%04x cmd=%s zcl_status=%u",
-             (unsigned)short_addr, command->valuestring, (unsigned)zcl_status);
+    uint8_t zcl_seq = esp_zb_zcl_on_off_cmd_req(&req);
+    ESP_LOGI(TAG, "CMD fwd: node=0x%04x cmd=%s zcl_seq=%u",
+             (unsigned)short_addr, command->valuestring, (unsigned)zcl_seq);
     cJSON_Delete(root);
 }
 
@@ -1513,12 +1528,29 @@ static void zb_handle_leave_event(const zb_app_event_t *event)
     }
 }
 
+static void zb_publish_node_switch_state(const zb_node_t *node)
+{
+    char topic_suffix[40];
+    char payload[64];
+
+    if (!s_mqtt_ok || node == NULL || !node->onoff_valid) {
+        return;
+    }
+
+    snprintf(topic_suffix, sizeof(topic_suffix), "nodes/zb-%04x/telemetry", node->addr);
+    snprintf(payload, sizeof(payload), "{\"data\":{\"on_off\":%u}}", node->onoff_value);
+    mqtt_pub(topic_suffix, payload);
+    ESP_LOGI(TAG, "MQTT -> %s: %s", topic_suffix, payload);
+}
+
 static void zb_handle_report_event(const zb_app_event_t *event)
 {
     bool became_active = false;
     bool first_dirty = false;
     bool need_status = false;
+    bool switch_state_changed = false;
     zb_node_t status_snap = {0};
+    zb_node_t switch_snap = {0};
     uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
 
     portENTER_CRITICAL(&s_zb_lock);
@@ -1548,6 +1580,12 @@ static void zb_handle_report_event(const zb_app_event_t *event)
             node->valid |= ZB_MASK_LUX;
             node->dirty |= ZB_MASK_LUX;
             break;
+        case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF:
+            node->onoff_value = event->value;
+            node->onoff_valid = true;
+            switch_snap = *node;
+            switch_state_changed = true;
+            break;
         default:
             break;
         }
@@ -1571,9 +1609,14 @@ static void zb_handle_report_event(const zb_app_event_t *event)
                 zb_publish_node_status(&status_snap, "device_active", true);
             }
         }
+        if (switch_state_changed) {
+            zb_publish_node_switch_state(&switch_snap);
+        }
         s_zb_report_events++;
-        ESP_LOGI(TAG, "Zigbee: cached report node=0x%04x cluster=0x%04x raw=%u total=%lu",
-                 event->addr, event->cluster, event->raw,
+        unsigned event_value = event->cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF
+                             ? event->value : event->raw;
+        ESP_LOGI(TAG, "Zigbee: cached report node=0x%04x cluster=0x%04x value=%u total=%lu",
+                 event->addr, event->cluster, event_value,
                  (unsigned long)s_zb_report_events);
     }
 }
@@ -1681,6 +1724,10 @@ static void zb_forward_pending(void)
             float lux = powf(10.0f, (float)n->lux_raw / 10000.0f) - 1.0f;
             pos += snprintf(payload + pos, sizeof(payload) - pos,
                             "\"lux\":%.1f,", lux);
+        }
+        if (n->onoff_valid) {
+            pos += snprintf(payload + pos, sizeof(payload) - pos,
+                            "\"on_off\":%u,", (unsigned)n->onoff_value);
         }
         if (payload[pos - 1] == ',') pos--;
         snprintf(payload + pos, sizeof(payload) - pos, "}}");

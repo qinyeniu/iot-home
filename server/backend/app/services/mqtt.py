@@ -179,6 +179,7 @@ class MQTTService:
                 on_off = data.get("on_off")
                 if (
                     isinstance(on_off, (int, float))
+                    and not isinstance(on_off, bool)
                     and math.isfinite(on_off)
                     and float(on_off) in (0.0, 1.0)
                 ):

@@ -92,8 +92,8 @@ async def get_device(
 async def get_device_metrics(
     device_id: str,
     metric: Optional[str] = Query(None, description="指标名称"),
-    hours: int = Query(24, description="查询时间范围（小时）"),
-    limit: int = Query(1000, description="返回条数限制"),
+    hours: int = Query(24, ge=1, le=24 * 365, description="查询时间范围（小时）"),
+    limit: int = Query(1000, ge=1, le=5000, description="返回条数限制"),
     session: AsyncSession = Depends(get_session)
 ):
     """获取设备指标数据"""

@@ -12,6 +12,7 @@ import os
 import unittest
 from datetime import datetime
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.models.database import Base
@@ -79,13 +80,15 @@ class MySQLConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         devices_module.mqtt_service = self.old_mqtt_service
         async with self.engine.begin() as conn:
             await conn.run_sync(
-                lambda sync_conn: sync_conn.exec_driver_sql(
-                    f"DELETE FROM commands WHERE device_id = '{DEVICE_ID}'"
+                lambda sync_conn: sync_conn.execute(
+                    text("DELETE FROM commands WHERE device_id = :device_id"),
+                    {"device_id": DEVICE_ID},
                 )
             )
             await conn.run_sync(
-                lambda sync_conn: sync_conn.exec_driver_sql(
-                    f"DELETE FROM devices WHERE id = '{DEVICE_ID}'"
+                lambda sync_conn: sync_conn.execute(
+                    text("DELETE FROM devices WHERE id = :device_id"),
+                    {"device_id": DEVICE_ID},
                 )
             )
         await self.engine.dispose()

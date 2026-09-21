@@ -83,6 +83,9 @@
 
 #define EP_SENSOR               10      // endpoint on both node and gateway
 #define RELAY_GPIO              GPIO_NUM_4  // co-located relay (LOW=energize)
+#define BUTTON_GPIO             GPIO_NUM_5  // local manual button (LOW=pressed)
+#define BUTTON_POLL_MS          20
+#define BUTTON_DEBOUNCE_MS      300
 #define COORDINATOR_SHORT_ADDR  0x0000
 
 #define INSTALLCODE_POLICY      false
@@ -1994,6 +1997,34 @@ static void sensor_task(void *arg)
     }
 }
 
+// Local button: one press toggles the co-located relay and the new state is
+// reported to the cloud through the same path as a cloud-driven change.
+static void button_task(void *arg)
+{
+    bool was_pressed = false;
+    uint32_t last_toggle_ms = 0;
+
+    for (;;) {
+        bool pressed = gpio_get_level(BUTTON_GPIO) == 0;
+
+        if (pressed && !was_pressed) {
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now - last_toggle_ms >= BUTTON_DEBOUNCE_MS) {
+                last_toggle_ms = now;
+                bool on = !s_relay_on;
+                // Reuse the exact cloud-command path: drive GPIO, then let the
+                // timer publish the raw ZCL OnOff report with finite retries.
+                relay_set(on);
+                relay_report_reset();
+                esp_zb_scheduler_alarm_cancel(relay_state_report_timer_cb, 0);
+                esp_zb_scheduler_alarm(relay_state_report_timer_cb, 0, 100);
+            }
+        }
+        was_pressed = pressed;
+        vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+    }
+}
+
 // ==================== Main ====================
 
 void app_main(void)
@@ -2010,6 +2041,16 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(gpio_config(&relay_io));
     gpio_set_level(RELAY_GPIO, 1);
+
+    // Local manual button on GPIO5 (active low), internal pull-up enabled.
+    gpio_config_t button_io = {
+        .pin_bit_mask = 1ULL << BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&button_io));
 
     ESP_LOGI(TAG, "=============================");
     ESP_LOGI(TAG, "Combined Sensor + Switch Node v3.1 (ZCL)");
@@ -2046,6 +2087,7 @@ void app_main(void)
     // the Zigbee task registers the APS confirm callback.
     xTaskCreate(sensor_task, "sensor", 4096, NULL, 5, &s_sensor_task_handle);
     xTaskCreate(zigbee_task, "zigbee", 16384, NULL, 5, NULL);
+    xTaskCreate(button_task, "button", 3072, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "Zigbee sensor node ready!");
 }

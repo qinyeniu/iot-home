@@ -21,6 +21,7 @@
 #include "nwk/esp_zigbee_nwk.h"
 #include "aps/esp_zigbee_aps.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 
 // ==================== Configuration ====================
 
@@ -77,6 +78,7 @@
 #define ZCL_TYPE_SIGNED_16BIT              0x29
 
 #define EP_SENSOR               10      // endpoint on both node and gateway
+#define RELAY_GPIO              GPIO_NUM_4  // co-located relay (LOW=energize)
 #define COORDINATOR_SHORT_ADDR  0x0000
 
 #define INSTALLCODE_POLICY      false
@@ -597,6 +599,34 @@ static sensor_read_status_t bh1750_read(float *lux)
 
 // ==================== Zigbee endpoint / clusters ====================
 
+// Relay actuator co-located on this sensor node. The relay is 3.3V
+// low-level triggered: drive the control pin LOW to energize it.
+static volatile bool s_relay_on = false;
+
+static void relay_set(bool on)
+{
+    s_relay_on = on;
+    gpio_set_level(RELAY_GPIO, on ? 0 : 1);
+    ESP_LOGI(TAG, "RELAY %s", on ? "ON" : "OFF");
+}
+
+// The HA library delivers a standard On/Off command as an attribute-set
+// action on cluster 0x0006.
+static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
+                                   const void *data)
+{
+    if (callback_id != ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID) {
+        return ESP_OK;
+    }
+    const esp_zb_zcl_set_attr_value_message_t *msg = data;
+    if (msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
+        msg->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID &&
+        msg->attribute.data.size == 1 && msg->attribute.data.value != NULL) {
+        relay_set((*(const uint8_t *)msg->attribute.data.value) != 0);
+    }
+    return ESP_OK;
+}
+
 static esp_zb_ep_list_t *create_sensor_ep(void)
 {
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
@@ -631,6 +661,10 @@ static esp_zb_ep_list_t *create_sensor_ep(void)
         esp_zb_humidity_meas_cluster_create(&hum_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_cluster_list_add_illuminance_meas_cluster(clusters,
         esp_zb_illuminance_meas_cluster_create(&lux_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    // On/Off server cluster drives the co-located relay; off until commanded.
+    esp_zb_on_off_cluster_cfg_t onoff_cfg = { .on_off = false };
+    esp_zb_cluster_list_add_on_off_cluster(clusters,
+        esp_zb_on_off_cluster_create(&onoff_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     esp_zb_endpoint_config_t ep_cfg = {
         .endpoint = EP_SENSOR,
@@ -1354,6 +1388,7 @@ static void zigbee_task(void *arg)
     ESP_LOGI(TAG, "RX-on-when-idle=%d", esp_zb_get_rx_on_when_idle());
     esp_zb_set_primary_network_channel_set(ESP_ZB_CHANNEL_MASK);
     esp_zb_device_register(create_sensor_ep());
+    esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_aps_data_confirm_handler_register(aps_data_confirm_cb);
     esp_zb_start(false);
 
@@ -1750,7 +1785,7 @@ static void sensor_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "=============================");
-    ESP_LOGI(TAG, "Zigbee Sensor Node v3.0 (ZCL)");
+    ESP_LOGI(TAG, "Combined Sensor + Switch Node v3.1 (ZCL)");
     ESP_LOGI(TAG, "=============================");
 
     esp_err_t ret = nvs_flash_init();
@@ -1759,6 +1794,18 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Configure the relay pin before the radio starts and hold it HIGH so
+    // the co-located relay stays released (off) at power-up.
+    gpio_config_t relay_io = {
+        .pin_bit_mask = 1ULL << RELAY_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&relay_io));
+    gpio_set_level(RELAY_GPIO, 1);
 
     esp_err_t i2c_err = i2c_sensor_bus_init();
     if (i2c_err != ESP_OK) {

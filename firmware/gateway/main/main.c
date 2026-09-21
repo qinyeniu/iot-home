@@ -39,6 +39,8 @@
 #include "esp_ieee802154.h"
 #include "wifi_secrets.h"
 #include "mqtt_secrets.h"
+#include "cJSON.h"
+#include "zcl/esp_zigbee_zcl_on_off.h"
 
 // ==================== Configuration ====================
 
@@ -1181,6 +1183,76 @@ static void wifi_start(void)
 
 // ==================== MQTT ====================
 
+// Forward a cloud command delivered over MQTT to a Zigbee node as a
+// standard ZCL On/Off cluster command. Topic convention:
+//   {prefix}/{gateway}/nodes/{node}/cmd
+// with {node} = "zb-XXXX" (short address). Payload: {"command":"on|off|toggle"}.
+static void gateway_handle_node_cmd(const char *topic, const char *payload)
+{
+    const char *nodes = strstr(topic, "/nodes/");
+    if (nodes == NULL) {
+        return;
+    }
+    const char *node_start = nodes + strlen("/nodes/");
+    const char *tail = strchr(node_start, '/');
+    if (tail == NULL || strcmp(tail, "/cmd") != 0) {
+        return;  // not a node command topic
+    }
+
+    char node[24];
+    size_t node_len = (size_t)(tail - node_start);
+    if (node_len == 0 || node_len >= sizeof(node)) {
+        return;
+    }
+    memcpy(node, node_start, node_len);
+    node[node_len] = '\0';
+
+    if (strncmp(node, "zb-", 3) != 0) {
+        return;
+    }
+    unsigned parsed = 0;
+    if (sscanf(node + 3, "%x", &parsed) != 1 || parsed == 0 || parsed > 0xFFFF) {
+        return;
+    }
+    uint16_t short_addr = (uint16_t)parsed;
+
+    cJSON *root = cJSON_Parse(payload);
+    if (root == NULL) {
+        ESP_LOGW(TAG, "CMD: non-JSON payload on %s", topic);
+        return;
+    }
+    cJSON *command = cJSON_GetObjectItem(root, "command");
+    uint8_t cmd_id = 0xFF;
+    if (cJSON_IsString(command)) {
+        if (strcmp(command->valuestring, "on") == 0) {
+            cmd_id = ESP_ZB_ZCL_CMD_ON_OFF_ON_ID;
+        } else if (strcmp(command->valuestring, "off") == 0) {
+            cmd_id = ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID;
+        } else if (strcmp(command->valuestring, "toggle") == 0) {
+            cmd_id = ESP_ZB_ZCL_CMD_ON_OFF_TOGGLE_ID;
+        }
+    }
+    if (cmd_id == 0xFF) {
+        ESP_LOGW(TAG, "CMD: unsupported command for node 0x%04x", short_addr);
+        cJSON_Delete(root);
+        return;
+    }
+
+    esp_zb_zcl_on_off_cmd_t req = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = short_addr,
+            .dst_endpoint = EP_GW,  // node endpoint 10
+            .src_endpoint = EP_GW,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .on_off_cmd_id = cmd_id,
+    };
+    uint8_t zcl_status = esp_zb_zcl_on_off_cmd_req(&req);
+    ESP_LOGI(TAG, "CMD fwd: node=0x%04x cmd=%s zcl_status=%u",
+             (unsigned)short_addr, command->valuestring, (unsigned)zcl_status);
+    cJSON_Delete(root);
+}
+
 static void mqtt_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     esp_mqtt_event_handle_t e = data;
@@ -1199,6 +1271,17 @@ static void mqtt_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
         break;
     case MQTT_EVENT_DATA:
         ESP_LOGI(TAG, "MQTT rx: %.*s = %.*s", e->topic_len, e->topic, e->data_len, e->data);
+        {
+            char topic[128];
+            char payload[256];
+            int tlen = e->topic_len < (int)sizeof(topic) - 1 ? e->topic_len : (int)sizeof(topic) - 1;
+            int dlen = e->data_len < (int)sizeof(payload) - 1 ? e->data_len : (int)sizeof(payload) - 1;
+            memcpy(topic, e->topic, tlen);
+            topic[tlen] = '\0';
+            memcpy(payload, e->data, dlen);
+            payload[dlen] = '\0';
+            gateway_handle_node_cmd(topic, payload);
+        }
         break;
     default:
         break;

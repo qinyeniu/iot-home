@@ -9,12 +9,17 @@ MQTT retained status 可以在服务重启后快速恢复 last known state，但
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from sqlalchemy import update
 
 from app.config import settings
 from app.models.database import Device
-from app.models.session import async_session_factory
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+# 运行时再导入，避免单元测试仅为替换会话工厂也必须安装 MySQL 驱动。
+async_session_factory: "async_sessionmaker[AsyncSession] | None" = None
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +30,11 @@ async def mark_stale_devices_offline() -> int:
         seconds=settings.DEVICE_OFFLINE_TIMEOUT_SECONDS
     )
 
-    async with async_session_factory() as session:
+    factory = async_session_factory
+    if factory is None:
+        from app.models.session import async_session_factory as factory
+
+    async with factory() as session:
         result = await session.execute(
             update(Device)
             .where(Device.status == "online")

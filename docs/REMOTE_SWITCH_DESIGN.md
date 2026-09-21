@@ -34,7 +34,7 @@ ZCL Report Attributes：cluster 0x0006, attribute 0, Boolean(0x10)
 网关转 MQTT telemetry：{"data":{"on_off":0|1}} -> metrics 表
 ```
 
-服务器侧命令 API、commands 表、MQTT 发布已完成；本次只改固件。
+服务器侧命令 API、commands 表、MQTT 发布已完成；2026-09-22 又补上基于 `on_off` 回报的命令状态闭环。
 
 ## 2. 已实施改动
 
@@ -62,7 +62,21 @@ MQTT_EVENT_DATA 中，当 topic 匹配 `.../nodes/{node}/cmd`：
 
 节点仍是 Zigbee End Device，并设置 rx-on-when-idle，以便云端命令无需等待本地轮询即可到达。
 
-### c. 独立开关板固件（备选，不是当前主线）
+### c. 后端命令状态闭环
+
+- 新增 `server/backend/app/services/command_ack.py` 与 `command_timeout.py`；
+- API 在插入任何命令行之前先对设备行 `SELECT ... FOR UPDATE`，保证同一设备的开关命令串行，避免 InnoDB 死锁；
+- 新开关命令发出前，此前 `pending/sent` 的开关命令会标记为 `superseded`；
+- 收到包含 `on_off` 的遥测后，查找同一设备 30 秒窗口内唯一仍为 `sent` 的 `on/off/toggle` 命令；若发现多个候选，不猜测回报归属；
+- `on` 期望状态 1，`off` 期望状态 0；`toggle` 查询命令发送前最后一条 `on_off`，从旧状态推断切换后的状态；
+- 指标同时保存设备时间戳 `ts` 和服务端实际接收时间 `received_at`；命令确认和 `toggle` 前置状态都按 `received_at` 判断，`acknowledged_at` 也使用服务端时间；
+- `on_off` 只接受精确的 0/1，不接受 `0.5` 等会被截断的值；
+- 新增后台任务：命令发出满 30 秒仍未确认则标记为 `timeout`，避免永久停留在 `sent`；任务启动时会立即检查一次；
+- 新增复合索引：命令 `(device_id,status,sent_at,id)`、指标 `(device_id,metric,received_at,id)`。
+
+已有数据库升级前需执行一次（脚本可重复执行）：`server/mysql/migrations/2026-09-22_command_lifecycle.sql`。
+
+### d. 独立开关板固件（备选，不是当前主线）
 
 `firmware/node_switch_zigbee/` 保留独立 On/Off light 节点模板；当前用户决定不做第三块板，因此只保留代码和提交，不刷写、不扩展。
 
@@ -78,6 +92,8 @@ MQTT_EVENT_DATA 中，当 topic 匹配 `.../nodes/{node}/cmd`：
 6. 温湿度/光照每 10 秒上报持续正常，完整数据包中包含 `on_off`。
 7. 云端 metrics 表已能查询 `metric=on_off`。
 8. 可靠性增强后复测：打开状态第一次尝试即 APS acknowledged；关闭后云端最新值恢复为 0，传感器上报持续正常。
+
+命令状态闭环代码已完成，20 项后端测试通过；因本次未部署/重启远端后端，也未执行现有数据库迁移，尚未在云服务器上实测 commands 状态从 `sent` 自动变为 `acknowledged/timeout/superseded`。
 
 待用户最终确认物理现象：继电器 IN/VCC/GND 是否已接好，是否听到“咔哒”声，或用万用表/小灯泡验证输出端通断。
 
@@ -110,7 +126,6 @@ Assertion failed .../zcl/zcl_general_commands.c:612
 ## 5. 暂不做（后续增强）
 
 - 设备能力建模：当前设备是“传感器 + 开关”组合，后续不要简单改成纯 switch；可增加 capabilities 字段或依据 `on_off` 指标识别；
-- 命令执行结果回执（commands 表 status: sent → done/acknowledged；当前 APS acknowledged 只是运行时链路确认）；
 - Grafana 开关按钮/开关状态面板；
 - 本地按键手动控制继电器；
 - 更强状态一致性：若 3 次 relay report 全部失败，可在节点周期上报中携带 OnOff，或由云端超时后 read attribute。当前状态回传属于有有限重试的 best-effort。

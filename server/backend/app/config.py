@@ -5,6 +5,7 @@
 
 import os
 from typing import Optional
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -29,8 +30,13 @@ class Settings(BaseSettings):
     API_PORT: int = 8000
 
     # 设备在线状态：调试期约 10 秒上报，3 分钟无心跳才判离线。
-    DEVICE_OFFLINE_TIMEOUT_SECONDS: int = 180
-    DEVICE_STATUS_CHECK_INTERVAL_SECONDS: int = 20
+    DEVICE_OFFLINE_TIMEOUT_SECONDS: int = Field(default=180, gt=0)
+    DEVICE_STATUS_CHECK_INTERVAL_SECONDS: int = Field(default=20, gt=0)
+
+    # 命令发出后的确认窗口；与超时阈值保持一致。
+    COMMAND_ACK_WINDOW_SECONDS: int = Field(default=30, gt=0)
+    COMMAND_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    COMMAND_TIMEOUT_CHECK_INTERVAL_SECONDS: int = Field(default=10, gt=0)
     
     # Grafana 配置
     GRAFANA_ADMIN_USER: str = "admin"

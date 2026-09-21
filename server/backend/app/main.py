@@ -12,6 +12,7 @@ from app.config import settings
 from app.models.session import init_db, close_db
 from app.services.mqtt import mqtt_service
 from app.services.device_status import device_status_monitor
+from app.services.command_timeout import command_timeout_monitor
 from app.routers.devices import router as devices_router
 
 # 配置日志
@@ -35,13 +36,19 @@ async def lifespan(app: FastAPI):
     # 启动后台任务
     mqtt_task = asyncio.create_task(mqtt_service.start())
     status_task = asyncio.create_task(device_status_monitor())
-    logger.info("MQTT 客户端和设备状态检查已启动")
+    command_timeout_task = asyncio.create_task(command_timeout_monitor())
+    logger.info("MQTT 客户端、设备状态和命令超时检查已启动")
 
     yield
 
     status_task.cancel()
+    command_timeout_task.cancel()
     try:
         await status_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await command_timeout_task
     except asyncio.CancelledError:
         pass
     

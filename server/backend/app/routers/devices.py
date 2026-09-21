@@ -4,13 +4,17 @@
 """
 
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.session import get_session
 from app.models.database import Device, Metric, Command
 from app.services.mqtt import mqtt_service
+from app.services.command_ack import (
+    SWITCH_COMMANDS,
+    supersede_open_switch_commands,
+)
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api", tags=["设备管理"])
@@ -39,7 +43,7 @@ class MetricResponse(BaseModel):
 
 class CommandRequest(BaseModel):
     command: str
-    payload: Optional[dict] = None
+    payload: Optional[dict[str, Any]] = None
 
 
 class CommandResponse(BaseModel):
@@ -49,6 +53,8 @@ class CommandResponse(BaseModel):
     payload: Optional[dict]
     status: str
     created_at: datetime
+    sent_at: Optional[datetime]
+    acknowledged_at: Optional[datetime]
 
 
 @router.get("/devices", response_model=List[DeviceResponse])
@@ -165,7 +171,16 @@ async def send_command(
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
     
-    # 创建命令记录
+    is_switch_command = request.command in SWITCH_COMMANDS
+    if is_switch_command:
+        # 必须先锁设备行，再插入命令，避免并发请求形成 InnoDB 死锁。
+        await session.execute(
+            select(Device.id)
+            .where(Device.id == device_id)
+            .with_for_update()
+        )
+
+    # 先不 commit，避免外部在消息尚未真正发出时看到一条 sent 命令。
     command = Command(
         device_id=device_id,
         command=request.command,
@@ -173,21 +188,35 @@ async def send_command(
         status="pending"
     )
     session.add(command)
-    await session.commit()
-    await session.refresh(command)
-    
+    await session.flush()
+
+    if is_switch_command:
+        await supersede_open_switch_commands(
+            session, device_id, command.id
+        )
+
     # 通过 MQTT 发送命令
-    success = await mqtt_service.publish_command(device_id, request.command, request.payload)
-    
+    success = await mqtt_service.publish_command(
+        device_id, request.command, request.payload
+    )
+
     if success:
         command.status = "sent"
         command.sent_at = datetime.now()
         await session.commit()
     else:
-        command.status = "failed"
+        await session.rollback()
+
+        failed_command = Command(
+            device_id=device_id,
+            command=request.command,
+            payload=request.payload,
+            status="failed"
+        )
+        session.add(failed_command)
         await session.commit()
         raise HTTPException(status_code=500, detail="命令发送失败")
-    
+
     return command
 
 

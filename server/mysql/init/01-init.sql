@@ -30,11 +30,13 @@ CREATE TABLE IF NOT EXISTS metrics (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   metric VARCHAR(64) NOT NULL COMMENT '指标名称（如 temperature, humidity, light）',
   value DOUBLE NOT NULL COMMENT '指标值',
-  ts DATETIME(3) NOT NULL COMMENT '时间戳（毫秒精度）',
+  ts DATETIME(3) NOT NULL COMMENT '设备时间戳（毫秒精度）',
+  received_at DATETIME(3) NOT NULL COMMENT '服务端实际接收时间',
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
   INDEX idx_device_metric (device_id, metric),
   INDEX idx_ts (ts),
   INDEX idx_device_ts (device_id, ts),
+  INDEX idx_metric_history (device_id, metric, received_at, id),
   FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='指标数据表（扩展性设计：新指标无需改表）';
 
@@ -44,12 +46,13 @@ CREATE TABLE IF NOT EXISTS commands (
   device_id VARCHAR(64) NOT NULL COMMENT '目标设备ID',
   command VARCHAR(64) NOT NULL COMMENT '命令名称',
   payload JSON DEFAULT NULL COMMENT '命令参数（JSON格式）',
-  status ENUM('pending', 'sent', 'acknowledged', 'failed') DEFAULT 'pending' COMMENT '命令状态',
+  status ENUM('pending', 'sent', 'acknowledged', 'failed', 'superseded', 'timeout') DEFAULT 'pending' COMMENT '命令状态',
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   sent_at DATETIME DEFAULT NULL COMMENT '发送时间',
   acknowledged_at DATETIME DEFAULT NULL COMMENT '确认时间',
   INDEX idx_device_status (device_id, status),
   INDEX idx_created_at (created_at),
+  INDEX idx_command_outbox (device_id, status, sent_at, id),
   FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='设备命令表';
 

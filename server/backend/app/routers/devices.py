@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.session import get_session
 from app.models.database import Device, Metric, Command
 from app.services.mqtt import mqtt_service
+from app.services.capabilities import get_capabilities, get_capabilities_map
 from app.services.command_ack import (
     SWITCH_COMMANDS,
     supersede_open_switch_commands,
@@ -29,7 +30,9 @@ class DeviceResponse(BaseModel):
     status: str
     last_seen: Optional[datetime]
     created_at: datetime
-    
+    # 动态能力，如 {"sensors": ["temperature", ...], "switch": true}
+    capabilities: dict[str, Any] = {"sensors": [], "switch": False}
+
     class Config:
         from_attributes = True
 
@@ -73,7 +76,19 @@ async def get_devices(
     
     query = query.order_by(Device.created_at.desc())
     result = await session.execute(query)
-    return result.scalars().all()
+    devices = result.scalars().all()
+
+    capabilities_map = await get_capabilities_map(
+        session, [device.id for device in devices]
+    )
+    return [
+        DeviceResponse.model_validate(
+            device, from_attributes=True
+        ).model_copy(
+            update={"capabilities": capabilities_map.get(device.id)}
+        )
+        for device in devices
+    ]
 
 
 @router.get("/devices/{device_id}", response_model=DeviceResponse)
@@ -85,7 +100,10 @@ async def get_device(
     device = await session.get(Device, device_id)
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
-    return device
+    capabilities = await get_capabilities(session, device_id)
+    return DeviceResponse.model_validate(
+        device, from_attributes=True
+    ).model_copy(update={"capabilities": capabilities})
 
 
 @router.get("/devices/{device_id}/metrics")

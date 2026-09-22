@@ -1,6 +1,8 @@
 """
 MQTT 客户端服务
-订阅遥测数据和设备状态
+- QoS1 订阅遥测/状态，杜绝网络抖动时静默丢消息；
+- 网络循环只负责快速排空消息，数据库写入由独立 worker 串行完成，
+  保持同一设备的消息顺序，同时避免慢数据库反压到 MQTT 收包循环。
 """
 
 import asyncio
@@ -10,8 +12,10 @@ import math
 import re
 from datetime import datetime
 from typing import Any, Optional
+
 import aiomqtt
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import settings
 from app.services.topics import device_command_topic, split_device_id
 from app.services.command_ack import acknowledge_switch_command
@@ -20,19 +24,40 @@ from app.models.database import Device, Metric
 
 logger = logging.getLogger(__name__)
 
+# 已解码但尚未写入数据库的消息最大积压量。持续增长说明处理速度跟不上
+# （通常是数据库过载），监控应关注对应的积压告警。
+MESSAGE_QUEUE_MAXSIZE = 2000
+
 
 class MQTTService:
     """MQTT 服务类"""
-    
+
     def __init__(self):
         self.client: Optional[aiomqtt.Client] = None
         self._running = False
-    
+        self._message_queue: Optional[asyncio.Queue[aiomqtt.Message]] = None
+        self._worker_task: Optional[asyncio.Task] = None
+
     async def start(self):
         """启动 MQTT 客户端"""
         self._running = True
-        logger.info(f"连接 MQTT: {settings.MQTT_HOST}:{settings.MQTT_PORT}")
-        
+        self._message_queue = asyncio.Queue(maxsize=MESSAGE_QUEUE_MAXSIZE)
+        self._worker_task = asyncio.create_task(self._process_messages())
+        logger.info("连接 MQTT: %s:%s", settings.MQTT_HOST, settings.MQTT_PORT)
+
+        try:
+            await self._run_client()
+        finally:
+            # 客户端循环退出（关停或致命错误）时一并收尾处理任务。
+            if self._worker_task is not None:
+                self._worker_task.cancel()
+                try:
+                    await self._worker_task
+                except asyncio.CancelledError:
+                    pass
+                self._worker_task = None
+
+    async def _run_client(self):
         while self._running:
             try:
                 async with aiomqtt.Client(
@@ -40,31 +65,49 @@ class MQTTService:
                     port=settings.MQTT_PORT,
                     username=settings.MQTT_USER,
                     password=settings.MQTT_PASSWORD,
-                    keepalive=60
+                    keepalive=60,
                 ) as client:
                     self.client = client
                     logger.info("MQTT 连接成功")
-                    
-                    # 订阅主题
-                    await client.subscribe(settings.mqtt_topic_telemetry)
-                    await client.subscribe(settings.mqtt_topic_status)
-                    logger.info(f"已订阅: {settings.mqtt_topic_telemetry}")
-                    logger.info(f"已订阅: {settings.mqtt_topic_status}")
-                    
-                    # 处理消息
+
+                    # QoS1 订阅：broker 必须收到本进程的 PUBACK 才完成投递；
+                    # QoS0 在网络抖动/处理积压时会静默丢消息。
+                    await client.subscribe(settings.mqtt_topic_telemetry, qos=1)
+                    await client.subscribe(settings.mqtt_topic_status, qos=1)
+                    logger.info("已订阅(QoS1): %s", settings.mqtt_topic_telemetry)
+                    logger.info("已订阅(QoS1): %s", settings.mqtt_topic_status)
+
+                    # 网络循环只负责快速排空；数据库写入由独立 worker
+                    # 串行完成，保持同一设备的消息顺序。
                     async for message in client.messages:
-                        await self._handle_message(message)
-                        
+                        assert self._message_queue is not None
+                        await self._message_queue.put(message)
+
             except aiomqtt.MqttError as e:
                 if not self._running:
                     logger.info("MQTT disconnected during shutdown")
                     break
-                logger.warning(f"MQTT 连接断开: {e}，5秒后重连...")
+                logger.warning("MQTT 连接断开: %s，5秒后重连...", e)
                 await asyncio.sleep(5)
             except Exception as e:
-                logger.error(f"MQTT 错误: {e}，5秒后重连...")
+                logger.error("MQTT 错误: %s，5秒后重连...", e)
                 await asyncio.sleep(5)
-    
+
+    async def _process_messages(self):
+        """单 worker 串行处理消息，保证同一设备的命令/状态顺序。"""
+        assert self._message_queue is not None
+        while True:
+            message = await self._message_queue.get()
+            backlog = self._message_queue.qsize()
+            if backlog >= 50:
+                logger.warning(
+                    "MQTT 待处理消息积压: %d 条（数据库可能过载）", backlog
+                )
+            try:
+                await self._handle_message(message)
+            finally:
+                self._message_queue.task_done()
+
     async def stop(self):
         """停止 MQTT 客户端"""
         self._running = False
@@ -82,7 +125,7 @@ class MQTTService:
                 if underlying is not None:
                     underlying.disconnect()
         logger.info("MQTT 客户端已停止")
-    
+
     async def _handle_message(self, message: aiomqtt.Message):
         """处理 MQTT 消息"""
         try:
@@ -92,7 +135,7 @@ class MQTTService:
                 logger.warning("忽略非对象 MQTT 消息: %s", topic)
                 return
 
-            logger.debug(f"收到消息: {topic} -> {payload}")
+            logger.debug("收到消息: %s -> %s", topic, payload)
 
             # 解析主题：iot-home/{gateway_id}/nodes/{node_id}/telemetry
             parts = topic.split("/")
@@ -111,30 +154,28 @@ class MQTTService:
                     await self._handle_telemetry(gateway_id, node_id, payload)
                 elif msg_type == "status":
                     await self._handle_status(gateway_id, node_id, payload)
-                    
-        except json.JSONDecodeError:
-            logger.warning(f"无效的 JSON: {message.payload}")
         except Exception as e:
-            logger.error(f"处理消息失败: {e}")
-    
+            logger.error("处理消息失败: %s", e)
+
     async def _handle_telemetry(
         self,
         gateway_id: str,
         node_id: str,
         payload: dict[str, Any],
     ) -> None:
-        """处理遥测数据"""
+        """处理遥测数据：一个事务批量写入本帧全部指标。"""
         device_id = f"{gateway_id}-{node_id}"
-        
+
         async with async_session_factory() as session:
             try:
-                # 确保设备存在；遥测本身也证明设备当前在线
-                device = await self._ensure_device(
+                await self._ensure_device(
                     session, device_id, node_id, "sensor", gateway_id
                 )
+
+                device = await session.get(Device, device_id)
                 device.status = "online"
                 device.last_seen = datetime.now()
-                
+
                 # 指标可保留设备时间；命令确认以服务端实际接收时间为准。
                 try:
                     metric_ts = datetime.fromisoformat(
@@ -143,15 +184,20 @@ class MQTTService:
                     if metric_ts.tzinfo is not None:
                         metric_ts = metric_ts.astimezone().replace(tzinfo=None)
                 except (TypeError, ValueError):
-                    logger.warning("设备上报了无效时间戳，改用服务端时间: %s", device_id)
+                    logger.warning(
+                        "设备上报了无效时间戳，改用服务端时间: %s", device_id
+                    )
                     metric_ts = datetime.now()
                 received_at = datetime.now()
 
                 data = payload.get("data", {})
                 if not isinstance(data, dict):
-                    logger.warning("设备上报 data 不是对象，忽略指标: %s", device_id)
+                    logger.warning(
+                        "设备上报 data 不是对象，忽略指标: %s", device_id
+                    )
                     data = {}
 
+                metric_records: list[Metric] = []
                 saved_metrics: list[str] = []
                 for metric, value in data.items():
                     if (
@@ -161,41 +207,49 @@ class MQTTService:
                         logger.warning("忽略非法指标名: %s", metric)
                         continue
                     if not (
-                        isinstance(value, (int, float)) and math.isfinite(value)
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(value)
                     ):
-                        logger.warning("忽略非数值指标 %s: %s", metric, device_id)
+                        logger.warning(
+                            "忽略非数值指标 %s: %s", metric, device_id
+                        )
                         continue
 
-                    metric_record = Metric(
-                        device_id=device_id,
-                        metric=metric,
-                        value=float(value),
-                        ts=metric_ts,
-                        received_at=received_at,
+                    metric_records.append(
+                        Metric(
+                            device_id=device_id,
+                            metric=metric,
+                            value=float(value),
+                            ts=metric_ts,
+                            received_at=received_at,
+                        )
                     )
-                    session.add(metric_record)
                     saved_metrics.append(metric)
 
+                if metric_records:
+                    # 一次批量 INSERT，避免每条指标一次往返。
+                    session.add_all(metric_records)
+                    await session.flush()
+
+                # on_off 单独确认在途开关命令；状态归属按 received_at 判断。
                 on_off = data.get("on_off")
                 if (
-                    isinstance(on_off, (int, float))
+                    isinstance(on_off, int)
                     and not isinstance(on_off, bool)
-                    and math.isfinite(on_off)
-                    and float(on_off) in (0.0, 1.0)
+                    and on_off in (0, 1)
                 ):
-                    # flush 当前指标；状态归属只查询服务端接收时间早于命令的记录。
-                    await session.flush()
                     await acknowledge_switch_command(
-                        session, device_id, int(on_off), received_at
+                        session, device_id, on_off, received_at
                     )
 
                 await session.commit()
-                logger.info(f"遥测数据已保存: {device_id} - {saved_metrics}")
-                
+                logger.info("遥测数据已保存: %s - %s", device_id, saved_metrics)
+
             except Exception as e:
                 await session.rollback()
-                logger.error(f"保存遥测数据失败: {e}")
-    
+                logger.error("保存遥测数据失败: %s", e)
+
     async def _handle_status(
         self,
         gateway_id: str,
@@ -205,25 +259,22 @@ class MQTTService:
         """处理设备状态"""
         device_id = f"{gateway_id}-{node_id}"
         status = payload.get("status", "unknown")
-        if status not in {"online", "offline", "unknown"}:
-            status = "unknown"
-        
+
         async with async_session_factory() as session:
             try:
-                # 更新设备状态
-                device = await session.get(Device, device_id)
-                if device:
+                await self._ensure_device(
+                    session, device_id, node_id, "sensor", gateway_id
+                )
+                if status in ("online", "offline"):
+                    device = await session.get(Device, device_id)
                     device.status = status
                     device.last_seen = datetime.now()
                     await session.commit()
-                    logger.info(f"设备状态已更新: {device_id} -> {status}")
-                else:
-                    logger.warning(f"设备不存在: {device_id}")
-                    
+                    logger.info("设备状态更新: %s -> %s", device_id, status)
             except Exception as e:
                 await session.rollback()
-                logger.error(f"更新设备状态失败: {e}")
-    
+                logger.error("更新设备状态失败: %s", e)
+
     async def _ensure_device(
         self,
         session: AsyncSession,
@@ -239,15 +290,14 @@ class MQTTService:
                 id=device_id,
                 name=name,
                 type=device_type,
-                parent_id=parent_id,
                 status="online",
-                last_seen=datetime.now()
+                parent_id=parent_id,
             )
             session.add(device)
             await session.flush()
-            logger.info(f"新设备已注册: {device_id}")
+            logger.info("新设备已注册: %s", device_id)
         return device
-    
+
     async def publish_command(
         self,
         device_id: str,
@@ -258,25 +308,26 @@ class MQTTService:
         if not self.client:
             logger.error("MQTT 客户端未连接")
             return False
-        
+
         try:
             topic = device_command_topic(settings.MQTT_TOPIC_PREFIX, device_id)
             if topic is None:
-                logger.error(f"无效的设备ID: {device_id}")
+                logger.error("无效的设备ID: %s", device_id)
                 return False
-            
+
             message = {
                 "command": command,
                 "payload": payload or {},
-                "ts": datetime.now().isoformat()
+                "ts": datetime.now().isoformat(),
             }
-            
-            await self.client.publish(topic, json.dumps(message).encode())
-            logger.info(f"命令已发送: {device_id} -> {command}")
+
+            # QoS1：命令至少送达 broker 一次，失败由上层记录为 failed。
+            await self.client.publish(topic, json.dumps(message).encode(), qos=1)
+            logger.info("命令已发送: %s -> %s", device_id, command)
             return True
-            
+
         except Exception as e:
-            logger.error(f"发送命令失败: {e}")
+            logger.error("发送命令失败: %s", e)
             return False
 
 

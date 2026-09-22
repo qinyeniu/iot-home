@@ -119,6 +119,8 @@ MQTT_EVENT_DATA 中，当 topic 匹配 `.../nodes/{node}/cmd`：
 
 最终正式应用固件已备份到：`backups/firmware/2026-09-22-low-tx-power/`。
 
+1 小时观察点（60.1 分钟）短地址仍为 `0x82cb`，未重复 rejoin；节点统计 `attempts=1020 / aps_ok=1007 / aps_fail=3 / unavail=3 / recovered=3`，I2C 故障为 0。3 次父链路短暂提示均在约 10–20 ms 内自动恢复，结论为 1 小时链路观察通过，但仍需 2–4 小时长观察确认抖动频率。
+
 命令状态闭环代码已完成，20 项后端测试通过；因本次未部署/重启远端后端，也未执行现有数据库迁移，尚未在云服务器上实测 commands 状态从 `sent` 自动变为 `acknowledged/timeout/superseded`。
 
 待用户最终确认物理现象：继电器 IN/VCC/GND 是否已接好，是否听到“咔哒”声，或用万用表/小灯泡验证输出端通断。

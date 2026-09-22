@@ -2,8 +2,7 @@
 -- 新增：superseded（被更新命令取代）、timeout（等待节点回报超时）。
 -- 本脚本可重复执行：列和索引存在时会跳过。
 
-USE iot_home;
-
+-- 数据库名由 mysql 命令行（MYSQL_DATABASE）指定，不在脚本内写死。
 SET @db_name := DATABASE();
 
 -- 1) metrics.received_at：命令因果判断使用服务端接收时间，而不是设备时钟。

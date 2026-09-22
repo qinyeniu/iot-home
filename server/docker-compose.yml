@@ -56,6 +56,7 @@ services:
       dockerfile: Dockerfile
     container_name: iot-backend
     restart: unless-stopped
+    stop_grace_period: 25s
     ports:
       - "8000:8000"
     environment:

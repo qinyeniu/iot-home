@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS commands (
   FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='设备命令表';
 
+
+-- Processed messages: idempotency for redelivered QoS1 messages.
+CREATE TABLE IF NOT EXISTS processed_messages (
+  message_id VARCHAR(80) NOT NULL PRIMARY KEY COMMENT 'unique message id',
+  device_id VARCHAR(64) NOT NULL COMMENT 'source device id',
+  processed_at DATETIME(3) NOT NULL COMMENT 'first processed time',
+  INDEX idx_pm_device_time (device_id, processed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='message idempotency table';
+
 -- 插入示例网关设备
 INSERT INTO devices (id, name, type, status) VALUES
   ('gw-001', '客厅网关', 'gateway', 'offline')

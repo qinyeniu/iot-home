@@ -16,12 +16,15 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <stddef.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "esp_system.h"
+#include "esp_mac.h"
+#include "esp_random.h"
 #include "esp_attr.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -1355,6 +1358,105 @@ static void mqtt_start(void)
 // status_resync is published automatically after every reconnect.
 
 
+#define MQTT_MESSAGE_ID_MAX              48
+#define MQTT_ENRICHED_PAYLOAD_MAX       192
+
+static uint32_t s_mqtt_boot_epoch;
+static uint32_t s_mqtt_message_seq;
+static bool s_mqtt_message_context_ready;
+
+static esp_err_t mqtt_message_context_init(void)
+{
+    if (s_mqtt_message_context_ready) {
+        return ESP_OK;
+    }
+
+    nvs_handle_t nvh;
+    esp_err_t err = nvs_open("gwmqtt", NVS_READWRITE, &nvh);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint32_t boot_epoch = 0;
+    // NVS 首次没有该键时使用默认值 0；随后递增，保证重启后编号不重复。
+    (void)nvs_get_u32(nvh, "boot_epoch", &boot_epoch);
+    s_mqtt_boot_epoch = boot_epoch + 1U;
+
+    err = nvs_set_u32(nvh, "boot_epoch", s_mqtt_boot_epoch);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvh);
+    }
+    nvs_close(nvh);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    s_mqtt_message_seq = 0;
+    s_mqtt_message_context_ready = true;
+    return ESP_OK;
+}
+
+static void mqtt_make_message_id(char *out, size_t size)
+{
+    uint8_t mac[6] = {0};
+    (void)esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+
+    if (mqtt_message_context_init() == ESP_OK) {
+        uint32_t seq = ++s_mqtt_message_seq;
+        snprintf(out, size,
+                 "%02x%02x%02x%02x%02x%02x-b%08lu-t%08lu-s%05lu",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                 (unsigned long)s_mqtt_boot_epoch,
+                 (unsigned long)now_ms,
+                 (unsigned long)seq);
+    } else {
+        // NVS 不可用时仍用硬件随机数给出近似全局唯一编号，避免阻断遥测；
+        // 启动后 NVS 恢复时，下一帧会重新走持久 boot epoch。
+        snprintf(out, size,
+                 "%02x%02x%02x%02x%02x%02x-r%08lx-t%08lu",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                 (unsigned long)esp_random(),
+                 (unsigned long)now_ms);
+    }
+}
+
+static void mqtt_payload_with_message_id(
+    const char *data, char *out, size_t out_size)
+{
+    const char *p = data;
+    while (isspace((unsigned char)*p)) {
+        p++;
+    }
+
+    if (*p != '{') {
+        strlcpy(out, data, out_size);
+        return;
+    }
+
+    char message_id[MQTT_MESSAGE_ID_MAX];
+    mqtt_make_message_id(message_id, sizeof(message_id));
+
+    char prefix[80];
+    int prefix_len = snprintf(
+        prefix, sizeof(prefix),
+        "{\"message_id\":\"%s\",", message_id
+    );
+    const char *rest = p + 1;
+    size_t rest_len = strlen(rest);
+
+    if (prefix_len <= 0 ||
+        (size_t)prefix_len + rest_len + 1U > out_size) {
+        strlcpy(out, data, out_size);
+        return;
+    }
+
+    memcpy(out, prefix, (size_t)prefix_len);
+    memcpy(out + prefix_len, rest, rest_len);
+    out[prefix_len + rest_len] = '\0';
+}
+
 static bool mqtt_try_publish(const char *topic_suffix, const char *data,
                              bool retain)
 {
@@ -1406,7 +1508,9 @@ void mqtt_pub_retained(const char *topic_suffix, const char *data, bool retain)
 
 void mqtt_pub(const char *topic_suffix, const char *data)
 {
-    mqtt_pub_retained(topic_suffix, data, false);
+    char enriched[MQTT_ENRICHED_PAYLOAD_MAX];
+    mqtt_payload_with_message_id(data, enriched, sizeof(enriched));
+    mqtt_pub_retained(topic_suffix, enriched, false);
 }
 
 // Drain buffered telemetry oldest-first after reconnect. Called from the

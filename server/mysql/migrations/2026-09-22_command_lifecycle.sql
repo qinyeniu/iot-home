@@ -66,3 +66,12 @@ SET @sql := (
 PREPARE stmt FROM @sql;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
+
+-- 5) processed_messages: idempotency for redelivered QoS1 messages.
+CREATE TABLE IF NOT EXISTS processed_messages (
+  message_id VARCHAR(80) NOT NULL PRIMARY KEY,
+  device_id VARCHAR(64) NOT NULL,
+  processed_at DATETIME(3) NOT NULL,
+  INDEX idx_pm_device_time (device_id, processed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+

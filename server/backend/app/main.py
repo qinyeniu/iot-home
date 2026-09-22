@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.models.session import init_db, close_db
-from app.services.mqtt import mqtt_service
+from app.services.mqtt import SHUTDOWN_DRAIN_TIMEOUT, mqtt_service
 from app.services.device_status import device_status_monitor
 from app.services.command_timeout import command_timeout_monitor
 from app.routers.devices import router as devices_router
@@ -55,7 +55,10 @@ async def lifespan(app: FastAPI):
     # 关闭 MQTT 客户端
     await mqtt_service.stop()
     try:
-        await asyncio.wait_for(mqtt_task, timeout=5)
+        await asyncio.wait_for(
+            mqtt_task,
+            timeout=SHUTDOWN_DRAIN_TIMEOUT + 5,
+        )
     except asyncio.TimeoutError:
         mqtt_task.cancel()
         try:

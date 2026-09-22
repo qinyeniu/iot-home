@@ -74,3 +74,17 @@ class Command(Base):
         Index("idx_command_outbox", "device_id", "status", "sent_at", "id"),
         {"comment": "设备命令表"}
     )
+
+
+class ProcessedMessage(Base):
+    '''Idempotency: a redelivered QoS1 message_id is processed only once.'''
+    __tablename__ = "processed_messages"
+
+    message_id = Column(String(80), primary_key=True, comment="unique message id")
+    device_id = Column(String(64), nullable=False, comment="source device id")
+    processed_at = Column(DateTime(3), nullable=False, comment="first processed time")
+
+    __table_args__ = (
+        Index("idx_pm_device_time", "device_id", "processed_at"),
+        {"comment": "message idempotency table"},
+    )

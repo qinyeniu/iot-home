@@ -13,18 +13,19 @@ import logging
 import math
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import aiomqtt
-from sqlalchemy.exc import SQLAlchemyError
+import paho.mqtt.client as paho_mqtt
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.services.topics import device_command_topic, split_device_id
 from app.services.command_ack import acknowledge_switch_command
 from app.models.session import async_session_factory
-from app.models.database import Device, Metric
+from app.models.database import Device, Metric, ProcessedMessage
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,12 @@ SHUTDOWN_DRAIN_TIMEOUT = 20
 # 重试用尽的消息落盘位置（容器内默认 /app/dead_letter.jsonl）。
 DEAD_LETTER_PATH = os.getenv("IOT_DEAD_LETTER_PATH", "dead_letter.jsonl")
 
+# message_id 只在最近保留期内需要用于 broker/网关重投去重；
+# 到期后由后台任务清理，避免幂等表无限增长。
+PROCESSED_MESSAGE_RETENTION_DAYS = 30
+PROCESSED_MESSAGE_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+
 
 class BadMessageError(ValueError):
     """永久无法处理的消息（格式/主题/data 非法），不重试。"""
@@ -55,23 +62,26 @@ class MQTTService:
         self._running = False
         self._message_queue: Optional[asyncio.Queue[aiomqtt.Message]] = None
         self._worker_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     async def start(self):
         """启动 MQTT 客户端"""
         self._running = True
         self._message_queue = asyncio.Queue(maxsize=MESSAGE_QUEUE_MAXSIZE)
         self._worker_task = asyncio.create_task(self._process_messages())
+        self._cleanup_task = asyncio.create_task(self._cleanup_processed_messages())
         logger.info("连接 MQTT: %s:%s", settings.MQTT_HOST, settings.MQTT_PORT)
 
         try:
             await self._run_client()
         finally:
             await self._shutdown_worker()
+            await self._shutdown_cleanup()
 
     async def _run_client(self):
         while self._running:
             try:
-                async with aiomqtt.Client(
+                mqtt_client = aiomqtt.Client(
                     hostname=settings.MQTT_HOST,
                     port=settings.MQTT_PORT,
                     # 固定 ID + 持久会话：后端短暂重启期间，broker 会替本
@@ -82,7 +92,10 @@ class MQTTService:
                     username=settings.MQTT_USER,
                     password=settings.MQTT_PASSWORD,
                     keepalive=60,
-                ) as client:
+                )
+                # 手动确认：只有数据库事务提交后才 PUBACK，避免“已确认但未落库”。
+                mqtt_client._client.manual_ack_set(True)
+                async with mqtt_client as client:
                     self.client = client
                     logger.info("MQTT 连接成功")
 
@@ -97,6 +110,12 @@ class MQTTService:
                     # 串行完成，保持同一设备的消息顺序。
                     async for message in client.messages:
                         assert self._message_queue is not None
+                        # 记录该帧归属的底层连接，禁止拿新连接确认旧帧。
+                        setattr(
+                            message,
+                            "_mqtt_underlying",
+                            mqtt_client._client,
+                        )
                         await self._message_queue.put(message)
 
             except aiomqtt.MqttError as e:
@@ -129,14 +148,18 @@ class MQTTService:
         for attempt in range(1, MAX_PROCESS_ATTEMPTS + 1):
             try:
                 await self._handle_message(message)
+                await self._ack_message(message)
                 return
             except BadMessageError:
-                # 永久坏消息：已在处理处记录，直接丢弃，不重试/不入死信。
+                # 永久坏消息：已在处理处记录，确认后丢弃，不重试/不入死信。
+                await self._ack_message(message)
                 return
             except SQLAlchemyError as exc:
                 if attempt >= MAX_PROCESS_ATTEMPTS:
                     logger.error("数据库错误重试 %d 次仍失败", attempt)
-                    self._write_dead_letter(message, exc)
+                    saved = self._write_dead_letter(message, exc)
+                    if saved:
+                        await self._ack_message(message)
                     return
                 logger.warning(
                     "数据库瞬时错误(第%d/%d次)，%.1fs 后重试: %s",
@@ -147,7 +170,9 @@ class MQTTService:
             except Exception as exc:
                 # 未预期错误：保留堆栈并落死信，避免毒消息永久阻塞队列。
                 logger.exception("处理消息出现未预期错误")
-                self._write_dead_letter(message, exc)
+                saved = self._write_dead_letter(message, exc)
+                if saved:
+                    await self._ack_message(message)
                 return
 
     async def _shutdown_worker(self):
@@ -169,7 +194,61 @@ class MQTTService:
             pass
         self._worker_task = None
 
-    def _write_dead_letter(self, message: aiomqtt.Message, exc: Exception):
+    async def _cleanup_old_processed_messages_once(self) -> int:
+        """清理一次超过保留期的 message_id，并返回删除行数。"""
+        cutoff = datetime.now() - timedelta(
+            days=PROCESSED_MESSAGE_RETENTION_DAYS
+        )
+        async with async_session_factory() as session:
+            result = await session.execute(
+                ProcessedMessage.__table__.delete().where(
+                    ProcessedMessage.processed_at < cutoff
+                )
+            )
+            await session.commit()
+            return result.rowcount
+
+    async def _cleanup_processed_messages(self):
+        """定期清理超过保留期的 message_id，控制幂等表大小。"""
+        while True:
+            try:
+                deleted = await self._cleanup_old_processed_messages_once()
+                logger.info("已清理 %d 条过期幂等消息", deleted)
+            except Exception:
+                logger.exception("清理幂等消息失败，将在下次周期重试")
+            await asyncio.sleep(PROCESSED_MESSAGE_CLEANUP_INTERVAL_SECONDS)
+
+    async def _shutdown_cleanup(self):
+        """取消幂等消息清理任务。"""
+        if self._cleanup_task is None:
+            return
+        self._cleanup_task.cancel()
+        try:
+            await self._cleanup_task
+        except asyncio.CancelledError:
+            pass
+        self._cleanup_task = None
+
+    async def _ack_message(self, message: aiomqtt.Message) -> bool:
+        """数据库处理成功后，手动确认 QoS1/QoS2 消息。"""
+        underlying = getattr(message, "_mqtt_underlying", None)
+        if underlying is None:
+            logger.warning("无法确认消息：缺少底层 MQTT 连接标记")
+            return False
+
+        try:
+            rc = underlying.ack(message.mid, message.qos)
+            if rc == paho_mqtt.MQTT_ERR_SUCCESS:
+                logger.debug("MQTT 消息已确认: mid=%s qos=%s",
+                             message.mid, message.qos)
+                return True
+            logger.warning("MQTT 消息确认失败: mid=%s rc=%s",
+                           message.mid, rc)
+        except Exception:
+            logger.exception("MQTT 消息确认异常: mid=%s", message.mid)
+        return False
+
+    def _write_dead_letter(self, message: aiomqtt.Message, exc: Exception) -> bool:
         entry = {
             "topic": str(message.topic),
             "payload": message.payload.decode(errors="replace"),
@@ -182,8 +261,10 @@ class MQTTService:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             logger.error("消息已写入 dead letter：%s（topic=%s）",
                          DEAD_LETTER_PATH, message.topic)
+            return True
         except OSError:
             logger.exception("无法写入 dead letter 文件：%s", DEAD_LETTER_PATH)
+            return False
 
     async def stop(self):
         """停止 MQTT 客户端（FastAPI lifespan 关停时调用）"""
@@ -251,7 +332,38 @@ class MQTTService:
         """处理遥测数据：一个事务批量写入本帧全部指标。"""
         device_id = f"{gateway_id}-{node_id}"
 
+        message_id = self._validate_message_id(payload)
+
+        try:
+            metric_ts = datetime.fromisoformat(
+                payload.get("ts", datetime.now().isoformat())
+            )
+            if metric_ts.tzinfo is not None:
+                metric_ts = metric_ts.astimezone().replace(tzinfo=None)
+        except (TypeError, ValueError):
+            logger.warning("设备上报了无效时间戳，改用服务端时间: %s",
+                           device_id)
+            metric_ts = datetime.now()
+        received_at = datetime.now()
+
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            logger.warning("设备上报 data 不是对象: %s", device_id)
+            raise BadMessageError("data not an object")
+
         async with async_session_factory() as session:
+            if message_id is not None:
+                processed = await session.get(ProcessedMessage, message_id)
+                if processed is not None:
+                    if processed.device_id != device_id:
+                        logger.warning(
+                            "message_id 已被其他设备使用: %s -> %s/%s",
+                            message_id, processed.device_id, device_id,
+                        )
+                        raise BadMessageError("message_id ownership conflict")
+                    logger.info("忽略 QoS1 重投的重复消息: %s", message_id)
+                    return
+
             await self._ensure_device(
                 session, device_id, node_id, "sensor", gateway_id
             )
@@ -260,24 +372,6 @@ class MQTTService:
             # retained 是 broker 的旧帧，不代表设备此刻在线，不刷新心跳。
             if not retained:
                 device.last_seen = datetime.now()
-
-            try:
-                metric_ts = datetime.fromisoformat(
-                    payload.get("ts", datetime.now().isoformat())
-                )
-                if metric_ts.tzinfo is not None:
-                    metric_ts = metric_ts.astimezone().replace(tzinfo=None)
-            except (TypeError, ValueError):
-                logger.warning("设备上报了无效时间戳，改用服务端时间: %s",
-                               device_id)
-                metric_ts = datetime.now()
-            received_at = datetime.now()
-
-            data = payload.get("data", {})
-            if not isinstance(data, dict):
-                logger.warning("设备上报 data 不是对象: %s", device_id)
-                await session.commit()
-                raise BadMessageError("data not an object")
 
             metric_records: list[Metric] = []
             saved_metrics: list[str] = []
@@ -327,8 +421,43 @@ class MQTTService:
                     session, device_id, on_off, received_at
                 )
 
-            await session.commit()
+            if message_id is not None:
+                session.add(ProcessedMessage(
+                    message_id=message_id,
+                    device_id=device_id,
+                    processed_at=received_at,
+                ))
+
+            try:
+                await session.commit()
+            except IntegrityError:
+                # 并发消费者可能已提交同一 message_id（单 worker 下主要是
+                # 旧进程/多副本竞争）；回滚后确认归属，确认是重复则视为成功。
+                await session.rollback()
+                if message_id is not None:
+                    processed = await session.get(ProcessedMessage, message_id)
+                    if (
+                        processed is not None
+                        and processed.device_id == device_id
+                    ):
+                        logger.info("忽略并发提交的重复消息: %s", message_id)
+                        return
+                raise
             logger.info("遥测数据已保存: %s - %s", device_id, saved_metrics)
+
+    @staticmethod
+    def _validate_message_id(payload: dict[str, Any]) -> Optional[str]:
+        """校验 message_id；字段缺省允许兼容旧固件，字段非法则永久拒绝。"""
+        message_id = payload.get("message_id")
+        if message_id is None:
+            return None
+        if (
+            not isinstance(message_id, str)
+            or MESSAGE_ID_PATTERN.fullmatch(message_id) is None
+        ):
+            logger.warning("忽略非法 message_id: %r", message_id)
+            raise BadMessageError("invalid message_id")
+        return message_id
 
     async def _handle_status(
         self,

@@ -227,7 +227,17 @@ class Deployer:
         if "received_at" not in out:
             raise DeployError("验收失败：metrics.received_at 列不存在")
         print("[OK] metrics.received_at 已存在")
-        self.run("docker logs --tail 15 iot-backend 2>&1", check=False)
+
+        out, _, _ = self.run(
+            f"cd {REMOTE_DIR}/server && docker compose -f {COMPOSE_FILE} "
+            "exec -T mysql sh -c 'exec mysql -u$MYSQL_USER "
+            "-p$MYSQL_PASSWORD $MYSQL_DATABASE'",
+            stdin_data=b"SHOW TABLES LIKE 'processed_messages';\n",
+        )
+        if "processed_messages" not in out:
+            raise DeployError("验收失败：processed_messages 表不存在")
+        print("[OK] processed_messages 已存在")
+        self.run("docker logs --tail 25 iot-backend 2>&1", check=False)
         print(
             "\n[提示] 节点接回后运行 tools/analyze_integrity.py 复测，"
             "预期送达率接近 100%。"

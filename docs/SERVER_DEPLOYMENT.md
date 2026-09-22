@@ -25,10 +25,11 @@ ssh root@8.163.110.27
 - 配置文件：/root/iot-home/server/docker-compose-minimal.yml
 
 ### 端口分配
-- Mosquitto: 1883
+- Mosquitto: 1883（MQTT TCP）、9001（WebSocket；明文端口不应直接暴露公网）
 - MySQL: 3307
 - FastAPI: 8000
 - Grafana: 3000
+- 公网生产前需增加 TLS/WSS、VPN 或云防火墙白名单
 
 ### 登录信息
 
@@ -47,13 +48,17 @@ docker compose -f docker-compose-minimal.yml up -d
 
 ## MQTT 认证迁移
 
-新版本会在 Mosquitto 容器启动时从 `.env` 生成密码和 ACL。为避免旧网关被立即锁定：
+新版本会在 Mosquitto 容器启动时从 `.env` 生成密码和 ACL。迁移过程中**不需要打开匿名访问**，避免公网设备被未授权连接。
 
-1. 在服务器 `.env` 中临时设置 `MQTT_ALLOW_ANONYMOUS=true`，更新 Compose 和 `mosquitto/config` 后重建 Mosquitto；
-2. 确认 FastAPI 使用账号密码连接正常；
-3. 烧录包含 `mqtt_secrets.h` 的新网关固件，确认 MQTT OK 且遥测继续入库；
-4. 将服务器 `.env` 改为 `MQTT_ALLOW_ANONYMOUS=false`，再次重建 Mosquitto；
-5. 验证匿名连接被拒绝、认证连接、API、Grafana 和网关遥测均正常。
+1. 在服务器 `.env` 中配置后端/网关分离账号，并临时设置 `MQTT_ENABLE_LEGACY_ACCOUNT=true`；
+2. 重建 Mosquitto，使新账号和旧 `MQTT_USER` 账号可以共存；
+3. 确认 FastAPI 使用后端独立账号连接、订阅和发布命令正常；
+4. 烧录包含网关独立账号的新固件，确认 MQTT、遥测和下行命令正常；
+5. 将 `MQTT_ENABLE_LEGACY_ACCOUNT=false` 并再次重建 Mosquitto，移除旧账号；
+6. 全程保持 `MQTT_ALLOW_ANONYMOUS=false`；
+7. 验证匿名连接被拒绝、跨网关访问被拒绝，API、Grafana 和网关遥测均正常。
+
+完整说明见 `docs/MQTT_SECURITY_HARDENING.md`。
 
 ## 停止服务
 

@@ -90,8 +90,8 @@ class MQTTService:
                     identifier=settings.MQTT_CLIENT_ID,
                     protocol=aiomqtt.ProtocolVersion.V311,
                     clean_session=False,
-                    username=settings.MQTT_USER,
-                    password=settings.MQTT_PASSWORD,
+                    username=settings.mqtt_username,
+                    password=settings.mqtt_password,
                     keepalive=60,
                 )
                 # 手动确认：只有数据库事务提交后才 PUBACK，避免“已确认但未落库”。

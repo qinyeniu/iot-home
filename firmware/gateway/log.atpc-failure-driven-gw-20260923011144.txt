@@ -1,0 +1,198 @@
+I (271) esp_image: segment 3: paddr=0014db5c vaddr=40807188 sizeI (15067) iot-gw: Starting Zigbee coordinator...
+I (15067) phy: libbtbb version: c493933, Nov 14 2025, 16:34:25
+I (15087) iot-gw: Zigbee stack started with ZCL reporting
+I (15087) iot-gw: Zigbee signal: 23
+I (15087) iot-gw: Zigbee: Initialize stack
+I (15087) iot-gw: Zigbee: Device started
+I (15087) iot-gw: Zigbee: Rebooted, open network
+I (15087) iot-gw: Zigbee: PANID=0xd989 channel=26
+I (15097) iot-gw: Zigbee: permit joining closed; secure rejoin may still use existing credentials
+I (15697) iot-gw: Zigbee: permit joining open for 180 seconds
+I (42977) iot-gw: Zigbee signal: 48
+I (42987) iot-gw: Zigbee: Device joined! addr=0x82cb
+I (42987) iot-gw: MQTT: nodes/zb-82cb/status status retained: device_joined
+I (47937) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-97
+I (47947) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=1
+I (48137) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-96
+I (48147) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7186 total=2
+I (48347) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-94
+I (48347) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=3
+I (48347) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (58597) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-98
+I (58607) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3105 total=4
+I (58797) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-98
+I (58807) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7188 total=5
+I (58997) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-97
+I (59007) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=6
+I (59007) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (61007) iot-gw: RF power -> node=0x82cb cmd=1 power=0 seq=1: ESP_OK
+I (61087) iot-gw: RF sample cluster=0xfc10 lqi=30 recent_rssi=-101
+I (61087) iot-gw: RF power: report accepted from unknown to -10 dBm seq=1
+I (69267) iot-gw: RF sample cluster=0x0402 lqi=20 recent_rssi=-98
+I (69267) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3102 total=7
+W (69367) iot-gw: Zigbee: NLME status indication nwk_status=0x09 network_addr=0x82cb unknown_cmd=0 signal_status=ESP_OK
+I (69457) iot-gw: RF sample cluster=0x0405 lqi=30 recent_rssi=-97
+I (69467) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7186 total=8
+I (69657) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-97
+I (69667) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=9
+I (69667) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (76917) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-101
+I (76917) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3103 total=10
+I (77127) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-96
+I (77127) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7189 total=11
+I (77327) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-93
+I (77327) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=12
+I (77327) iot-gw: MQTT duplicate suppressed (nodes/zb-82cb/telemetry, age=7660 ms): {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (87577) iot-gw: RF sample cluster=0x0402 lqi=30 recent_rssi=-98
+I (87577) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3106 total=13
+I (87777) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-94
+I (87777) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7182 total=14
+I (87977) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-98
+I (87987) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=15
+I (87987) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.1,"humidity":71.8,"lux":0.0}}
+W (95187) wifi:<ba-add>idx:0, ifx:0, tid:4, TAHI:0x1003475, TALO:0xec1a3dc6, (ssn:15, win:64, cur_ssn:15), CONF:0xc0004005
+I (98237) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-97
+I (98237) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3105 total=16
+I (98437) iot-gw: RF sample cluster=0x0405 lqi=30 recent_rssi=-97
+I (98437) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7180 total=17
+I (98637) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-96
+I (98637) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=18
+I (98637) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.8,"lux":0.0}}
+I (108897) iot-gw: RF sample cluster=0x0402 lqi=30 recent_rssi=-97
+I (108897) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=19
+I (109097) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-97
+I (109097) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7186 total=20
+I (109297) iot-gw: RF sample cluster=0x0400 lqi=20 recent_rssi=-96
+I (109297) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=21
+I (109297) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (119567) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-90
+I (119567) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3103 total=22
+I (119757) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-92
+I (119757) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7187 total=23
+I (119957) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-98
+I (119957) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=24
+I (119957) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (121957) iot-gw: RF power: keep -10 dBm lqi_ema=23 low_windows=0 high_windows=0
+I (130217) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-96
+I (130217) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=25
+I (130417) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-100
+I (130427) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7188 total=26
+I (130627) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-96
+I (130627) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=27
+I (130627) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (143887) iot-gw: RF sample cluster=0x0402 lqi=20 recent_rssi=-101
+I (143897) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3105 total=28
+I (144097) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-95
+I (144097) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7188 total=29
+I (144297) iot-gw: RF sample cluster=0x0400 lqi=30 recent_rssi=-96
+I (144297) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=30
+I (144297) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (151537) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-98
+I (151537) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=31
+I (151737) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-93
+I (151737) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7187 total=32
+I (151937) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-97
+I (151937) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=33
+I (151937) iot-gw: MQTT duplicate suppressed (nodes/zb-82cb/telemetry, age=7640 ms): {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (165207) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-96
+I (165207) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3105 total=34
+I (165407) iot-gw: RF sample cluster=0x0405 lqi=20 recent_rssi=-75
+I (165407) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7191 total=35
+I (165607) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-96
+I (165607) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=36
+I (165607) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (172857) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-96
+I (172857) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=37
+I (173057) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-97
+I (173057) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7188 total=38
+I (173257) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-97
+I (173257) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=39
+I (173267) iot-gw: MQTT duplicate suppressed (nodes/zb-82cb/telemetry, age=7650 ms): {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (183267) iot-gw: RF power: keep -10 dBm lqi_ema=23 low_windows=0 high_windows=0
+I (183517) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-96
+I (183527) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3105 total=40
+I (183727) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-95
+I (183727) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7188 total=41
+I (183927) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-92
+I (183927) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=42
+I (183937) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (194177) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-96
+I (194187) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=43
+I (194377) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-98
+I (194377) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7188 total=44
+I (194577) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-99
+I (194577) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=45
+I (194587) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (204837) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-97
+I (204847) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=46
+I (205037) iot-gw: RF sample cluster=0x0405 lqi=20 recent_rssi=-98
+I (205037) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7190 total=47
+I (205237) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-98
+I (205237) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=48
+I (205247) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (215497) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-97
+I (215507) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3106 total=49
+I (215697) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-96
+I (215707) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7185 total=50
+I (215897) iot-gw: RF sample cluster=0x0400 lqi=30 recent_rssi=-97
+I (215907) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=51
+I (215907) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.1,"humidity":71.8,"lux":0.0}}
+I (226167) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-96
+I (226167) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=52
+I (226357) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-99
+I (226367) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7185 total=53
+I (226557) iot-gw: RF sample cluster=0x0400 lqi=30 recent_rssi=-95
+I (226567) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=54
+I (226567) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.8,"lux":0.0}}
+I (236817) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-97
+I (236827) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=55
+I (237027) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-98
+I (237027) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7183 total=56
+I (237227) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-96
+I (237237) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=57
+I (237237) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.8,"lux":0.0}}
+I (245237) iot-gw: RF power: keep -10 dBm lqi_ema=25 low_windows=0 high_windows=0
+I (250227) iot-gw: Zigbee: permit joining closed; secure rejoin may still use existing credentials
+I (250487) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-97
+I (250487) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=58
+I (250687) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-97
+I (250687) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7185 total=59
+I (250887) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-96
+I (250887) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=60
+I (250897) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.8,"lux":0.0}}
+I (258147) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-97
+I (258147) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=61
+I (258337) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-97
+I (258347) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7188 total=62
+I (258537) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-96
+I (258547) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=63
+I (258547) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (268807) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-99
+I (268807) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3105 total=64
+I (268997) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-95
+I (269007) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7185 total=65
+I (269197) iot-gw: RF sample cluster=0x0400 lqi=20 recent_rssi=-96
+I (269207) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=66
+I (269207) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.8,"lux":0.0}}
+I (279467) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-90
+I (279467) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3106 total=67
+I (279657) iot-gw: RF sample cluster=0x0405 lqi=20 recent_rssi=-99
+I (279667) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7188 total=68
+I (279867) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-98
+I (279867) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=69
+I (279867) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.1,"humidity":71.9,"lux":0.0}}
+I (290127) iot-gw: RF sample cluster=0x0402 lqi=25 recent_rssi=-96
+I (290127) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=70
+I (290327) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-93
+I (290327) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7190 total=71
+I (290527) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-98
+I (290527) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=72
+I (290527) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (300787) iot-gw: RF sample cluster=0x0402 lqi=30 recent_rssi=-97
+I (300787) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0402 value=3104 total=73
+I (300987) iot-gw: RF sample cluster=0x0405 lqi=25 recent_rssi=-98
+I (300987) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0405 value=7193 total=74
+I (301187) iot-gw: RF sample cluster=0x0400 lqi=25 recent_rssi=-96
+I (301187) iot-gw: Zigbee: cached report node=0x82cb cluster=0x0400 value=0 total=75
+I (301187) iot-gw: MQTT -> nodes/zb-82cb/telemetry: {"data":{"temperature":31.0,"humidity":71.9,"lux":0.0}}
+I (307187) iot-gw: RF power: keep -10 dBm lqi_ema=24 low_windows=0 high_windows=0

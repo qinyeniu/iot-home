@@ -37,7 +37,9 @@
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "esp_zigbee_core.h"
+#include "esp_zigbee_attribute.h"
 #include "nwk/esp_zigbee_nwk.h"
+#include "aps/esp_zigbee_aps.h"
 #include "esp_coexist.h"
 #include "esp_ieee802154.h"
 #include "wifi_secrets.h"
@@ -67,6 +69,41 @@
 
 #define STATUS_INTERVAL_MS      30000
 #define OLED_UPDATE_MS          1000
+
+#define RF_POWER_CLUSTER_ID     0xFC10
+#define RF_PACKET_MAGIC0        0x52
+#define RF_PACKET_MAGIC1        0x46
+#define RF_PACKET_VERSION       1
+#define RF_PACKET_LEN           6
+#define RF_CMD_QUERY            1
+#define RF_CMD_SET              2
+#define RF_CMD_REPORT           3
+#define RF_POWER_UNKNOWN_DBM       (-128)
+// One-time installation bounds. Values must exist in s_rf_power_table below.
+// The controller still starts/reconciles from the node and does not use
+// distance as a direct control input.
+#define RF_POWER_AUTO_MIN_DBM     (-10)
+#define RF_POWER_AUTO_MAX_DBM     (20)
+#define RF_POWER_LEVEL_IS_SUPPORTED(p) \
+    (((p) == -10) || ((p) == 0) || ((p) == 8) || ((p) == 14) || \
+     ((p) == 18) || ((p) == 20))
+_Static_assert(RF_POWER_LEVEL_IS_SUPPORTED(RF_POWER_AUTO_MIN_DBM),
+               "RF_POWER_AUTO_MIN_DBM must exactly match a power-table level");
+_Static_assert(RF_POWER_LEVEL_IS_SUPPORTED(RF_POWER_AUTO_MAX_DBM),
+               "RF_POWER_AUTO_MAX_DBM must exactly match a power-table level");
+#define RF_POWER_EVAL_MS          60000
+#define RF_POWER_FRESH_MS         120000
+#define RF_POWER_SAMPLES_NEEDED   6
+// Use LQI only as a diagnostic/down-control signal. On this ESP32-C6 setup,
+// successful close-range APS traffic can report LQI around 20 while stale RSSI
+// can read near -94 dBm, so weak-looking LQI alone must not raise power. Real
+// commissioning/APS failures drive power-up; persistent very-high LQI can lower
+// an unnecessarily high learned level.
+#define RF_LQI_LOWER              240
+#define RF_LQI_LOWER_WINDOWS      3
+#define RF_POWER_SETTLE_MS        90000
+#define RF_POWER_RECONCILE_MS     300000
+#define RF_ZB_ENDPOINT            10
 
 // Forward declarations
 void mqtt_pub(const char *topic_suffix, const char *data);
@@ -253,6 +290,496 @@ static bool zb_nlme_diagnostic_allowed(void)
         return true;
     }
     return false;
+}
+
+// ==================== Gateway-side automatic TX power control ====================
+
+static const int8_t s_rf_power_table[] = {-10, 0, 8, 14, 18, 20};
+#define RF_POWER_LEVEL_COUNT (sizeof(s_rf_power_table) / sizeof(s_rf_power_table[0]))
+
+static uint16_t s_rf_node_addr;
+static int s_rf_lqi_ema = -1;
+static uint8_t s_rf_lqi_samples;
+static uint32_t s_rf_last_rx_ms;
+static int8_t s_rf_node_power_dbm = RF_POWER_UNKNOWN_DBM;
+static uint8_t s_rf_packet_sequence;
+static uint32_t s_rf_last_eval_ms;
+static uint8_t s_rf_lqi_low_windows;
+static uint8_t s_rf_lqi_high_windows;
+static bool s_rf_report_waiting;
+static uint8_t s_rf_expected_report_seq;
+static int8_t s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+static bool s_rf_last_report_seq_valid;
+static uint8_t s_rf_last_report_seq;
+static uint32_t s_rf_wait_started_ms;
+static uint32_t s_rf_power_confirmed_ms;
+static portMUX_TYPE s_rf_power_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static bool rf_power_known_active_child(uint16_t addr);
+static bool rf_power_is_table_value(int8_t power_dbm);
+
+static bool rf_power_is_monitored_cluster(uint16_t cluster_id)
+{
+    return cluster_id == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT ||
+           cluster_id == ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT ||
+           cluster_id == ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT ||
+           cluster_id == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF ||
+           cluster_id == RF_POWER_CLUSTER_ID;
+}
+
+static bool rf_power_is_table_value(int8_t power_dbm)
+{
+    for (uint8_t i = 0; i < RF_POWER_LEVEL_COUNT; ++i) {
+        if (s_rf_power_table[i] == power_dbm) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rf_power_is_allowed_value(int8_t power_dbm)
+{
+    return power_dbm >= RF_POWER_AUTO_MIN_DBM &&
+           power_dbm <= RF_POWER_AUTO_MAX_DBM &&
+           rf_power_is_table_value(power_dbm);
+}
+
+static uint8_t rf_power_nearest_index(int8_t power_dbm)
+{
+    uint8_t best = 0;
+    uint16_t best_delta = 0xFFFF;
+
+    for (uint8_t i = 0; i < RF_POWER_LEVEL_COUNT; ++i) {
+        int delta = (int)power_dbm - (int)s_rf_power_table[i];
+        uint16_t abs_delta = (uint16_t)(delta < 0 ? -delta : delta);
+        if (abs_delta < best_delta) {
+            best_delta = abs_delta;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static uint8_t rf_power_min_index(void)
+{
+    return rf_power_nearest_index(RF_POWER_AUTO_MIN_DBM);
+}
+
+static uint8_t rf_power_max_index(void)
+{
+    return rf_power_nearest_index(RF_POWER_AUTO_MAX_DBM);
+}
+
+static void rf_power_forget_node(uint16_t addr)
+{
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    if (s_rf_node_addr == addr) {
+        s_rf_node_addr = 0;
+        s_rf_lqi_ema = -1;
+        s_rf_lqi_samples = 0;
+        s_rf_last_rx_ms = 0;
+        s_rf_node_power_dbm = RF_POWER_UNKNOWN_DBM;
+        s_rf_lqi_low_windows = 0;
+        s_rf_lqi_high_windows = 0;
+        s_rf_report_waiting = false;
+        s_rf_expected_report_seq = 0;
+        s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+        s_rf_last_report_seq_valid = false;
+        s_rf_last_report_seq = 0;
+        s_rf_wait_started_ms = 0;
+        s_rf_power_confirmed_ms = 0;
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+}
+
+static void rf_power_reset_for_announce(uint16_t addr)
+{
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+
+    // A device announce can be a fresh node as well as a reset of the same short
+    // address. Discard any power/LQI state from the previous process and force
+    // the next periodic pass to QUERY. Otherwise the gateway could apply a
+    // stale high-power level to a node that booted safely at -10 dBm.
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    s_rf_node_addr = addr;
+    s_rf_lqi_ema = -1;
+    s_rf_lqi_samples = 0;
+    s_rf_last_rx_ms = now;
+    s_rf_node_power_dbm = RF_POWER_UNKNOWN_DBM;
+    s_rf_lqi_low_windows = 0;
+    s_rf_lqi_high_windows = 0;
+    s_rf_report_waiting = false;
+    s_rf_expected_report_seq = 0;
+    s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+    s_rf_last_report_seq_valid = false;
+    s_rf_last_report_seq = 0;
+    s_rf_wait_started_ms = 0;
+    s_rf_power_confirmed_ms = 0;
+    s_rf_last_eval_ms = 0;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+}
+
+static bool rf_power_report_is_new_unsolicited_locked(uint8_t seq)
+{
+    // Gateway-initiated replies echo a low sequence number and are accepted via
+    // the exact expected-sequence path. Node-initiated reports use 128..255.
+    if (seq < 0x80) {
+        return false;
+    }
+    if (!s_rf_last_report_seq_valid) {
+        return true;
+    }
+    if (s_rf_last_report_seq < 0x80) {
+        // First node-initiated report after a gateway-driven exchange.
+        return true;
+    }
+
+    uint8_t last_low = s_rf_last_report_seq & 0x7f;
+    uint8_t current_low = seq & 0x7f;
+    uint8_t forward_delta = (uint8_t)(current_low - last_low);
+    return forward_delta >= 1 && forward_delta <= 127;
+}
+
+typedef enum {
+    RF_REJECT_NONE = 0,
+    RF_REJECT_UNSECURED,
+    RF_REJECT_MALFORMED,
+    RF_REJECT_UNEXPECTED_CMD,
+    RF_REJECT_UNKNOWN_CHILD,
+    RF_REJECT_INVALID_POWER,
+    RF_REJECT_MISMATCH,
+    RF_REJECT_OLD,
+} rf_reject_reason_t;
+
+static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
+{
+    bool is_private = ind.cluster_id == RF_POWER_CLUSTER_ID;
+    bool power_report = false;
+    bool accept_report = false;
+    int8_t reported_power = 0;
+    uint8_t report_seq = 0;
+    uint8_t expected_seq = 0;
+    int8_t expected_power = RF_POWER_UNKNOWN_DBM;
+    uint8_t last_seq = 0;
+    int8_t recent_rssi = -127;
+    bool old_power_unknown = true;
+    rf_reject_reason_t reject_reason = RF_REJECT_NONE;
+
+    if (!rf_power_is_monitored_cluster(ind.cluster_id)) {
+        return false;
+    }
+
+    if (ind.status != 0 || ind.profile_id != ESP_ZB_AF_HA_PROFILE_ID ||
+        ind.src_endpoint != RF_ZB_ENDPOINT || ind.dst_endpoint != RF_ZB_ENDPOINT) {
+        return is_private;
+    }
+
+    if (ind.security_status == 0) {
+        reject_reason = RF_REJECT_UNSECURED;
+        return is_private;
+    }
+
+    if (is_private) {
+        if (ind.asdu_length != RF_PACKET_LEN || ind.asdu == NULL ||
+            ind.asdu[0] != RF_PACKET_MAGIC0 ||
+            ind.asdu[1] != RF_PACKET_MAGIC1 ||
+            ind.asdu[2] != RF_PACKET_VERSION) {
+            reject_reason = RF_REJECT_MALFORMED;
+            return true;
+        }
+
+        report_seq = ind.asdu[4];
+        if (ind.asdu[3] == RF_CMD_REPORT) {
+            reported_power = (int8_t)ind.asdu[5];
+            power_report = true;
+        } else {
+            reject_reason = RF_REJECT_UNEXPECTED_CMD;
+            return true;
+        }
+    }
+
+    recent_rssi = esp_ieee802154_get_recent_rssi();
+    int frame_lqi = ind.lqi;
+    bool active_child = rf_power_known_active_child(ind.src_short_addr);
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    if (active_child) {
+        s_rf_node_addr = ind.src_short_addr;
+        s_rf_last_rx_ms = now;
+    }
+
+    if (power_report) {
+        expected_seq = s_rf_expected_report_seq;
+        expected_power = s_rf_expected_report_power;
+        last_seq = s_rf_last_report_seq;
+        old_power_unknown = s_rf_node_power_dbm == RF_POWER_UNKNOWN_DBM;
+
+        if (!active_child) {
+            reject_reason = RF_REJECT_UNKNOWN_CHILD;
+        } else if (!rf_power_is_allowed_value(reported_power)) {
+            reject_reason = RF_REJECT_INVALID_POWER;
+        } else if (s_rf_report_waiting) {
+            if (report_seq == expected_seq &&
+                (expected_power == RF_POWER_UNKNOWN_DBM ||
+                 reported_power == expected_power)) {
+                accept_report = true;
+                s_rf_report_waiting = false;
+                s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+                s_rf_wait_started_ms = 0;
+            } else {
+                reject_reason = RF_REJECT_MISMATCH;
+            }
+        } else if (rf_power_report_is_new_unsolicited_locked(report_seq)) {
+            accept_report = true;
+        } else {
+            reject_reason = RF_REJECT_OLD;
+        }
+    }
+
+    if (accept_report) {
+        s_rf_node_power_dbm = reported_power;
+        s_rf_last_report_seq = report_seq;
+        s_rf_last_report_seq_valid = true;
+        s_rf_power_confirmed_ms = now;
+        // Discard old-power history. The encrypted report itself is the first
+        // sample at the new power; subsequent standard frames refine the EMA.
+        s_rf_lqi_ema = frame_lqi;
+        s_rf_lqi_samples = 1;
+        s_rf_lqi_low_windows = 0;
+        s_rf_lqi_high_windows = 0;
+    } else if (!is_private && active_child && frame_lqi >= 0) {
+        if (s_rf_lqi_ema < 0) {
+            s_rf_lqi_ema = frame_lqi;
+        } else {
+            s_rf_lqi_ema = (s_rf_lqi_ema * 3 + frame_lqi) / 4;
+        }
+        if (s_rf_lqi_samples < UINT8_MAX) {
+            s_rf_lqi_samples++;
+        }
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    // Log only after leaving the restricted critical section.
+    if (active_child) {
+        ESP_LOGI(TAG, "RF sample cluster=0x%04x lqi=%d recent_rssi=%d",
+                 (unsigned)ind.cluster_id, frame_lqi, (int)recent_rssi);
+    }
+    if (accept_report) {
+        ESP_LOGI(TAG,
+                 "RF power: report accepted from %s to %d dBm seq=%u",
+                 old_power_unknown ? "unknown" : "previous",
+                 (int)reported_power, report_seq);
+    } else if (reject_reason == RF_REJECT_UNSECURED) {
+        ESP_LOGW(TAG, "RF power: reject unsecured frame cluster=0x%04x",
+                 (unsigned)ind.cluster_id);
+    } else if (reject_reason == RF_REJECT_MALFORMED) {
+        ESP_LOGW(TAG, "RF power: reject malformed private frame length=%lu",
+                 (unsigned long)ind.asdu_length);
+    } else if (reject_reason == RF_REJECT_UNEXPECTED_CMD) {
+        ESP_LOGW(TAG, "RF power: reject unexpected private command");
+    } else if (reject_reason == RF_REJECT_UNKNOWN_CHILD) {
+        ESP_LOGW(TAG,
+                 "RF power: reject report from unknown/inactive child 0x%04x",
+                 (unsigned)ind.src_short_addr);
+    } else if (reject_reason == RF_REJECT_INVALID_POWER) {
+        ESP_LOGW(TAG, "RF power: reject invalid reported power=%d",
+                 (int)reported_power);
+    } else if (reject_reason == RF_REJECT_MISMATCH) {
+        ESP_LOGW(TAG,
+                 "RF power: reject mismatched report seq=%u expected=%u power=%d expected=%d",
+                 report_seq, expected_seq,
+                 (int)reported_power, (int)expected_power);
+    } else if (reject_reason == RF_REJECT_OLD) {
+        ESP_LOGW(TAG,
+                 "RF power: reject duplicate/old report seq=%u last=%u",
+                 report_seq, last_seq);
+    }
+
+    return is_private;
+}
+
+static esp_err_t rf_power_send_to_node(uint8_t command, int8_t power_dbm,
+                                       uint8_t *sent_seq)
+{
+    uint8_t seq = 0;
+    uint16_t addr = 0;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    addr = s_rf_node_addr;
+    seq = ++s_rf_packet_sequence;
+    if (seq == 0 || seq >= 0x80) {
+        seq = 1;
+        s_rf_packet_sequence = 1;
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    uint8_t asdu[RF_PACKET_LEN] = {
+        RF_PACKET_MAGIC0,
+        RF_PACKET_MAGIC1,
+        RF_PACKET_VERSION,
+        command,
+        seq,
+        (uint8_t)power_dbm,
+    };
+    esp_zb_apsde_data_req_t req = {
+        .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .dst_addr.addr_short = addr,
+        .dst_endpoint = RF_ZB_ENDPOINT,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .cluster_id = RF_POWER_CLUSTER_ID,
+        .src_endpoint = RF_ZB_ENDPOINT,
+        .asdu_length = sizeof(asdu),
+        .asdu = asdu,
+        .tx_options = ESP_ZB_APSDE_TX_OPT_SECURITY_ENABLED | ESP_ZB_APSDE_TX_OPT_ACK_TX,
+        .use_alias = false,
+        .alias_src_addr = 0,
+        .alias_seq_num = 0,
+        .radius = 10,
+    };
+    esp_err_t err = esp_zb_aps_data_request(&req);
+    ESP_LOGI(TAG, "RF power -> node=0x%04x cmd=%u power=%d seq=%u: %s",
+             (unsigned)addr, command, power_dbm, seq, esp_err_to_name(err));
+    if (err == ESP_OK && sent_seq != NULL) {
+        *sent_seq = seq;
+    }
+    return err;
+}
+
+static void rf_power_controller_periodic(void)
+{
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+    uint16_t addr = 0;
+    uint32_t last_rx = 0;
+    int link_lqi = -1;
+    uint8_t samples = 0;
+    int8_t current_power = 0;
+    int8_t target_power = 0;
+    bool report_waiting = false;
+    uint32_t wait_started_ms = 0;
+    uint32_t confirmed_ms = 0;
+
+    if (now - s_rf_last_eval_ms < RF_POWER_EVAL_MS) {
+        return;
+    }
+    s_rf_last_eval_ms = now;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    addr = s_rf_node_addr;
+    last_rx = s_rf_last_rx_ms;
+    link_lqi = s_rf_lqi_ema;
+    samples = s_rf_lqi_samples;
+    current_power = s_rf_node_power_dbm;
+    report_waiting = s_rf_report_waiting;
+    wait_started_ms = s_rf_wait_started_ms;
+    confirmed_ms = s_rf_power_confirmed_ms;
+    s_rf_lqi_samples = 0;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (addr == 0) {
+        return;
+    }
+    if (now - last_rx > RF_POWER_FRESH_MS) {
+        taskENTER_CRITICAL(&s_rf_power_lock);
+        s_rf_lqi_ema = -1;
+        s_rf_lqi_low_windows = 0;
+        s_rf_lqi_high_windows = 0;
+        s_rf_report_waiting = false;
+        s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+        s_rf_wait_started_ms = 0;
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+    bool wait_timed_out = report_waiting &&
+                          now - wait_started_ms >= RF_POWER_SETTLE_MS;
+    if (current_power == RF_POWER_UNKNOWN_DBM || wait_timed_out) {
+        uint8_t sent_seq = 0;
+        if (rf_power_send_to_node(RF_CMD_QUERY, 0, &sent_seq) == ESP_OK) {
+            taskENTER_CRITICAL(&s_rf_power_lock);
+            s_rf_report_waiting = true;
+            s_rf_expected_report_seq = sent_seq;
+            s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+            s_rf_wait_started_ms = now;
+            taskEXIT_CRITICAL(&s_rf_power_lock);
+        }
+        return;
+    }
+    if (!report_waiting && confirmed_ms != 0 &&
+        now - confirmed_ms >= RF_POWER_RECONCILE_MS) {
+        uint8_t sent_seq = 0;
+        ESP_LOGI(TAG, "RF power: periodic reconcile current=%d dBm", current_power);
+        if (rf_power_send_to_node(RF_CMD_QUERY, 0, &sent_seq) == ESP_OK) {
+            taskENTER_CRITICAL(&s_rf_power_lock);
+            s_rf_report_waiting = true;
+            s_rf_expected_report_seq = sent_seq;
+            s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+            s_rf_wait_started_ms = now;
+            taskEXIT_CRITICAL(&s_rf_power_lock);
+        }
+        return;
+    }
+    if (report_waiting) {
+        ESP_LOGI(TAG, "RF power: waiting for report seq=%u current=%d dBm",
+                 s_rf_expected_report_seq, current_power);
+        return;
+    }
+    if (samples < RF_POWER_SAMPLES_NEEDED) {
+        ESP_LOGI(TAG, "RF power: wait samples=%u/%u lqi_ema=%d",
+                 samples, RF_POWER_SAMPLES_NEEDED, link_lqi);
+        return;
+    }
+
+    uint8_t current_index = rf_power_nearest_index(current_power);
+    uint8_t min_index = rf_power_min_index();
+    uint8_t max_index = rf_power_max_index();
+    uint8_t target_index = current_index;
+
+    if (current_index < min_index || current_index > max_index) {
+        ESP_LOGW(TAG, "RF power: current=%d dBm outside configured policy",
+                 (int)current_power);
+        return;
+    }
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    s_rf_lqi_low_windows = 0;
+    if (link_lqi > RF_LQI_LOWER) {
+        if (s_rf_lqi_high_windows < UINT8_MAX) {
+            s_rf_lqi_high_windows++;
+        }
+    } else {
+        s_rf_lqi_high_windows = 0;
+    }
+
+    if (s_rf_lqi_high_windows >= RF_LQI_LOWER_WINDOWS &&
+        current_index > min_index) {
+        target_index = current_index - 1;
+        s_rf_lqi_low_windows = 0;
+        s_rf_lqi_high_windows = 0;
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (target_index == current_index) {
+        taskENTER_CRITICAL(&s_rf_power_lock);
+        uint8_t low_windows = s_rf_lqi_low_windows;
+        uint8_t high_windows = s_rf_lqi_high_windows;
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        ESP_LOGI(TAG,
+                 "RF power: keep %d dBm lqi_ema=%d low_windows=%u high_windows=%u",
+                 current_power, link_lqi, low_windows, high_windows);
+        return;
+    }
+
+    target_power = s_rf_power_table[target_index];
+    uint8_t sent_seq = 0;
+    if (rf_power_send_to_node(RF_CMD_SET, target_power, &sent_seq) == ESP_OK) {
+        // Queue acceptance is not proof. Accept only the node's encrypted
+        // REPORT carrying this request sequence and requested power.
+        taskENTER_CRITICAL(&s_rf_power_lock);
+        s_rf_report_waiting = true;
+        s_rf_expected_report_seq = sent_seq;
+        s_rf_expected_report_power = target_power;
+        s_rf_wait_started_ms = now;
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+    }
 }
 
 // ==================== OLED SSD1306 ====================
@@ -777,6 +1304,24 @@ typedef struct {
 static zb_node_t s_zb_nodes[MAX_ZB_NODES];
 static portMUX_TYPE s_zb_lock = portMUX_INITIALIZER_UNLOCKED;
 
+// Verify the report source independently from the short address in the frame.
+// This helper uses only s_zb_lock and is intentionally called before taking
+// s_rf_power_lock to avoid a lock nesting/deadlock.
+static bool rf_power_known_active_child(uint16_t addr)
+{
+    bool found = false;
+
+    portENTER_CRITICAL(&s_zb_lock);
+    for (uint8_t i = 0; i < MAX_ZB_NODES; ++i) {
+        if (s_zb_nodes[i].addr == addr && s_zb_nodes[i].active) {
+            found = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_zb_lock);
+    return found;
+}
+
 static zb_node_t *zb_node_get_or_create(uint16_t addr)
 {
     zb_node_t *free_slot = NULL;
@@ -876,6 +1421,9 @@ static esp_zb_ep_list_t *create_gateway_ep(void)
         esp_zb_illuminance_meas_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
     esp_zb_cluster_list_add_on_off_cluster(clusters,
         esp_zb_on_off_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+    esp_zb_cluster_list_add_custom_cluster(clusters,
+        esp_zb_zcl_attr_list_create(RF_POWER_CLUSTER_ID),
+        ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
     esp_zb_endpoint_config_t ep_cfg = {
         .endpoint = EP_GW,
@@ -916,6 +1464,7 @@ static void zigbee_task(void *arg)
     }
     esp_zb_device_register(create_gateway_ep());
     esp_zb_core_action_handler_register(zb_action_handler);
+    esp_zb_aps_data_indication_handler_register(rf_power_aps_indication_cb);
 
     ESP_ERROR_CHECK(esp_zb_start(false));
 
@@ -1696,6 +2245,7 @@ static void zb_handle_join_event(const zb_app_event_t *event)
     }
 
     zb_publish_node_status(&status_snap, is_new_child ? "device_joined" : "device_announce", true);
+    rf_power_reset_for_announce(event->addr);
 }
 
 static void zb_handle_leave_event(const zb_app_event_t *event)
@@ -1721,6 +2271,7 @@ static void zb_handle_leave_event(const zb_app_event_t *event)
 
     if (was_active) {
         ESP_LOGI(TAG, "Zigbee: Device left! addr=0x%04x", snap.addr);
+        rf_power_forget_node(snap.addr);
         zb_publish_node_status(&snap, "device_left", false);
     } else {
         ESP_LOGI(TAG, "Zigbee: Leave for unknown/inactive IEEE "
@@ -1807,6 +2358,7 @@ static void zb_handle_report_event(const zb_app_event_t *event)
         if (became_active) {
             ESP_LOGI(TAG, "Zigbee: Device active by report addr=0x%04x", event->addr);
             zb_persist_child_seen();
+            rf_power_reset_for_announce(event->addr);
             if (need_status) {
                 zb_publish_node_status(&status_snap, "device_active", true);
             }
@@ -2012,6 +2564,7 @@ static void zb_forward_task(void *arg)
             zb_publish_known_statuses();
         }
         zb_forward_pending();
+        rf_power_controller_periodic();
         mqtt_outbox_flush();
 
         uint32_t app_drops = s_zb_app_drops_task + s_zb_app_drops_isr;

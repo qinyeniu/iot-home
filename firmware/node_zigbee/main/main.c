@@ -13,10 +13,12 @@
 #include <stddef.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_zigbee_core.h"
 #include "zcl/esp_zigbee_zcl_command.h"
 #include "nwk/esp_zigbee_nwk.h"
@@ -81,6 +83,24 @@
 #define ZCL_TYPE_UNSIGNED_16BIT            0x21
 #define ZCL_TYPE_SIGNED_16BIT              0x29
 
+#define RF_POWER_CLUSTER_ID    0xFC10
+#define RF_PACKET_MAGIC0       0x52  // 'R'
+#define RF_PACKET_MAGIC1       0x46  // 'F'
+#define RF_PACKET_VERSION      1
+#define RF_PACKET_LEN          6
+#define RF_CMD_QUERY           1
+#define RF_CMD_SET             2
+#define RF_CMD_REPORT          3
+#define RF_TASK_REMOTE_BIT     (1u << 0)
+#define RF_TASK_SAVE_BIT       (1u << 1)
+#define RF_TASK_REPORT_BIT     (1u << 2)
+#define RF_APS_FAIL_WINDOW_MS     60000
+#define RF_APS_FAIL_LIMIT         4
+#define RF_APS_RAISE_COOLDOWN_MS  90000
+#define RF_CONNECTED_SETTLE_MS    30000
+#define RF_COMMISSION_FAIL_LIMIT  4
+#define RF_COMMISSION_GRACE_MS    45000
+
 #define EP_SENSOR               10      // endpoint on both node and gateway
 #define RELAY_GPIO              GPIO_NUM_4  // co-located relay (LOW=energize)
 #define BUTTON_GPIO             GPIO_NUM_5  // local manual button (LOW=pressed)
@@ -90,8 +110,33 @@
 
 #define INSTALLCODE_POLICY      false
 #define ESP_ZB_CHANNEL_MASK     (1l << 26)
-// Close-range bring-up: avoid receiver overload on the neighboring gateway.
-#define ZIGBEE_NODE_TX_POWER_DBM (-10)
+// Zigbee TX power policy. The controller learns the actual level; these are
+// installation limits, not a fixed power that must be edited for every position.
+// AUTO_MIN/AUTO_MAX should be values present in s_rf_power_table below.
+#define ZIGBEE_NODE_TX_POWER_HW_MIN_DBM    (-15)
+#define ZIGBEE_NODE_TX_POWER_HW_MAX_DBM    (20)
+#define ZIGBEE_NODE_TX_POWER_START_DBM     (-10)
+#define ZIGBEE_NODE_TX_POWER_AUTO_MIN_DBM  (-10)
+#define ZIGBEE_NODE_TX_POWER_AUTO_MAX_DBM  (20)
+#define ZIGBEE_POWER_LEVEL_IS_SUPPORTED(p) \
+    (((p) == -10) || ((p) == 0) || ((p) == 8) || ((p) == 14) || \
+     ((p) == 18) || ((p) == 20))
+
+_Static_assert(ZIGBEE_NODE_TX_POWER_HW_MIN_DBM >= -15 &&
+               ZIGBEE_NODE_TX_POWER_HW_MAX_DBM <= 20,
+               "ESP32-C6 Zigbee TX power hardware range is -15..20 dBm");
+_Static_assert(ZIGBEE_POWER_LEVEL_IS_SUPPORTED(ZIGBEE_NODE_TX_POWER_START_DBM),
+               "ZIGBEE_NODE_TX_POWER_START_DBM must exactly match a power-table level");
+_Static_assert(ZIGBEE_POWER_LEVEL_IS_SUPPORTED(ZIGBEE_NODE_TX_POWER_AUTO_MIN_DBM),
+               "ZIGBEE_NODE_TX_POWER_AUTO_MIN_DBM must exactly match a power-table level");
+_Static_assert(ZIGBEE_POWER_LEVEL_IS_SUPPORTED(ZIGBEE_NODE_TX_POWER_AUTO_MAX_DBM),
+               "ZIGBEE_NODE_TX_POWER_AUTO_MAX_DBM must exactly match a power-table level");
+_Static_assert(ZIGBEE_NODE_TX_POWER_AUTO_MIN_DBM <= ZIGBEE_NODE_TX_POWER_AUTO_MAX_DBM &&
+               ZIGBEE_NODE_TX_POWER_START_DBM >= ZIGBEE_NODE_TX_POWER_AUTO_MIN_DBM &&
+               ZIGBEE_NODE_TX_POWER_START_DBM <= ZIGBEE_NODE_TX_POWER_AUTO_MAX_DBM &&
+               ZIGBEE_NODE_TX_POWER_AUTO_MIN_DBM >= ZIGBEE_NODE_TX_POWER_HW_MIN_DBM &&
+               ZIGBEE_NODE_TX_POWER_AUTO_MAX_DBM <= ZIGBEE_NODE_TX_POWER_HW_MAX_DBM,
+               "Zigbee startup TX power must lie within the automatic power bounds");
 
 // Zigbee End Device config
 #define ESP_ZB_ZED_CONFIG()                         \
@@ -825,6 +870,10 @@ static esp_zb_ep_list_t *create_sensor_ep(void)
     esp_zb_on_off_cluster_cfg_t onoff_cfg = { .on_off = false };
     esp_zb_cluster_list_add_on_off_cluster(clusters,
         esp_zb_on_off_cluster_create(&onoff_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    // Private manufacturer-range cluster used only by the gateway for ATPC.
+    esp_zb_cluster_list_add_custom_cluster(clusters,
+        esp_zb_zcl_attr_list_create(RF_POWER_CLUSTER_ID),
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     esp_zb_endpoint_config_t ep_cfg = {
         .endpoint = EP_SENSOR,
@@ -834,6 +883,432 @@ static esp_zb_ep_list_t *create_sensor_ep(void)
     };
     esp_zb_ep_list_add_ep(ep_list, clusters, ep_cfg);
     return ep_list;
+}
+
+// ==================== Automatic Zigbee TX power control ====================
+
+static const int8_t s_rf_power_table[] = {-10, 0, 8, 14, 18, 20};
+#define RF_POWER_LEVEL_COUNT (sizeof(s_rf_power_table) / sizeof(s_rf_power_table[0]))
+
+static uint8_t s_rf_power_index;
+static uint8_t s_rf_power_min_index;
+static uint8_t s_rf_power_max_index;
+static TaskHandle_t s_rf_power_task;
+static SemaphoreHandle_t s_rf_apply_mutex;
+static portMUX_TYPE s_rf_power_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint8_t s_rf_remote_cmd;
+static volatile int8_t s_rf_remote_power;
+static uint8_t s_rf_aps_failures;
+static uint32_t s_rf_aps_window_start_ms;
+static uint8_t s_rf_commission_failures;
+static uint32_t s_rf_first_commission_failure_ms;
+static uint32_t s_rf_connected_ms;
+static uint32_t s_rf_last_local_raise_ms;
+static uint8_t s_rf_remote_seq;
+static bool s_rf_unsolicited_report_pending;
+static bool s_rf_save_pending;
+static uint8_t s_rf_packet_sequence;
+
+static uint8_t rf_power_nearest_index(int8_t requested_dbm)
+{
+    uint8_t best = 0;
+    uint16_t best_delta = 0xFFFF;
+
+    for (uint8_t i = 0; i < RF_POWER_LEVEL_COUNT; ++i) {
+        int delta = (int)requested_dbm - (int)s_rf_power_table[i];
+        uint16_t abs_delta = (uint16_t)(delta < 0 ? -delta : delta);
+        if (abs_delta < best_delta) {
+            best_delta = abs_delta;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static uint8_t rf_power_clamp_index(uint8_t index)
+{
+    if (index < s_rf_power_min_index) {
+        return s_rf_power_min_index;
+    }
+    if (index > s_rf_power_max_index) {
+        return s_rf_power_max_index;
+    }
+    return index;
+}
+
+static void rf_power_task_notify(uint32_t bits)
+{
+    if (s_rf_power_task == NULL) {
+        return;
+    }
+
+    if (xPortCanYield()) {
+        xTaskNotify(s_rf_power_task, bits, eSetBits);
+    } else {
+        BaseType_t higher_woken = pdFALSE;
+        xTaskNotifyFromISR(s_rf_power_task, bits, eSetBits, &higher_woken);
+        portYIELD_FROM_ISR(higher_woken);
+    }
+}
+
+static void rf_power_init(void)
+{
+    // Always bring the radio up at the verified close-range safe level. A
+    // learned far-site value persisted in NVS must not be replayed after the
+    // node has been moved next to the gateway, because it can overload the
+    // coordinator receiver. The controller may raise power only after timed,
+    // repeated commissioning/link failures.
+    if (s_rf_apply_mutex == NULL) {
+        s_rf_apply_mutex = xSemaphoreCreateMutex();
+        if (s_rf_apply_mutex == NULL) {
+            ESP_LOGE(TAG, "RF power: apply mutex unavailable; only startup power can be used");
+        }
+    }
+    s_rf_power_min_index = rf_power_nearest_index(ZIGBEE_NODE_TX_POWER_AUTO_MIN_DBM);
+    s_rf_power_max_index = rf_power_nearest_index(ZIGBEE_NODE_TX_POWER_AUTO_MAX_DBM);
+    s_rf_power_index = rf_power_clamp_index(
+        rf_power_nearest_index(ZIGBEE_NODE_TX_POWER_START_DBM));
+}
+
+int8_t rf_power_get_dbm(void)
+{
+    return s_rf_power_table[s_rf_power_index];
+}
+
+static void rf_power_save_if_pending(void)
+{
+    nvs_handle_t handle;
+
+    if (!s_rf_save_pending) {
+        return;
+    }
+
+    // Diagnostic only: the learned value is retained for inspection/tooling, but
+    // startup intentionally ignores it and always returns to -10 dBm.
+    if (nvs_open("rfctl", NVS_READWRITE, &handle) == ESP_OK) {
+        esp_err_t err = nvs_set_i8(handle, "txp2", rf_power_get_dbm());
+        if (err == ESP_OK) {
+            err = nvs_commit(handle);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "RF power persistence failed: %s", esp_err_to_name(err));
+        }
+        nvs_close(handle);
+    } else {
+        ESP_LOGW(TAG, "RF power persistence namespace unavailable");
+    }
+    s_rf_save_pending = false;
+}
+
+// The installed SDK exposes a void setter, so verify the resulting radio level.
+static bool rf_power_configure_dbm(int8_t target_dbm, int8_t *actual_dbm)
+{
+    esp_zb_set_tx_power(target_dbm);
+    esp_zb_get_tx_power(actual_dbm);
+    return *actual_dbm == target_dbm;
+}
+
+// The stack must already be initialized before this is called.
+static bool rf_power_apply_index(uint8_t index, const char *reason,
+                                       bool autonomous_report)
+{
+    int8_t actual = 0;
+    uint8_t old_index = 0;
+    bool applied = false;
+
+    if (index >= RF_POWER_LEVEL_COUNT || s_rf_apply_mutex == NULL) {
+        return false;
+    }
+    if (index < s_rf_power_min_index || index > s_rf_power_max_index) {
+        ESP_LOGW(TAG, "RF power: requested index=%u outside configured range",
+                 (unsigned)index);
+        return false;
+    }
+
+    if (xSemaphoreTake(s_rf_apply_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGW(TAG, "RF power: apply mutex busy for target index=%u",
+                 (unsigned)index);
+        return false;
+    }
+
+    old_index = s_rf_power_index;
+    if (index == old_index) {
+        xSemaphoreGive(s_rf_apply_mutex);
+        return false;
+    }
+
+    s_rf_power_index = index;
+    if (!rf_power_configure_dbm(rf_power_get_dbm(), &actual)) {
+        int8_t restored_actual = 0;
+        ESP_LOGE(TAG,
+                 "RF power: failed to apply %d dBm (actual=%d); restore previous %d dBm",
+                 (int)rf_power_get_dbm(),
+                 (int)actual,
+                 (int)s_rf_power_table[old_index]);
+        s_rf_power_index = old_index;
+        if (!rf_power_configure_dbm(s_rf_power_table[old_index],
+                                    &restored_actual) ||
+            restored_actual != s_rf_power_table[old_index]) {
+            ESP_LOGE(TAG, "RF power: previous-power restore uncertain actual=%d",
+                     (int)restored_actual);
+        }
+        xSemaphoreGive(s_rf_apply_mutex);
+        return false;
+    }
+
+    s_rf_save_pending = true;
+    if (autonomous_report) {
+        s_rf_unsolicited_report_pending = true;
+    }
+    applied = true;
+    xSemaphoreGive(s_rf_apply_mutex);
+
+    ESP_LOGI(TAG, "RF power: %s -> %d dBm (actual=%d)",
+             reason, rf_power_get_dbm(), actual);
+    uint32_t task_bits = RF_TASK_SAVE_BIT;
+    if (autonomous_report) {
+        task_bits |= RF_TASK_REPORT_BIT;
+    }
+    rf_power_task_notify(task_bits);
+    return applied;
+}
+
+static esp_err_t rf_power_send_command(uint8_t command, int8_t power_dbm,
+                                       uint8_t sequence)
+{
+    uint8_t asdu[RF_PACKET_LEN] = {
+        RF_PACKET_MAGIC0,
+        RF_PACKET_MAGIC1,
+        RF_PACKET_VERSION,
+        command,
+        sequence,
+        (uint8_t)power_dbm,
+    };
+    esp_zb_apsde_data_req_t req = {
+        .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .dst_addr.addr_short = COORDINATOR_SHORT_ADDR,
+        .dst_endpoint = EP_SENSOR,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .cluster_id = RF_POWER_CLUSTER_ID,
+        .src_endpoint = EP_SENSOR,
+        .asdu_length = sizeof(asdu),
+        .asdu = asdu,
+        .tx_options = ESP_ZB_APSDE_TX_OPT_SECURITY_ENABLED | ESP_ZB_APSDE_TX_OPT_ACK_TX,
+        .use_alias = false,
+        .alias_src_addr = 0,
+        .alias_seq_num = 0,
+        .radius = REPORT_APS_RADIUS,
+    };
+    esp_err_t err = esp_zb_aps_data_request(&req);
+    ESP_LOGI(TAG, "RF power cmd=%u power=%d seq=%u: %s",
+             command, power_dbm, sequence, esp_err_to_name(err));
+    return err;
+}
+
+static void rf_power_handle_remote(uint8_t command, int8_t power_dbm,
+                                   uint8_t sequence)
+{
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    s_rf_remote_cmd = command;
+    s_rf_remote_power = power_dbm;
+    s_rf_remote_seq = sequence;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+    rf_power_task_notify(RF_TASK_REMOTE_BIT);
+}
+
+static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
+{
+    if (ind.cluster_id != RF_POWER_CLUSTER_ID) {
+        return false;
+    }
+
+    if (ind.src_short_addr != COORDINATOR_SHORT_ADDR ||
+        ind.src_endpoint != EP_SENSOR || ind.security_status == 0) {
+        ESP_LOGW(TAG, "RF power: reject unauthenticated peer 0x%04x",
+                 (unsigned)ind.src_short_addr);
+        return true;
+    }
+
+    if (ind.profile_id != ESP_ZB_AF_HA_PROFILE_ID ||
+        ind.dst_endpoint != EP_SENSOR) {
+        ESP_LOGW(TAG, "RF power: reject private frame with wrong profile/endpoint");
+        return true;
+    }
+
+    if (ind.asdu_length == RF_PACKET_LEN && ind.asdu != NULL &&
+        ind.asdu[0] == RF_PACKET_MAGIC0 &&
+        ind.asdu[1] == RF_PACKET_MAGIC1 &&
+        ind.asdu[2] == RF_PACKET_VERSION) {
+        uint8_t command = ind.asdu[3];
+        if (command == RF_CMD_SET || command == RF_CMD_QUERY) {
+            rf_power_handle_remote(command, (int8_t)ind.asdu[5], ind.asdu[4]);
+        } else {
+            ESP_LOGW(TAG, "RF power: reject unexpected command=%u",
+                     (unsigned)command);
+        }
+    } else {
+        ESP_LOGW(TAG, "RF power: malformed private frame length=%lu",
+                 (unsigned long)ind.asdu_length);
+    }
+    return true;
+}
+
+static void rf_power_note_aps_result(bool success)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    // Count failures within the rolling observation window. A later success does
+    // not erase earlier failures, because several sparse failures can still show
+    // a marginal link. The count naturally restarts after the window expires.
+    if (!success) {
+        if (s_rf_aps_window_start_ms == 0 ||
+            now - s_rf_aps_window_start_ms > RF_APS_FAIL_WINDOW_MS) {
+            s_rf_aps_window_start_ms = now;
+            s_rf_aps_failures = 1;
+        } else if (s_rf_aps_failures < UINT8_MAX) {
+            s_rf_aps_failures++;
+        }
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+}
+
+static bool rf_power_raise_for_aps_if_due(void)
+{
+    bool should_raise = false;
+    uint8_t next_index = 0;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    if (s_rf_aps_failures >= RF_APS_FAIL_LIMIT &&
+        s_rf_connected_ms != 0 &&
+        now - s_rf_connected_ms >= RF_CONNECTED_SETTLE_MS &&
+        (s_rf_last_local_raise_ms == 0 ||
+         now - s_rf_last_local_raise_ms >= RF_APS_RAISE_COOLDOWN_MS) &&
+        s_rf_power_index < s_rf_power_max_index) {
+        should_raise = true;
+        next_index = s_rf_power_index + 1;
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (!should_raise || !rf_power_apply_index(next_index, "APS failures", true)) {
+        return false;
+    }
+
+    now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    s_rf_aps_failures = 0;
+    s_rf_aps_window_start_ms = 0;
+    s_rf_last_local_raise_ms = now;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+    return true;
+}
+
+static void rf_power_note_commission_failure(void)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    if (s_rf_commission_failures < UINT8_MAX) {
+        s_rf_commission_failures++;
+    }
+    if (s_rf_first_commission_failure_ms == 0) {
+        s_rf_first_commission_failure_ms = now;
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+}
+
+static void rf_power_note_connected(void)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    s_rf_commission_failures = 0;
+    s_rf_aps_failures = 0;
+    s_rf_aps_window_start_ms = 0;
+    s_rf_first_commission_failure_ms = 0;
+    s_rf_connected_ms = now;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+}
+
+static bool rf_power_raise_for_commission_if_due(void)
+{
+    bool should_raise = false;
+    uint8_t next_index = 0;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    if (s_rf_commission_failures >= RF_COMMISSION_FAIL_LIMIT &&
+        s_rf_first_commission_failure_ms != 0 &&
+        now - s_rf_first_commission_failure_ms >= RF_COMMISSION_GRACE_MS &&
+        s_rf_power_index < s_rf_power_max_index) {
+        should_raise = true;
+        next_index = s_rf_power_index + 1;
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (!should_raise ||
+        !rf_power_apply_index(next_index, "commissioning failures", true)) {
+        return false;
+    }
+
+    now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    s_rf_commission_failures = 0;
+    s_rf_first_commission_failure_ms = 0;
+    s_rf_last_local_raise_ms = now;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+    return true;
+}
+
+static void rf_power_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        uint32_t notify_value = 0;
+
+        xTaskNotifyWait(0, UINT32_MAX, &notify_value, pdMS_TO_TICKS(60000));
+
+        if ((notify_value & RF_TASK_REMOTE_BIT) != 0) {
+            uint8_t command = 0;
+            int8_t power_dbm = 0;
+            uint8_t request_seq = 0;
+
+            taskENTER_CRITICAL(&s_rf_power_lock);
+            command = s_rf_remote_cmd;
+            power_dbm = s_rf_remote_power;
+            request_seq = s_rf_remote_seq;
+            s_rf_remote_cmd = 0;
+            taskEXIT_CRITICAL(&s_rf_power_lock);
+
+            if (command == RF_CMD_SET) {
+                uint8_t index = rf_power_clamp_index(rf_power_nearest_index(power_dbm));
+                // If the level was already current, still answer the request.
+                (void)rf_power_apply_index(index, "gateway RSSI policy", false);
+                rf_power_send_command(RF_CMD_REPORT, rf_power_get_dbm(),
+                                      request_seq);
+            } else if (command == RF_CMD_QUERY) {
+                rf_power_send_command(RF_CMD_REPORT, rf_power_get_dbm(),
+                                      request_seq);
+            }
+        }
+
+        if ((notify_value & RF_TASK_SAVE_BIT) != 0) {
+            rf_power_save_if_pending();
+        }
+        if ((notify_value & RF_TASK_REPORT_BIT) != 0 &&
+            s_rf_unsolicited_report_pending) {
+            uint8_t node_seq = (uint8_t)((s_rf_packet_sequence + 1u) & 0x7f);
+            if (node_seq == 0) {
+                node_seq = 1;
+            }
+            s_rf_packet_sequence = node_seq;
+            uint8_t report_seq = (uint8_t)(0x80 | node_seq);
+            s_rf_unsolicited_report_pending = false;
+            rf_power_send_command(RF_CMD_REPORT, rf_power_get_dbm(), report_seq);
+        }
+    }
 }
 
 // ==================== Zigbee signals ====================
@@ -1126,6 +1601,7 @@ static bool late_commissioning_failure_while_connected(
 
 static void zigbee_mark_connected(const char *reason)
 {
+    rf_power_note_connected();
     s_link_resteer_forced = false;
     s_network_steering_pending = false;
     link_probe_cancel_active_preserve_retired();
@@ -1185,6 +1661,7 @@ static void network_steering_timer_cb(uint8_t mode_mask)
         return;
     }
 
+    rf_power_raise_for_commission_if_due();
     err = zigbee_start_commissioning(mode_mask);
     if (err != ESP_OK) {
         bdb_status = esp_zb_get_bdb_commissioning_status();
@@ -1352,6 +1829,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 // If that parent/rejoin attempt fails without retaining a usable
                 // network address, explicitly run network steering instead of
                 // waiting forever for another signal.
+                rf_power_note_commission_failure();
                 schedule_network_steering(ZIGBEE_LINK_RESTEER_DELAY_MS);
             }
         }
@@ -1374,6 +1852,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                          "Zigbee: ignore late steering commissioning status=%d while connected",
                          (int)bdb_status);
             } else {
+                rf_power_note_commission_failure();
                 schedule_network_steering(ZIGBEE_STEERING_FAIL_RETRY_MS);
             }
         }
@@ -1586,8 +2065,10 @@ static void aps_data_confirm_cb(esp_zb_apsde_data_confirm_t confirm)
 
     if (app_report && confirm.status == 0) {
         s_aps_confirm_success++;
+        rf_power_note_aps_result(true);
     } else if (app_report) {
         s_aps_confirm_failure++;
+        rf_power_note_aps_result(false);
         if (s_sensor_task_handle != NULL) {
             xTaskNotify(s_sensor_task_handle,
                         SENSOR_NOTIFY_APS_FAIL_BIT, eSetBits);
@@ -1602,10 +2083,10 @@ static void zigbee_task(void *arg)
 
     esp_zb_cfg_t zb_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_cfg);
-    esp_zb_set_tx_power(ZIGBEE_NODE_TX_POWER_DBM);
-    int8_t configured_tx_power = 0;
-    esp_zb_get_tx_power(&configured_tx_power);
-    ESP_LOGI(TAG, "Zigbee TX power=%d dBm", configured_tx_power);
+    int8_t startup_target_dbm = rf_power_get_dbm();
+    esp_zb_set_tx_power(startup_target_dbm);
+    ESP_LOGI(TAG, "Zigbee startup TX power target=%d dBm before stack start",
+             (int)startup_target_dbm);
     // Temporary diagnostic: keep this ZED receiver on instead of sleepy polling.
     esp_zb_set_rx_on_when_idle(true);
     ESP_LOGI(TAG, "RX-on-when-idle=%d", esp_zb_get_rx_on_when_idle());
@@ -1613,7 +2094,17 @@ static void zigbee_task(void *arg)
     esp_zb_device_register(create_sensor_ep());
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_aps_data_confirm_handler_register(aps_data_confirm_cb);
+    esp_zb_aps_data_indication_handler_register(rf_power_aps_indication_cb);
     esp_zb_start(false);
+
+    int8_t configured_tx_power = 0;
+    if (!rf_power_configure_dbm(startup_target_dbm, &configured_tx_power)) {
+        ESP_LOGW(TAG,
+                 "Zigbee startup TX power target=%d actual=%d; continue with caution",
+                 (int)startup_target_dbm, (int)configured_tx_power);
+    } else {
+        ESP_LOGI(TAG, "Zigbee TX power=%d dBm", configured_tx_power);
+    }
 
     ESP_LOGI(TAG, "Zigbee stack started");
 
@@ -1975,6 +2466,10 @@ static void sensor_task(void *arg)
                      REPORT_APS_REPAIRS);
 
             vTaskDelay(pdMS_TO_TICKS(1000 * repairs_this_round));
+            if (rf_power_raise_for_aps_if_due()) {
+                ESP_LOGW(TAG, "REPORT_APS: increased RF power before repair");
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
             report_window_reset();
             if (!send_sensor_reports(s_last_sample.valid_flags, "aps-repair")) {
                 ESP_LOGE(TAG, "REPORT_APS: repair reports could not be queued");
@@ -2068,6 +2563,7 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    rf_power_init();
 
     // GPIO4 was configured and held high at the very start of app_main.
 
@@ -2089,6 +2585,8 @@ void app_main(void)
         ESP_LOGW(TAG, "I2C SCAN: expect AHT20=0x38 BH1750=0x23");
     }
 
+    // RF task first so power-control replies can be handled during bring-up.
+    xTaskCreate(rf_power_task, "rf-power", 3072, NULL, 5, &s_rf_power_task);
     // Create the sensor task first so its notification handle exists before
     // the Zigbee task registers the APS confirm callback.
     xTaskCreate(sensor_task, "sensor", 4096, NULL, 5, &s_sensor_task_handle);

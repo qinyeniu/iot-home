@@ -65,9 +65,9 @@ MQTT_EVENT_DATA 中，当 topic 匹配 `.../nodes/{node}/cmd`：
 ### e. 近距离发射功率与幂等命令（2026-09-22 22:20）
 
 - 实测根因：节点与网关在桌面近距离摆放时，节点按默认高功率发射会造成网关 802.15.4 接收端饱和/阻塞。现象是节点持续 rejoin failure，而网关侧看不到 child/rejoin 请求。
-- 当前决策：节点启动并完成 `esp_zb_init()` 后，立即调用 `esp_zb_set_tx_power(-10)`，并通过 `esp_zb_get_tx_power()` 打印实际值；启动日志确认 `Zigbee TX power=-10 dBm`。
-- `-10 dBm` 是当前“同桌面近距离联调”的固定值，不是通用生产值。若以后节点与网关距离变大，需要重新测 rejoin、RSSI、APS 成功率，再调整 `ZIGBEE_NODE_TX_POWER_DBM`。
-- 该设置每次启动由固件重新配置，不依赖 Zigbee NVRAM，不改变 PANID、channel、短地址或安全凭据。
+- 当前决策已升级为 ATPC 自动发射功率控制：节点启动并完成 `esp_zb_init()` 后先使用安全功率 `-10 dBm`，之后按入网失败和 APS 失败自动在 `-10/0/+8/+14/+18/+20 dBm` 档位之间提升；LQI 仅作诊断，长期高 LQI 时才允许降低已学到的高功率。
+- 节点移动后不再需要手工修改固定功率；复位后以 -10 dBm 安全启动，远距离会在定时确认失败后逐级提升。
+- 详见 `docs/ATPC_TX_POWER_DESIGN.md`。该设置每次启动由固件重新配置，不依赖 Zigbee NVRAM，不改变 PANID、channel、短地址或安全凭据。
 - 标准 `on/off/toggle` 命令具有幂等性：当节点已经是 off 时再次收到 off，ZBOSS 可能不再产生 `ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID`，因此节点不会出现新的 `RELAY OFF` 或状态报告；网关已转发 ZCL 命令，后续周期遥测继续显示 `on_off=0`，这不属于链路失败。
 
 ### c. 后端命令状态闭环

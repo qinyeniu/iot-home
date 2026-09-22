@@ -1,0 +1,54 @@
+I (194) esp_image: segment 3: paddr=000e6164 vaddr=4080eaf0 sizeZBOSS: nwk/zb_nwk_ed_aging.c:227   ED aging is not supported
+I (16252) zb-sensor: DATA: {"temp":31.1,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (16252) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (21732) zb-sensor: RF power cmd=3 power=-10 seq=1: ESP_OK
+I (26912) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (26912) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (37572) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (37572) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (48232) zb-sensor: DATA: {"temp":31.1,"hum":71.8,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (48232) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (58892) zb-sensor: DATA: {"temp":31.1,"hum":71.8,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (58892) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (69552) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (69552) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (69952) zb-sensor: REPORT_STATS: rounds=7 repairs=0 i2c_th_fail=0 i2c_lux_fail=0 i2c_resets=0 i2c_reinits=0 attempts=21 queued=21 queue_fail=0 items_failed=0 aps_ok=20 aps_fail=0 unavail=0 recovered=0 candidate=0/0 probe_resteer=0 probes=0/0 probe_aps_fail=0 th_invalid=0 lux_invalid=0 th_streak=0 lux_streak=0
+I (80212) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (80212) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (90872) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (90872) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (101532) zb-sensor: DATA: {"temp":31.1,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (101532) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (112192) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (112192) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (122852) zb-sensor: DATA: {"temp":31.1,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (122852) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (133512) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (133512) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (133912) zb-sensor: REPORT_STATS: rounds=13 repairs=0 i2c_th_fail=0 i2c_lux_fail=0 i2c_resets=0 i2c_reinits=0 attempts=39 queued=39 queue_fail=0 items_failed=0 aps_ok=38 aps_fail=0 unavail=0 recovered=0 candidate=0/0 probe_resteer=0 probes=0/0 probe_aps_fail=0 th_invalid=0 lux_invalid=0 th_streak=0 lux_streak=0
+I (144172) zb-sensor: DATA: {"temp":31.1,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (144172) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (154832) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (154832) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (165492) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (165492) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (176152) zb-sensor: DATA: {"temp":31.1,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (176152) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (186812) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (186812) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (197472) zb-sensor: DATA: {"temp":31.0,"hum":71.8,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (197472) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (197872) zb-sensor: REPORT_STATS: rounds=19 repairs=0 i2c_th_fail=0 i2c_lux_fail=0 i2c_resets=0 i2c_reinits=0 attempts=57 queued=57 queue_fail=0 items_failed=0 aps_ok=56 aps_fail=0 unavail=0 recovered=0 candidate=0/0 probe_resteer=0 probes=0/0 probe_aps_fail=0 th_invalid=0 lux_invalid=0 th_streak=0 lux_streak=0
+I (208132) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (208132) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (218792) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (218792) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (229452) zb-sensor: DATA: {"temp":31.1,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (229452) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (240112) zb-sensor: DATA: {"temp":31.1,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (240112) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (250772) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (250772) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (261432) zb-sensor: DATA: {"temp":31.0,"hum":71.9,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (261432) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (261832) zb-sensor: REPORT_STATS: rounds=25 repairs=0 i2c_th_fail=0 i2c_lux_fail=0 i2c_resets=0 i2c_reinits=0 attempts=75 queued=75 queue_fail=0 items_failed=0 aps_ok=74 aps_fail=0 unavail=0 recovered=0 candidate=0/0 probe_resteer=0 probes=0/0 probe_aps_fail=0 th_invalid=0 lux_invalid=0 th_streak=0 lux_streak=0

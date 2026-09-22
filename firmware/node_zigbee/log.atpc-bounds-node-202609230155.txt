@@ -1,0 +1,98 @@
+I (194) esp_image: segment 3: paddr=000e6324 vaddr=4080ea20 sizeI (75543) zb-sensor: Zigbee: steering timer, bdb status=3 forced=1
+ZBOSS: commissioning/bdb/zdo_commissioning_bdb.c:349   dev type 2, joined 1, ext_pan_id 1, authenticated 1, tclk_valid 1
+ZBOSS: zdo/zdo_app_join.c:771   CONGRATULATIONS! joined status 0, addr 0x82cb, iface_id 0, ch 26, rejoin 1
+ZBOSS: zdo/zdo_app_join.c:773   xpanid 98:88:e0:ff:fe:70:90:dc
+ZBOSS: commissioning/bdb/zdo_commissioning_bdb.c:549   COMMISSIONING_STOP: app signal 6 comm status 14
+W (75833) zb-sensor: Zigbee: Startup/rejoin failed (0xffffffff), bdb status=14; retry steering
+I (75833) zb-sensor: Zigbee: connected (rejoin APS verification); short addr=0x82cb
+I (75833) zb-sensor: Zigbee: provisional rejoin accepted; verify with sparse APS probe
+ZBOSS: commissioning/bdb/zdo_commissioning_bdb.c:349   dev type 2, joined 1, ext_pan_id 1, authenticated 1, tclk_valid 1
+ZBOSS: nwk/nwk_join.c:629   Rejoin failure: no dev with xpanid 98:88:e0:ff:fe:70:90:dc or can't choose best parent
+ZBOSS: commissioning/bdb/zdo_commissioning_bdb.c:549   COMMISSIONING_STOP: app signal 6 comm status 3
+W (76083) zb-sensor: Zigbee: Startup/rejoin failed (0xffffffff), bdb status=3; retry steering
+I (76083) zb-sensor: Zigbee: ignore late reboot commissioning status=3 while connected
+W (77843) zb-sensor: Zigbee: active parent-link probe #5 sent seq=21 cluster=0x0402
+W (77843) zb-sensor: Zigbee: provisional rejoin probe seq=21 failed APS; retry 2/10 in 2500 ms
+W (77843) zb-sensor: Zigbee: parent unavailable event=6 while probe verification is pending
+W (80353) zb-sensor: Zigbee: active parent-link probe #6 sent seq=22 cluster=0x0402
+W (80353) zb-sensor: Zigbee: provisional rejoin probe seq=22 failed APS; retry 3/10 in 2500 ms
+W (80353) zb-sensor: Zigbee: parent unavailable event=7 while probe verification is pending
+W (82863) zb-sensor: Zigbee: active parent-link probe #7 sent seq=23 cluster=0x0402
+W (82863) zb-sensor: Zigbee: provisional rejoin probe seq=23 failed APS; retry 4/10 in 2500 ms
+W (82863) zb-sensor: Zigbee: parent unavailable event=8 while probe verification is pending
+W (85373) zb-sensor: Zigbee: active parent-link probe #8 sent seq=24 cluster=0x0402
+W (85373) zb-sensor: Zigbee: provisional rejoin probe seq=24 failed APS; retry 5/10 in 2500 ms
+W (85373) zb-sensor: Zigbee: parent unavailable event=9 while probe verification is pending
+W (87883) zb-sensor: Zigbee: active parent-link probe #9 sent seq=25 cluster=0x0402
+W (87883) zb-sensor: Zigbee: provisional rejoin probe seq=25 failed APS; retry 6/10 in 2500 ms
+W (87883) zb-sensor: Zigbee: parent unavailable event=10 while probe verification is pending
+W (90393) zb-sensor: Zigbee: active parent-link probe #10 sent seq=26 cluster=0x0402
+W (90393) zb-sensor: Zigbee: provisional rejoin probe seq=26 failed APS; retry 7/10 in 2500 ms
+W (90393) zb-sensor: Zigbee: parent unavailable event=11 while probe verification is pending
+W (92903) zb-sensor: Zigbee: active parent-link probe #11 sent seq=27 cluster=0x0402
+W (92903) zb-sensor: Zigbee: provisional rejoin probe seq=27 failed APS; retry 8/10 in 2500 ms
+W (92903) zb-sensor: Zigbee: parent unavailable event=12 while probe verification is pending
+W (95413) zb-sensor: Zigbee: active parent-link probe #12 sent seq=28 cluster=0x0402
+W (95413) zb-sensor: Zigbee: provisional rejoin probe seq=28 failed APS; retry 9/10 in 2500 ms
+W (95413) zb-sensor: Zigbee: parent unavailable event=13 while probe verification is pending
+W (97923) zb-sensor: Zigbee: active parent-link probe #13 sent seq=29 cluster=0x0402
+W (97923) zb-sensor: Zigbee: provisional rejoin probe seq=29 failed APS; retry 10/10 in 2500 ms
+W (97923) zb-sensor: Zigbee: parent unavailable event=14 while probe verification is pending
+W (100433) zb-sensor: Zigbee: active parent-link probe #14 sent seq=30 cluster=0x0402
+W (100433) zb-sensor: Zigbee: active parent-link probe seq=30 failed APS after 10 attempts; wait for 30000 ms verification timeout
+W (100433) zb-sensor: Zigbee: parent unavailable event=15 while probe verification is pending
+W (105843) zb-sensor: Zigbee: parent unavailable probe had no APS success; resteer now (verify_resteers=2)
+W (105843) zb-sensor: Zigbee: link lost signal=60 status=0x0; mark offline and steer again
+I (105893) zb-sensor: Waiting for Zigbee network...
+I (106853) zb-sensor: Zigbee: steering timer, bdb status=3 forced=1
+ZBOSS: commissioning/bdb/zdo_commissioning_bdb.c:349   dev type 2, joined 1, ext_pan_id 1, authenticated 1, tclk_valid 1
+ZBOSS: zdo/zdo_app_join.c:771   CONGRATULATIONS! joined status 0, addr 0x82cb, iface_id 0, ch 26, rejoin 1
+ZBOSS: zdo/zdo_app_join.c:773   xpanid 98:88:e0:ff:fe:70:90:dc
+ZBOSS: commissioning/bdb/zdo_commissioning_bdb.c:549   COMMISSIONING_STOP: app signal 6 comm status 0
+I (107123) zb-sensor: Zigbee: Device started
+I (107123) zb-sensor: Zigbee: connected (device reboot); short addr=0x82cb
+I (108153) zb-sensor: DATA: {"temp":31.0,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (108153) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (108553) zb-sensor: REPORT_STATS: rounds=6 repairs=1 i2c_th_fail=0 i2c_lux_fail=0 i2c_resets=0 i2c_reinits=0 attempts=25 queued=19 queue_fail=6 items_failed=2 aps_ok=14 aps_fail=4 unavail=15 recovered=0 candidate=0/1 probe_resteer=2 probes=14/1 probe_aps_fail=14 th_invalid=0 lux_invalid=0 th_streak=0 lux_streak=0
+I (114623) zb-sensor: RF power cmd=3 power=-10 seq=1: ESP_OK
+I (118813) zb-sensor: DATA: {"temp":31.0,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (118813) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (129473) zb-sensor: DATA: {"temp":30.9,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (129473) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (140133) zb-sensor: DATA: {"temp":31.0,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (140133) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (150793) zb-sensor: DATA: {"temp":31.0,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (150793) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (161453) zb-sensor: DATA: {"temp":31.0,"hum":72.1,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (161453) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (172113) zb-sensor: DATA: {"temp":31.0,"hum":72.1,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (172113) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (172513) zb-sensor: REPORT_STATS: rounds=12 repairs=1 i2c_th_fail=0 i2c_lux_fail=0 i2c_resets=0 i2c_reinits=0 attempts=43 queued=37 queue_fail=6 items_failed=2 aps_ok=32 aps_fail=4 unavail=15 recovered=0 candidate=0/1 probe_resteer=2 probes=14/1 probe_aps_fail=14 th_invalid=0 lux_invalid=0 th_streak=0 lux_streak=0
+I (182773) zb-sensor: DATA: {"temp":30.9,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (182773) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (193433) zb-sensor: DATA: {"temp":30.9,"hum":72.1,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (193433) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (204093) zb-sensor: DATA: {"temp":31.0,"hum":72.1,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (204093) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (214753) zb-sensor: DATA: {"temp":31.0,"hum":72.1,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (214753) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (225413) zb-sensor: DATA: {"temp":31.0,"hum":72.0,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (225413) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (236073) zb-sensor: DATA: {"temp":31.0,"hum":72.0,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (236073) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (236473) zb-sensor: REPORT_STATS: rounds=18 repairs=1 i2c_th_fail=0 i2c_lux_fail=0 i2c_resets=0 i2c_reinits=0 attempts=61 queued=55 queue_fail=6 items_failed=2 aps_ok=48 aps_fail=4 unavail=15 recovered=0 candidate=0/1 probe_resteer=2 probes=14/1 probe_aps_fail=14 th_invalid=0 lux_invalid=0 th_streak=0 lux_streak=0
+I (246733) zb-sensor: DATA: {"temp":30.9,"hum":72.1,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (246733) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (257393) zb-sensor: DATA: {"temp":30.9,"hum":72.1,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (257393) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (268053) zb-sensor: DATA: {"temp":30.9,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (268053) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (278713) zb-sensor: DATA: {"temp":30.9,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (278713) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (289373) zb-sensor: DATA: {"temp":30.9,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (289373) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (300033) zb-sensor: DATA: {"temp":31.0,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (300033) zb-sensor: REPORT_SEND: reason=sample flags=0x07
+I (300433) zb-sensor: REPORT_STATS: rounds=24 repairs=1 i2c_th_fail=0 i2c_lux_fail=0 i2c_resets=0 i2c_reinits=0 attempts=79 queued=73 queue_fail=6 items_failed=2 aps_ok=68 aps_fail=4 unavail=15 recovered=0 candidate=0/1 probe_resteer=2 probes=14/1 probe_aps_fail=14 th_invalid=0 lux_invalid=0 th_streak=0 lux_streak=0
+I (310693) zb-sensor: DATA: {"temp":30.9,"hum":72.2,"lux":0.0,"addr":"0x82cb","th_ok":true,"lux_ok":true}
+I (310693) zb-sensor: REPORT_SEND: reason=sample flags=0x07

@@ -1,7 +1,7 @@
 # Zigbee 自动发射功率控制（ATPC）设计
 
 **更新时间**：2026-09-23  
-**状态**：代码已实现；节点/网关编译通过；近距离约 5 分钟硬件实测通过；自动功率上下限已做成安装配置项  
+**状态**：代码已实现并烧录；自动功率上下限已做成安装配置项；近距离 5 分钟及节点单独复位 3 分钟硬件实测通过  
 **适用设备**：ESP32-C6 传感器+继电器二合一节点、ESP32-C6 网关
 
 ## 1. 最终设计结论
@@ -207,11 +207,29 @@ ESP32-C6 芯片可支持约 **-15 dBm 到 +20 dBm**。当前默认自动策略�
 - unavail=0、recovered=0、probe_resteer=0；
 - I2C failures/resets/reinits=0。
 
-### 实测日志
+### 实测日志（01:12 基线）
 
 - 节点：`firmware/node_zigbee/log.atpc-failure-driven-node-20260923011224.txt`
 - 网关：`firmware/gateway/log.atpc-failure-driven-gw-20260923011144.txt`
 - 固件备份：`backups/firmware/2026-09-23-failure-driven-atpc/`
+
+### 烧录后复验（02:06，约 3 分钟，网关保持运行、仅复位节点）
+
+- 节点烧录 COM5、网关烧录 COM6 后均正常启动；
+- 节点最终统计：`aps_fail=0`、`queue_fail=0`、`items_failed=0`、I2C failures=0；
+- 期间出现 1 次 `parent unavailable`，独立探针立即成功，`recovered=1`，没有触发误升功率；
+- 网关在多个评估点记录 `RF power: keep -10 dBm`，LQI EMA 约 24–25；
+- MQTT 遥测持续到达。
+
+日志：
+
+- 节点：`firmware/node_zigbee/log.atpc-bounds-nodeonly-202609230206.txt`
+- 网关：`firmware/gateway/log.atpc-bounds-gw-nodeonly-202609230206.txt`
+- 固件备份：`backups/firmware/2026-09-23-configurable-atpc-bounds/`
+
+### 已知边界：节点/网关同时冷启动
+
+烧录后的同启观察中，节点前约 106 秒出现过一次父链路验证不一致，随后自动 resteer 并恢复，恢复后持续保持 -10 dBm。因此当前策略可以自恢复，但同启时的完全收敛可能需要约 2 分钟。后续可优化为网关先启动、节点延迟加入，或进一步缩短验证/重导时间。
 
 ## 8. 后续可选增强
 

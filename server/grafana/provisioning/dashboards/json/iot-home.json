@@ -588,6 +588,234 @@
         "align": false,
         "alignLevel": null
       }
+    },
+    {
+      "datasource": "MySQL",
+      "aliasColors": {},
+      "bars": false,
+      "dashes": false,
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "fill": 0,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "id": 7,
+      "legend": {
+        "show": true,
+        "values": false,
+        "current": true
+      },
+      "lines": true,
+      "linewidth": 2,
+      "nullPointMode": "null",
+      "options": {
+        "alertThreshold": {
+          "conditions": [],
+          "execution": "cumulative"
+        }
+      },
+      "percentage": false,
+      "pluginVersion": "7.5.0",
+      "pointradius": 3,
+      "points": true,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "steppedLine": true,
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS time, value AS tx_power_dbm\nFROM metrics\nWHERE device_id = '$device_id'\n  AND metric = 'tx_power_dbm'\n  AND ts >= NOW() - INTERVAL $hours HOUR\nORDER BY ts",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "title": "节点发射功率趋势（dBm）",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "mode": "time",
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "dBm",
+          "label": "发射功率",
+          "logBase": 1,
+          "min": -10,
+          "max": 20,
+          "show": true
+        },
+        {
+          "format": "short",
+          "logBase": 1,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "datasource": "MySQL",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "自动",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "手动",
+                  "color": "yellow"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 12,
+        "y": 22
+      },
+      "id": 8,
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "7.5.0",
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS time, value\nFROM metrics\nWHERE device_id = '$device_id'\n  AND metric = 'rf_mode'\n  AND ts >= NOW() - INTERVAL $hours HOUR\nORDER BY ts DESC\nLIMIT 1",
+          "refId": "A"
+        }
+      ],
+      "title": "RF 模式当前状态",
+      "type": "stat"
+    },
+    {
+      "datasource": "MySQL",
+      "aliasColors": {},
+      "bars": false,
+      "dashes": false,
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "fill": 0,
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 18,
+        "y": 22
+      },
+      "id": 9,
+      "legend": {
+        "show": true,
+        "values": false,
+        "current": true
+      },
+      "lines": true,
+      "linewidth": 2,
+      "nullPointMode": "null",
+      "options": {
+        "alertThreshold": {
+          "conditions": [],
+          "execution": "cumulative"
+        }
+      },
+      "percentage": false,
+      "pluginVersion": "7.5.0",
+      "pointradius": 3,
+      "points": true,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "steppedLine": true,
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS time, value AS rf_mode\nFROM metrics\nWHERE device_id = '$device_id'\n  AND metric = 'rf_mode'\n  AND ts >= NOW() - INTERVAL $hours HOUR\nORDER BY ts",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "title": "RF 模式记录（0=自动 1=手动）",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "mode": "time",
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "short",
+          "min": 0,
+          "max": 1,
+          "show": true
+        },
+        {
+          "format": "short",
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
     }
   ],
   "refresh": "10s",
@@ -674,5 +902,5 @@
   "timezone": "Asia/Shanghai",
   "title": "IoT-Home 环境监测",
   "uid": "iot-home-dashboard",
-  "version": 1
+  "version": 2
 }

@@ -115,10 +115,10 @@ class Deployer:
         print("\n========== 验收（只读） ==========")
         self.run("curl -s http://localhost:8000/api/health")
         self.run(
-            f"cd {REMOTE_DIR}/server && {('docker compose -f ' + COMPOSE_FILE)} "
-            "exec -T mysql sh -c 'mysql -u\"$MYSQL_USER\" -p\"$MYSQL_PASSWORD\" "
-            "\"$MYSQL_DATABASE\" -e \"SHOW COLUMNS FROM metrics LIKE "
-            "\\'received_at\\';\"'"
+            f"cd {REMOTE_DIR}/server && docker compose -f {COMPOSE_FILE} "
+            "exec -T mysql sh -c 'exec mysql -u$MYSQL_USER "
+            "-p$MYSQL_PASSWORD $MYSQL_DATABASE'",
+            stdin_data=b"SHOW COLUMNS FROM metrics LIKE 'received_at';\n",
         )
         self.run("docker logs --tail 15 iot-backend 2>&1")
         print(

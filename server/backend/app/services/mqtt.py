@@ -153,7 +153,9 @@ class MQTTService:
                 if msg_type == "telemetry":
                     await self._handle_telemetry(gateway_id, node_id, payload)
                 elif msg_type == "status":
-                    await self._handle_status(gateway_id, node_id, payload)
+                    await self._handle_status(
+                        gateway_id, node_id, payload, message.retain
+                    )
         except Exception as e:
             logger.error("处理消息失败: %s", e)
 
@@ -255,8 +257,15 @@ class MQTTService:
         gateway_id: str,
         node_id: str,
         payload: dict[str, Any],
+        retained: bool = False,
     ) -> None:
-        """处理设备状态"""
+        """处理设备状态。
+
+        后端（重新）订阅时 broker 会投递 retained 状态；它可能是很久以前
+        的最后状态，不能当作新的心跳刷新 last_seen，否则设备刚掉线时会
+        因后端重启被误判在线。非 retained 的状态由设备/网关切实发出，
+        才更新心跳时间。
+        """
         device_id = f"{gateway_id}-{node_id}"
         status = payload.get("status", "unknown")
 
@@ -268,9 +277,15 @@ class MQTTService:
                 if status in ("online", "offline"):
                     device = await session.get(Device, device_id)
                     device.status = status
-                    device.last_seen = datetime.now()
+                    if not retained:
+                        device.last_seen = datetime.now()
                     await session.commit()
-                    logger.info("设备状态更新: %s -> %s", device_id, status)
+                    logger.info(
+                        "设备状态更新: %s -> %s%s",
+                        device_id,
+                        status,
+                        " (retained, last_seen 未更新)" if retained else "",
+                    )
             except Exception as e:
                 await session.rollback()
                 logger.error("更新设备状态失败: %s", e)

@@ -82,6 +82,19 @@ static volatile bool s_wifi_ever_connected = false;
 static esp_mqtt_client_handle_t s_mqtt = NULL;
 static bool s_wifi_ok = false;
 static bool s_mqtt_ok = false;
+
+// Outage buffer for non-retained telemetry (definition of storage and
+// helpers follows below, after mqtt_start()).
+#define MQTT_OUTBOX_LEN 30
+typedef struct {
+    char topic_suffix[64];
+    char payload[192];
+} mqtt_outbox_msg_t;
+static QueueHandle_t s_mqtt_outbox;
+static StaticQueue_t s_mqtt_outbox_struct;
+static mqtt_outbox_msg_t s_mqtt_outbox_storage[MQTT_OUTBOX_LEN];
+static void mqtt_outbox_store(const char *topic_suffix, const char *data);
+
 static char s_ip[16] = "0.0.0.0";
 static bool s_network_formed = false;
 static bool s_child_seen = false;
@@ -588,7 +601,11 @@ static void oled_text(int x, int y, const char *s)
 #define INSTALLCODE_POLICY_ENABLE   false
 #define ESP_ZB_CHANNEL_MASK         (1l << 26)  // Channel 26
 #define ZB_ONLY_RF_DIAG             0  // Temporary RF/coexistence diagnostic
-#define ZB_JOIN_BEFORE_WIFI         1  // Commission on 802.15.4 before enabling Wi-Fi
+// Wi-Fi now coexists safely with Zigbee (dedicated stack loop and RF
+// priority fixes landed earlier). Waiting for a node before bringing up
+// Wi-Fi used to delay cloud reconnection by 3-5 minutes whenever no node
+// was present, so the commissioning-first path is disabled.
+#define ZB_JOIN_BEFORE_WIFI         0  // Bring Wi-Fi/MQTT up in parallel with Zigbee
 #define ZB_JOIN_FIRST_TIMEOUT_MS    180000
 #define ZB_REJOIN_FIRST_TIMEOUT_MS 300000
 
@@ -1319,23 +1336,104 @@ static void mqtt_start(void)
             .retain = true,
         },
     };
+    if (s_mqtt_outbox == NULL) {
+        s_mqtt_outbox = xQueueCreateStatic(
+            MQTT_OUTBOX_LEN, sizeof(mqtt_outbox_msg_t),
+            (uint8_t *)s_mqtt_outbox_storage, &s_mqtt_outbox_struct);
+    }
+
     s_mqtt = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_cb, NULL);
     esp_mqtt_client_start(s_mqtt);
     ESP_LOGI(TAG, "MQTT starting: %s", MQTT_BROKER_URI);
 }
 
-void mqtt_pub_retained(const char *topic_suffix, const char *data, bool retain)
+// Outage buffer: while Wi-Fi/MQTT is down, telemetry used to be dropped
+// silently. A bounded FIFO keeps the newest MQTT_OUTBOX_LEN non-retained
+// messages (~5 minutes at one frame per 10 s); when full, oldest frames are
+// dropped first. Retained status messages stay best-effort because a
+// status_resync is published automatically after every reconnect.
+
+
+static bool mqtt_try_publish(const char *topic_suffix, const char *data,
+                             bool retain)
 {
-    if (!s_mqtt_ok) return;
     char topic[128];
     snprintf(topic, sizeof(topic), "%s/%s", MQTT_TOPIC_PREFIX, topic_suffix);
-    esp_mqtt_client_publish(s_mqtt, topic, data, 0, 1, retain ? 1 : 0);
+    // Returns message id (>0) when accepted, -1 when the client cannot send.
+    int msg_id = esp_mqtt_client_publish(s_mqtt, topic, data, 0, 1,
+                                         retain ? 1 : 0);
+    return msg_id >= 0;
+}
+
+static void mqtt_outbox_store(const char *topic_suffix, const char *data)
+{
+    mqtt_outbox_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    strlcpy(msg.topic_suffix, topic_suffix, sizeof(msg.topic_suffix));
+    strlcpy(msg.payload, data, sizeof(msg.payload));
+
+    if (xQueueSend(s_mqtt_outbox, &msg, 0) != pdTRUE) {
+        mqtt_outbox_msg_t dropped;
+        // Bounded buffer: discard the oldest telemetry first.
+        xQueueReceive(s_mqtt_outbox, &dropped, 0);
+        xQueueSend(s_mqtt_outbox, &msg, 0);
+        ESP_LOGW(TAG, "MQTT outbox full; oldest telemetry dropped: %s",
+                 dropped.topic_suffix);
+    }
+}
+
+void mqtt_pub_retained(const char *topic_suffix, const char *data, bool retain)
+{
+    // Retained status is republished by zb_publish_known_statuses() after a
+    // reconnect, so it does not need to occupy the telemetry outbox.
+    if (retain) {
+        if (s_mqtt_ok) {
+            mqtt_try_publish(topic_suffix, data, true);
+        }
+        return;
+    }
+
+    if (s_mqtt_ok && uxQueueMessagesWaiting(s_mqtt_outbox) == 0) {
+        if (mqtt_try_publish(topic_suffix, data, false)) {
+            return;
+        }
+        ESP_LOGW(TAG, "MQTT publish rejected; buffering telemetry: %s",
+                 topic_suffix);
+    }
+    mqtt_outbox_store(topic_suffix, data);
 }
 
 void mqtt_pub(const char *topic_suffix, const char *data)
 {
     mqtt_pub_retained(topic_suffix, data, false);
+}
+
+// Drain buffered telemetry oldest-first after reconnect. Called from the
+// Zigbee forward task loop. Stops early if the MQTT client rejects a frame;
+// the same message is retried on the next cycle.
+static void mqtt_outbox_flush(void)
+{
+    if (!s_mqtt_ok) {
+        return;
+    }
+
+    int flushed = 0;
+    while (flushed < 10) {
+        mqtt_outbox_msg_t msg;
+        if (xQueuePeek(s_mqtt_outbox, &msg, 0) != pdTRUE) {
+            break;
+        }
+        if (!mqtt_try_publish(msg.topic_suffix, msg.payload, false)) {
+            break;
+        }
+        xQueueReceive(s_mqtt_outbox, &msg, 0);
+        flushed++;
+    }
+
+    if (flushed > 0) {
+        ESP_LOGI(TAG, "MQTT outbox flushed: %d buffered message(s)", flushed);
+    }
 }
 
 // ==================== Tasks ====================
@@ -1810,6 +1908,7 @@ static void zb_forward_task(void *arg)
             zb_publish_known_statuses();
         }
         zb_forward_pending();
+        mqtt_outbox_flush();
 
         uint32_t app_drops = s_zb_app_drops_task + s_zb_app_drops_isr;
         if (app_drops != reported_app_drops &&

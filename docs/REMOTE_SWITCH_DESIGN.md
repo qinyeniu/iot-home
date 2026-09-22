@@ -62,6 +62,14 @@ MQTT_EVENT_DATA 中，当 topic 匹配 `.../nodes/{node}/cmd`：
 
 节点仍是 Zigbee End Device，并设置 rx-on-when-idle，以便云端命令无需等待本地轮询即可到达。
 
+### e. 近距离发射功率与幂等命令（2026-09-22 22:20）
+
+- 实测根因：节点与网关在桌面近距离摆放时，节点按默认高功率发射会造成网关 802.15.4 接收端饱和/阻塞。现象是节点持续 rejoin failure，而网关侧看不到 child/rejoin 请求。
+- 当前决策：节点启动并完成 `esp_zb_init()` 后，立即调用 `esp_zb_set_tx_power(-10)`，并通过 `esp_zb_get_tx_power()` 打印实际值；启动日志确认 `Zigbee TX power=-10 dBm`。
+- `-10 dBm` 是当前“同桌面近距离联调”的固定值，不是通用生产值。若以后节点与网关距离变大，需要重新测 rejoin、RSSI、APS 成功率，再调整 `ZIGBEE_NODE_TX_POWER_DBM`。
+- 该设置每次启动由固件重新配置，不依赖 Zigbee NVRAM，不改变 PANID、channel、短地址或安全凭据。
+- 标准 `on/off/toggle` 命令具有幂等性：当节点已经是 off 时再次收到 off，ZBOSS 可能不再产生 `ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID`，因此节点不会出现新的 `RELAY OFF` 或状态报告；网关已转发 ZCL 命令，后续周期遥测继续显示 `on_off=0`，这不属于链路失败。
+
 ### c. 后端命令状态闭环
 
 - 新增 `server/backend/app/services/command_ack.py` 与 `command_timeout.py`；
@@ -92,6 +100,24 @@ MQTT_EVENT_DATA 中，当 topic 匹配 `.../nodes/{node}/cmd`：
 6. 温湿度/光照每 10 秒上报持续正常，完整数据包中包含 `on_off`。
 7. 云端 metrics 表已能查询 `metric=on_off`。
 8. 可靠性增强后复测：打开状态第一次尝试即 APS acknowledged；关闭后云端最新值恢复为 0，传感器上报持续正常。
+
+### 3.1 重新上电后复验（2026-09-22 22:23-22:24）
+
+用户重新上电后，使用既有串口监视器与 MQTT 订阅完成复验：
+
+| 时间 | 命令 | 节点/网关证据 | 回报状态 |
+|---|---|---|---|
+| 22:23:46 | on | 节点 `RELAY ON`，状态帧一次 APS acknowledged | `on_off=1` |
+| 22:23:58 | off | 节点 `RELAY OFF`，状态帧一次 APS acknowledged | `on_off=0` |
+| 22:24:10 | toggle | 节点 `RELAY ON`，状态帧一次 APS acknowledged | `on_off=1` |
+| 22:24:22 | toggle | 节点 `RELAY OFF`，状态帧一次 APS acknowledged | `on_off=0` |
+| 22:24:34 | off（重复幂等） | 网关 `CMD fwd ... zcl_seq=9`；节点状态未变化，无新继电器日志 | 后续遥测持续为 0 |
+
+截至 22:32，节点上电后连续运行约 20 分钟，短地址始终为 `0x82cb`，温湿度/光照遥测持续。期间出现过一次父链路短暂不可用提示，节点主动探测在约 20 ms 内恢复；未触发重新 steering/rejoin，I2C 故障计数为 0。
+
+后端使用项目虚拟环境复跑：**50 passed / 3 skipped**。
+
+最终正式应用固件已备份到：`backups/firmware/2026-09-22-low-tx-power/`。
 
 命令状态闭环代码已完成，20 项后端测试通过；因本次未部署/重启远端后端，也未执行现有数据库迁移，尚未在云服务器上实测 commands 状态从 `sent` 自动变为 `acknowledged/timeout/superseded`。
 

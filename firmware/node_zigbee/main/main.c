@@ -90,6 +90,8 @@
 
 #define INSTALLCODE_POLICY      false
 #define ESP_ZB_CHANNEL_MASK     (1l << 26)
+// Close-range bring-up: avoid receiver overload on the neighboring gateway.
+#define ZIGBEE_NODE_TX_POWER_DBM (-10)
 
 // Zigbee End Device config
 #define ESP_ZB_ZED_CONFIG()                         \
@@ -1600,6 +1602,10 @@ static void zigbee_task(void *arg)
 
     esp_zb_cfg_t zb_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_cfg);
+    esp_zb_set_tx_power(ZIGBEE_NODE_TX_POWER_DBM);
+    int8_t configured_tx_power = 0;
+    esp_zb_get_tx_power(&configured_tx_power);
+    ESP_LOGI(TAG, "Zigbee TX power=%d dBm", configured_tx_power);
     // Temporary diagnostic: keep this ZED receiver on instead of sleepy polling.
     esp_zb_set_rx_on_when_idle(true);
     ESP_LOGI(TAG, "RX-on-when-idle=%d", esp_zb_get_rx_on_when_idle());

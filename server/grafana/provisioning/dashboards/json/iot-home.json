@@ -78,7 +78,9 @@
           "select": [
             [
               {
-                "params": ["value"],
+                "params": [
+                  "value"
+                ],
                 "type": "column"
               }
             ]
@@ -89,7 +91,9 @@
           "where": [
             {
               "name": "",
-              "params": ["ts"],
+              "params": [
+                "ts"
+              ],
               "type": "macro"
             }
           ]
@@ -194,7 +198,9 @@
           "select": [
             [
               {
-                "params": ["value"],
+                "params": [
+                  "value"
+                ],
                 "type": "column"
               }
             ]
@@ -205,7 +211,9 @@
           "where": [
             {
               "name": "",
-              "params": ["ts"],
+              "params": [
+                "ts"
+              ],
               "type": "macro"
             }
           ]
@@ -310,7 +318,9 @@
           "select": [
             [
               {
-                "params": ["value"],
+                "params": [
+                  "value"
+                ],
                 "type": "column"
               }
             ]
@@ -321,7 +331,9 @@
           "where": [
             {
               "name": "",
-              "params": ["ts"],
+              "params": [
+                "ts"
+              ],
               "type": "macro"
             }
           ]
@@ -398,7 +410,9 @@
           "select": [
             [
               {
-                "params": ["value"],
+                "params": [
+                  "value"
+                ],
                 "type": "column"
               }
             ]
@@ -409,7 +423,9 @@
           "where": [
             {
               "name": "",
-              "params": ["ts"],
+              "params": [
+                "ts"
+              ],
               "type": "macro"
             }
           ]
@@ -418,12 +434,169 @@
       "title": "最近数据",
       "transformations": [],
       "type": "table"
+    },
+    {
+      "datasource": "MySQL",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "已关闭",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "已开启",
+                  "color": "green"
+                }
+              }
+            },
+            {
+              "type": "null",
+              "options": {
+                "text": "无数据"
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "pluginVersion": "7.5.0",
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS time, value\nFROM metrics\nWHERE device_id = '$device_id'\n  AND metric = 'on_off'\n  AND ts >= NOW() - INTERVAL $hours HOUR\nORDER BY ts DESC\nLIMIT 1",
+          "refId": "A"
+        }
+      ],
+      "title": "开关当前状态",
+      "type": "stat"
+    },
+    {
+      "datasource": "MySQL",
+      "aliasColors": {},
+      "bars": false,
+      "dashes": false,
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "fill": 0,
+      "gridPos": {
+        "h": 6,
+        "w": 18,
+        "x": 6,
+        "y": 16
+      },
+      "id": 6,
+      "legend": {
+        "show": true,
+        "values": false,
+        "current": true
+      },
+      "lines": true,
+      "linewidth": 2,
+      "nullPointMode": "null",
+      "options": {
+        "alertThreshold": {
+          "conditions": [],
+          "execution": "cumulative"
+        }
+      },
+      "percentage": false,
+      "pluginVersion": "7.5.0",
+      "pointradius": 3,
+      "points": true,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "steppedLine": true,
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS time, value AS on_off\nFROM metrics\nWHERE device_id = '$device_id'\n  AND metric = 'on_off'\n  AND ts >= NOW() - INTERVAL $hours HOUR\nORDER BY ts",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "title": "开关状态记录（0=关 1=开）",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "mode": "time",
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "min": 0,
+          "max": 1,
+          "show": true
+        },
+        {
+          "format": "short",
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
     }
   ],
   "refresh": "10s",
   "schemaVersion": 27,
   "style": "dark",
-  "tags": ["iot", "home"],
+  "tags": [
+    "iot",
+    "home"
+  ],
   "templating": {
     "list": [
       {
@@ -503,4 +676,3 @@
   "uid": "iot-home-dashboard",
   "version": 1
 }
-

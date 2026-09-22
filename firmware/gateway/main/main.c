@@ -73,11 +73,15 @@
 #define RF_POWER_CLUSTER_ID     0xFC10
 #define RF_PACKET_MAGIC0        0x52
 #define RF_PACKET_MAGIC1        0x46
-#define RF_PACKET_VERSION       1
-#define RF_PACKET_LEN           6
+#define RF_PACKET_VERSION       2
+#define RF_PACKET_V1_LEN        6
+#define RF_PACKET_LEN           8
 #define RF_CMD_QUERY            1
 #define RF_CMD_SET              2
 #define RF_CMD_REPORT           3
+#define RF_MODE_AUTO            0
+#define RF_MODE_MANUAL          1
+#define RF_MODE_UNKNOWN         0xFF
 #define RF_POWER_UNKNOWN_DBM       (-128)
 // One-time installation bounds. Values must exist in s_rf_power_table below.
 // The controller still starts/reconciles from the node and does not use
@@ -107,6 +111,7 @@ _Static_assert(RF_POWER_LEVEL_IS_SUPPORTED(RF_POWER_AUTO_MAX_DBM),
 
 // Forward declarations
 void mqtt_pub(const char *topic_suffix, const char *data);
+void mqtt_pub_retained(const char *topic_suffix, const char *data, bool retain);
 
 // ==================== Globals ====================
 
@@ -302,6 +307,7 @@ static int s_rf_lqi_ema = -1;
 static uint8_t s_rf_lqi_samples;
 static uint32_t s_rf_last_rx_ms;
 static int8_t s_rf_node_power_dbm = RF_POWER_UNKNOWN_DBM;
+static uint8_t s_rf_node_mode = RF_MODE_UNKNOWN;
 static uint8_t s_rf_packet_sequence;
 static uint32_t s_rf_last_eval_ms;
 static uint8_t s_rf_lqi_low_windows;
@@ -309,14 +315,23 @@ static uint8_t s_rf_lqi_high_windows;
 static bool s_rf_report_waiting;
 static uint8_t s_rf_expected_report_seq;
 static int8_t s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+static uint8_t s_rf_expected_report_mode = RF_MODE_UNKNOWN;
 static bool s_rf_last_report_seq_valid;
 static uint8_t s_rf_last_report_seq;
 static uint32_t s_rf_wait_started_ms;
 static uint32_t s_rf_power_confirmed_ms;
+static uint8_t s_rf_mode;
+static int8_t s_rf_manual_power_dbm;
+static bool s_rf_policy_apply_pending;
+static char s_rf_expected_request_id[17];
+static bool s_rf_expected_user_transaction;
+static bool s_rf_policy_user_transaction;
+static char s_rf_policy_request_id[17];
 static portMUX_TYPE s_rf_power_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static bool rf_power_known_active_child(uint16_t addr);
 static bool rf_power_is_table_value(int8_t power_dbm);
+static bool rf_power_request_id_valid(const char *request_id);
 
 static bool rf_power_is_monitored_cluster(uint16_t cluster_id)
 {
@@ -370,6 +385,87 @@ static uint8_t rf_power_max_index(void)
     return rf_power_nearest_index(RF_POWER_AUTO_MAX_DBM);
 }
 
+#define RF_POLICY_NVS_NAMESPACE     "rfpol"
+
+static const char *rf_power_mode_name(uint8_t mode)
+{
+    if (mode == RF_MODE_MANUAL) {
+        return "manual";
+    }
+    if (mode == RF_MODE_AUTO) {
+        return "auto";
+    }
+    return "unknown";
+}
+
+static bool rf_power_policy_values_valid(uint8_t mode, int8_t manual_power_dbm)
+{
+    return (mode == RF_MODE_AUTO || mode == RF_MODE_MANUAL) &&
+           rf_power_is_allowed_value(manual_power_dbm);
+}
+
+static void rf_power_policy_persist(uint8_t mode, int8_t manual_power_dbm)
+{
+    nvs_handle_t handle;
+
+    if (nvs_open(RF_POLICY_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGW(TAG, "RF power policy persistence namespace unavailable");
+        return;
+    }
+
+    esp_err_t err = nvs_set_u8(handle, "mode", mode);
+    if (err == ESP_OK) {
+        err = nvs_set_i8(handle, "mpwr", manual_power_dbm);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RF power policy persistence failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static void rf_set_policy_request_id_locked(const char *request_id)
+{
+    s_rf_policy_request_id[0] = '\0';
+    if (rf_power_request_id_valid(request_id)) {
+        strlcpy(s_rf_policy_request_id, request_id,
+                sizeof(s_rf_policy_request_id));
+    }
+}
+
+static void rf_power_policy_init(void)
+{
+    uint8_t mode = RF_MODE_AUTO;
+    int8_t manual_power_dbm = RF_POWER_AUTO_MIN_DBM;
+    nvs_handle_t handle;
+
+    if (nvs_open(RF_POLICY_NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
+        uint8_t stored_mode = RF_MODE_AUTO;
+        int8_t stored_manual_power = RF_POWER_AUTO_MIN_DBM;
+        esp_err_t mode_err = nvs_get_u8(handle, "mode", &stored_mode);
+        esp_err_t power_err = nvs_get_i8(handle, "mpwr", &stored_manual_power);
+        nvs_close(handle);
+
+        if (mode_err == ESP_OK && power_err == ESP_OK &&
+            rf_power_policy_values_valid(stored_mode, stored_manual_power)) {
+            mode = stored_mode;
+            manual_power_dbm = stored_manual_power;
+        } else {
+            ESP_LOGW(TAG, "RF power policy storage invalid; using defaults");
+        }
+    }
+
+    s_rf_mode = mode;
+    s_rf_manual_power_dbm = manual_power_dbm;
+    s_rf_policy_apply_pending = false;
+    s_rf_policy_user_transaction = false;
+    s_rf_policy_request_id[0] = '\0';
+    ESP_LOGI(TAG, "RF power policy: mode=%s manual=%d dBm",
+             rf_power_mode_name(mode), (int)manual_power_dbm);
+}
+
 static void rf_power_forget_node(uint16_t addr)
 {
     taskENTER_CRITICAL(&s_rf_power_lock);
@@ -379,15 +475,22 @@ static void rf_power_forget_node(uint16_t addr)
         s_rf_lqi_samples = 0;
         s_rf_last_rx_ms = 0;
         s_rf_node_power_dbm = RF_POWER_UNKNOWN_DBM;
+        s_rf_node_mode = RF_MODE_UNKNOWN;
         s_rf_lqi_low_windows = 0;
         s_rf_lqi_high_windows = 0;
         s_rf_report_waiting = false;
         s_rf_expected_report_seq = 0;
         s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+        s_rf_expected_report_mode = RF_MODE_UNKNOWN;
         s_rf_last_report_seq_valid = false;
         s_rf_last_report_seq = 0;
         s_rf_wait_started_ms = 0;
         s_rf_power_confirmed_ms = 0;
+        s_rf_policy_apply_pending = false;
+        s_rf_expected_request_id[0] = '\0';
+        s_rf_expected_user_transaction = false;
+        s_rf_policy_user_transaction = false;
+        s_rf_policy_request_id[0] = '\0';
     }
     taskEXIT_CRITICAL(&s_rf_power_lock);
 }
@@ -406,15 +509,24 @@ static void rf_power_reset_for_announce(uint16_t addr)
     s_rf_lqi_samples = 0;
     s_rf_last_rx_ms = now;
     s_rf_node_power_dbm = RF_POWER_UNKNOWN_DBM;
+    s_rf_node_mode = RF_MODE_UNKNOWN;
     s_rf_lqi_low_windows = 0;
     s_rf_lqi_high_windows = 0;
     s_rf_report_waiting = false;
     s_rf_expected_report_seq = 0;
     s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+    s_rf_expected_report_mode = RF_MODE_UNKNOWN;
     s_rf_last_report_seq_valid = false;
     s_rf_last_report_seq = 0;
     s_rf_wait_started_ms = 0;
     s_rf_power_confirmed_ms = 0;
+    s_rf_policy_apply_pending = s_rf_policy_user_transaction ||
+                                 (s_rf_mode == RF_MODE_MANUAL);
+    s_rf_expected_user_transaction = false;
+    s_rf_expected_request_id[0] = '\0';
+    if (!s_rf_policy_user_transaction) {
+        s_rf_policy_request_id[0] = '\0';
+    }
     s_rf_last_eval_ms = 0;
     taskEXIT_CRITICAL(&s_rf_power_lock);
 }
@@ -451,18 +563,127 @@ typedef enum {
     RF_REJECT_OLD,
 } rf_reject_reason_t;
 
+static void rf_power_publish_state(uint16_t addr, int8_t power_dbm,
+                                   uint8_t node_mode, const char *state,
+                                   const char *request_id)
+{
+    char suffix[64];
+    cJSON *root = cJSON_CreateObject();
+
+    if (root == NULL) {
+        return;
+    }
+
+    snprintf(suffix, sizeof(suffix), "nodes/zb-%04x/rf_policy",
+             (unsigned)addr);
+    cJSON_AddStringToObject(root, "mode",
+                            rf_power_mode_name(node_mode));
+    if (power_dbm == RF_POWER_UNKNOWN_DBM) {
+        cJSON_AddNullToObject(root, "power_dbm");
+    } else {
+        cJSON_AddNumberToObject(root, "power_dbm", (int)power_dbm);
+    }
+    cJSON_AddStringToObject(root, "status", state);
+    if (request_id == NULL || request_id[0] == '\0') {
+        cJSON_AddNullToObject(root, "request_id");
+    } else {
+        cJSON_AddStringToObject(root, "request_id", request_id);
+    }
+    cJSON_AddStringToObject(root, "desired_mode",
+                            rf_power_mode_name(s_rf_mode));
+    cJSON_AddNumberToObject(root, "desired_manual_power_dbm",
+                            (int)s_rf_manual_power_dbm);
+
+    char *payload = cJSON_PrintUnformatted(root);
+    if (payload != NULL) {
+        mqtt_pub_retained(suffix, payload, true);
+    }
+    cJSON_free(payload);
+    cJSON_Delete(root);
+}
+
+static void rf_power_publish_querying(uint16_t addr, const char *request_id)
+{
+    rf_power_publish_state(addr, RF_POWER_UNKNOWN_DBM,
+                           RF_MODE_UNKNOWN, "querying", request_id);
+}
+
+static bool rf_power_request_id_valid(const char *request_id)
+{
+    size_t len = 0;
+
+    if (request_id == NULL) {
+        return false;
+    }
+    len = strlen(request_id);
+    if (len == 0 || len >= sizeof(s_rf_expected_request_id)) {
+        return false;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        char ch = request_id[i];
+        bool ok = (ch >= 'a' && ch <= 'z') ||
+                  (ch >= 'A' && ch <= 'Z') ||
+                  (ch >= '0' && ch <= '9') ||
+                  ch == '_' || ch == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void rf_power_set_request_id_locked(const char *request_id)
+{
+    s_rf_expected_request_id[0] = '\0';
+    if (rf_power_request_id_valid(request_id)) {
+        strlcpy(s_rf_expected_request_id, request_id,
+                sizeof(s_rf_expected_request_id));
+    }
+}
+
+static void rf_power_clear_waiting_locked(void)
+{
+    s_rf_report_waiting = false;
+    s_rf_expected_report_seq = 0;
+    s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+    s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+    s_rf_expected_user_transaction = false;
+    s_rf_expected_request_id[0] = '\0';
+    s_rf_wait_started_ms = 0;
+}
+
+// Called while s_rf_power_lock is held. Once the deadline passes, a late,
+// otherwise exact REPORT must no longer confirm the original user transaction.
+static bool rf_power_expire_waiting_if_due_locked(uint32_t now)
+{
+    if (!s_rf_report_waiting || s_rf_wait_started_ms == 0 ||
+        now - s_rf_wait_started_ms < RF_POWER_SETTLE_MS) {
+        return false;
+    }
+
+    rf_power_clear_waiting_locked();
+    return true;
+}
+
 static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
 {
     bool is_private = ind.cluster_id == RF_POWER_CLUSTER_ID;
     bool power_report = false;
     bool accept_report = false;
+    bool packet_v1 = false;
+    bool packet_v2 = false;
     int8_t reported_power = 0;
+    uint8_t reported_mode = RF_MODE_UNKNOWN;
     uint8_t report_seq = 0;
     uint8_t expected_seq = 0;
+    uint8_t expected_mode = RF_MODE_UNKNOWN;
     int8_t expected_power = RF_POWER_UNKNOWN_DBM;
     uint8_t last_seq = 0;
+    bool expected_user = false;
     int8_t recent_rssi = -127;
     bool old_power_unknown = true;
+    bool matched_transaction = false;
+    char response_request_id[17] = {0};
     rf_reject_reason_t reject_reason = RF_REJECT_NONE;
 
     if (!rf_power_is_monitored_cluster(ind.cluster_id)) {
@@ -480,10 +701,19 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
     }
 
     if (is_private) {
-        if (ind.asdu_length != RF_PACKET_LEN || ind.asdu == NULL ||
+        if (ind.asdu == NULL) {
+            reject_reason = RF_REJECT_MALFORMED;
+            return true;
+        }
+
+        packet_v1 = ind.asdu_length == RF_PACKET_V1_LEN &&
+                    ind.asdu[2] == 1;
+        packet_v2 = ind.asdu_length == RF_PACKET_LEN &&
+                    ind.asdu[2] == RF_PACKET_VERSION;
+
+        if ((!packet_v1 && !packet_v2) ||
             ind.asdu[0] != RF_PACKET_MAGIC0 ||
-            ind.asdu[1] != RF_PACKET_MAGIC1 ||
-            ind.asdu[2] != RF_PACKET_VERSION) {
+            ind.asdu[1] != RF_PACKET_MAGIC1) {
             reject_reason = RF_REJECT_MALFORMED;
             return true;
         }
@@ -492,6 +722,15 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
         if (ind.asdu[3] == RF_CMD_REPORT) {
             reported_power = (int8_t)ind.asdu[5];
             power_report = true;
+            if (packet_v2) {
+                reported_mode = ind.asdu[6];
+                if ((reported_mode != RF_MODE_AUTO &&
+                     reported_mode != RF_MODE_MANUAL) ||
+                    ind.asdu[7] != 0) {
+                    reject_reason = RF_REJECT_MALFORMED;
+                    return true;
+                }
+            }
         } else {
             reject_reason = RF_REJECT_UNEXPECTED_CMD;
             return true;
@@ -503,6 +742,7 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
     bool active_child = rf_power_known_active_child(ind.src_short_addr);
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
     taskENTER_CRITICAL(&s_rf_power_lock);
+    (void)rf_power_expire_waiting_if_due_locked(now);
     if (active_child) {
         s_rf_node_addr = ind.src_short_addr;
         s_rf_last_rx_ms = now;
@@ -510,7 +750,9 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
 
     if (power_report) {
         expected_seq = s_rf_expected_report_seq;
+        expected_mode = s_rf_expected_report_mode;
         expected_power = s_rf_expected_report_power;
+        expected_user = s_rf_expected_user_transaction;
         last_seq = s_rf_last_report_seq;
         old_power_unknown = s_rf_node_power_dbm == RF_POWER_UNKNOWN_DBM;
 
@@ -519,12 +761,20 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
         } else if (!rf_power_is_allowed_value(reported_power)) {
             reject_reason = RF_REJECT_INVALID_POWER;
         } else if (s_rf_report_waiting) {
-            if (report_seq == expected_seq &&
+            if (packet_v2 &&
+                report_seq == expected_seq &&
                 (expected_power == RF_POWER_UNKNOWN_DBM ||
-                 reported_power == expected_power)) {
+                 reported_power == expected_power) &&
+                (expected_mode == RF_MODE_UNKNOWN ||
+                 reported_mode == expected_mode)) {
                 accept_report = true;
+                matched_transaction = expected_user;
+                strlcpy(response_request_id, s_rf_expected_request_id,
+                        sizeof(response_request_id));
+                s_rf_expected_request_id[0] = '\0';
                 s_rf_report_waiting = false;
                 s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+                s_rf_expected_report_mode = RF_MODE_UNKNOWN;
                 s_rf_wait_started_ms = 0;
             } else {
                 reject_reason = RF_REJECT_MISMATCH;
@@ -538,6 +788,19 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
 
     if (accept_report) {
         s_rf_node_power_dbm = reported_power;
+        s_rf_node_mode = packet_v2 ? reported_mode : RF_MODE_UNKNOWN;
+        if (!s_rf_policy_user_transaction && packet_v2 &&
+            ((s_rf_mode == RF_MODE_MANUAL &&
+              reported_mode == RF_MODE_MANUAL &&
+              reported_power == s_rf_manual_power_dbm) ||
+             (s_rf_mode == RF_MODE_AUTO &&
+              reported_mode == RF_MODE_AUTO))) {
+            s_rf_policy_apply_pending = false;
+            s_rf_policy_request_id[0] = '\0';
+        }
+        if (s_rf_policy_apply_pending) {
+            s_rf_last_eval_ms = 0;
+        }
         s_rf_last_report_seq = report_seq;
         s_rf_last_report_seq_valid = true;
         s_rf_power_confirmed_ms = now;
@@ -566,9 +829,16 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
     }
     if (accept_report) {
         ESP_LOGI(TAG,
-                 "RF power: report accepted from %s to %d dBm seq=%u",
+                 "RF power: report accepted from %s to %s/%d dBm seq=%u",
                  old_power_unknown ? "unknown" : "previous",
+                 rf_power_mode_name(reported_mode),
                  (int)reported_power, report_seq);
+        rf_power_publish_state(ind.src_short_addr, reported_power,
+                                reported_mode,
+                                matched_transaction ? "confirmed"
+                                                   : "report_received",
+                                matched_transaction ? response_request_id
+                                                   : NULL);
     } else if (reject_reason == RF_REJECT_UNSECURED) {
         ESP_LOGW(TAG, "RF power: reject unsecured frame cluster=0x%04x",
                  (unsigned)ind.cluster_id);
@@ -586,9 +856,11 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
                  (int)reported_power);
     } else if (reject_reason == RF_REJECT_MISMATCH) {
         ESP_LOGW(TAG,
-                 "RF power: reject mismatched report seq=%u expected=%u power=%d expected=%d",
+                 "RF power: reject mismatched report seq=%u expected=%u power=%d expected=%d mode=%s expected=%s",
                  report_seq, expected_seq,
-                 (int)reported_power, (int)expected_power);
+                 (int)reported_power, (int)expected_power,
+                 rf_power_mode_name(reported_mode),
+                 rf_power_mode_name(expected_mode));
     } else if (reject_reason == RF_REJECT_OLD) {
         ESP_LOGW(TAG,
                  "RF power: reject duplicate/old report seq=%u last=%u",
@@ -599,10 +871,14 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
 }
 
 static esp_err_t rf_power_send_to_node(uint8_t command, int8_t power_dbm,
-                                       uint8_t *sent_seq)
+                                       uint8_t mode, uint8_t *sent_seq)
 {
     uint8_t seq = 0;
     uint16_t addr = 0;
+
+    if (mode != RF_MODE_AUTO && mode != RF_MODE_MANUAL) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
     taskENTER_CRITICAL(&s_rf_power_lock);
     addr = s_rf_node_addr;
@@ -620,6 +896,8 @@ static esp_err_t rf_power_send_to_node(uint8_t command, int8_t power_dbm,
         command,
         seq,
         (uint8_t)power_dbm,
+        mode,
+        0,
     };
     esp_zb_apsde_data_req_t req = {
         .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
@@ -637,12 +915,191 @@ static esp_err_t rf_power_send_to_node(uint8_t command, int8_t power_dbm,
         .radius = 10,
     };
     esp_err_t err = esp_zb_aps_data_request(&req);
-    ESP_LOGI(TAG, "RF power -> node=0x%04x cmd=%u power=%d seq=%u: %s",
-             (unsigned)addr, command, power_dbm, seq, esp_err_to_name(err));
+    ESP_LOGI(TAG, "RF power -> node=0x%04x cmd=%u power=%d mode=%s seq=%u: %s",
+             (unsigned)addr, command, power_dbm, rf_power_mode_name(mode),
+             seq, esp_err_to_name(err));
+    if (err != ESP_OK) {
+        taskENTER_CRITICAL(&s_rf_power_lock);
+        s_rf_expected_request_id[0] = '\0';
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+    }
     if (err == ESP_OK && sent_seq != NULL) {
         *sent_seq = seq;
     }
     return err;
+}
+
+static void rf_power_remote_query(const char *request_id)
+{
+    uint16_t addr = 0;
+    bool report_waiting = false;
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    addr = s_rf_node_addr;
+    report_waiting = s_rf_report_waiting;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (addr == 0) {
+        ESP_LOGW(TAG, "RF power: QUERY requested before node became active");
+        return;
+    }
+    if (report_waiting) {
+        ESP_LOGW(TAG, "RF power: QUERY ignored while another report is pending");
+        return;
+    }
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    s_rf_expected_user_transaction = true;
+    rf_power_set_request_id_locked(request_id);
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+    request_id = s_rf_expected_request_id[0] != '\0' ? s_rf_expected_request_id : NULL;
+
+    uint8_t sent_seq = 0;
+    rf_power_publish_querying(addr, request_id);
+    if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq) == ESP_OK) {
+        taskENTER_CRITICAL(&s_rf_power_lock);
+        s_rf_report_waiting = true;
+        s_rf_expected_report_seq = sent_seq;
+        s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+        s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+        s_rf_expected_user_transaction = true;
+        s_rf_wait_started_ms = now;
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+    } else {
+        taskENTER_CRITICAL(&s_rf_power_lock);
+        s_rf_expected_user_transaction = false;
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+    }
+}
+
+static void rf_power_remote_set_manual(int8_t target_power_dbm, const char *request_id)
+{
+    uint16_t addr = 0;
+    int8_t current_power_dbm = RF_POWER_UNKNOWN_DBM;
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+
+    if (!rf_power_is_allowed_value(target_power_dbm)) {
+        ESP_LOGW(TAG, "RF power: reject remote target=%d dBm", (int)target_power_dbm);
+        return;
+    }
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    s_rf_mode = RF_MODE_MANUAL;
+    s_rf_manual_power_dbm = target_power_dbm;
+    s_rf_policy_apply_pending = true;
+    s_rf_report_waiting = false;
+    s_rf_expected_report_seq = 0;
+    s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+    s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+    s_rf_expected_user_transaction = false;
+    s_rf_expected_request_id[0] = '\0';
+    s_rf_wait_started_ms = 0;
+    s_rf_last_eval_ms = 0;
+    s_rf_policy_user_transaction = true;
+    rf_set_policy_request_id_locked(request_id);
+    addr = s_rf_node_addr;
+    current_power_dbm = s_rf_node_power_dbm;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    rf_power_policy_persist(RF_MODE_MANUAL, target_power_dbm);
+
+    if (addr == 0) {
+        ESP_LOGI(TAG, "RF power: manual policy saved; apply when node joins");
+        return;
+    }
+    if (current_power_dbm == RF_POWER_UNKNOWN_DBM) {
+        uint8_t sent_seq = 0;
+        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq) == ESP_OK) {
+            taskENTER_CRITICAL(&s_rf_power_lock);
+            s_rf_report_waiting = true;
+            s_rf_expected_report_seq = sent_seq;
+            s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+            s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+            s_rf_expected_user_transaction = false;
+            s_rf_expected_request_id[0] = '\0';
+            s_rf_wait_started_ms = now;
+            taskEXIT_CRITICAL(&s_rf_power_lock);
+        }
+        return;
+    }
+
+    uint8_t sent_seq = 0;
+    if (rf_power_send_to_node(RF_CMD_SET, target_power_dbm, RF_MODE_MANUAL, &sent_seq) == ESP_OK) {
+        taskENTER_CRITICAL(&s_rf_power_lock);
+        s_rf_report_waiting = true;
+        s_rf_expected_report_seq = sent_seq;
+        s_rf_expected_report_power = target_power_dbm;
+        s_rf_expected_report_mode = RF_MODE_MANUAL;
+        s_rf_expected_user_transaction = s_rf_policy_user_transaction;
+        strlcpy(s_rf_expected_request_id, s_rf_policy_request_id, sizeof(s_rf_expected_request_id));
+        s_rf_policy_user_transaction = false;
+        s_rf_policy_request_id[0] = '\0';
+        s_rf_wait_started_ms = now;
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+    }
+}
+
+static void rf_power_remote_set_auto(const char *request_id)
+{
+    uint16_t addr = 0;
+    int8_t current_power_dbm = RF_POWER_UNKNOWN_DBM;
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    s_rf_mode = RF_MODE_AUTO;
+    s_rf_policy_apply_pending = true;
+    s_rf_report_waiting = false;
+    s_rf_expected_report_seq = 0;
+    s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+    s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+    s_rf_expected_user_transaction = false;
+    s_rf_expected_request_id[0] = '\0';
+    s_rf_wait_started_ms = 0;
+    s_rf_last_eval_ms = 0;
+    s_rf_policy_user_transaction = true;
+    rf_set_policy_request_id_locked(request_id);
+    addr = s_rf_node_addr;
+    current_power_dbm = s_rf_node_power_dbm;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    rf_power_policy_persist(RF_MODE_AUTO, s_rf_manual_power_dbm);
+    ESP_LOGI(TAG, "RF power: automatic policy enabled");
+
+    if (addr == 0) {
+        ESP_LOGI(TAG, "RF power: automatic policy saved; apply when node joins");
+        return;
+    }
+    if (current_power_dbm == RF_POWER_UNKNOWN_DBM) {
+        uint8_t sent_seq = 0;
+        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq) == ESP_OK) {
+            taskENTER_CRITICAL(&s_rf_power_lock);
+            s_rf_report_waiting = true;
+            s_rf_expected_report_seq = sent_seq;
+            s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+            s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+            s_rf_expected_user_transaction = false;
+            s_rf_expected_request_id[0] = '\0';
+            s_rf_wait_started_ms = now;
+            taskEXIT_CRITICAL(&s_rf_power_lock);
+        }
+        return;
+    }
+
+    uint8_t sent_seq = 0;
+    if (rf_power_send_to_node(RF_CMD_SET, current_power_dbm, RF_MODE_AUTO, &sent_seq) == ESP_OK) {
+        taskENTER_CRITICAL(&s_rf_power_lock);
+        s_rf_report_waiting = true;
+        s_rf_expected_report_seq = sent_seq;
+        s_rf_expected_report_power = current_power_dbm;
+        s_rf_expected_report_mode = RF_MODE_AUTO;
+        s_rf_expected_user_transaction = s_rf_policy_user_transaction;
+        strlcpy(s_rf_expected_request_id, s_rf_policy_request_id, sizeof(s_rf_expected_request_id));
+        s_rf_policy_user_transaction = false;
+        s_rf_policy_request_id[0] = '\0';
+        s_rf_wait_started_ms = now;
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+    }
 }
 
 static void rf_power_controller_periodic(void)
@@ -654,6 +1111,12 @@ static void rf_power_controller_periodic(void)
     uint8_t samples = 0;
     int8_t current_power = 0;
     int8_t target_power = 0;
+    uint8_t mode = RF_MODE_AUTO;
+    uint8_t node_mode = RF_MODE_UNKNOWN;
+    int8_t manual_power = RF_POWER_AUTO_MIN_DBM;
+    bool policy_pending = false;
+    bool policy_user = false;
+    char policy_request_id[17] = {0};
     bool report_waiting = false;
     uint32_t wait_started_ms = 0;
     uint32_t confirmed_ms = 0;
@@ -669,6 +1132,13 @@ static void rf_power_controller_periodic(void)
     link_lqi = s_rf_lqi_ema;
     samples = s_rf_lqi_samples;
     current_power = s_rf_node_power_dbm;
+    node_mode = s_rf_node_mode;
+    mode = s_rf_mode;
+    manual_power = s_rf_manual_power_dbm;
+    policy_pending = s_rf_policy_apply_pending;
+    policy_user = s_rf_policy_user_transaction;
+    strlcpy(policy_request_id, s_rf_policy_request_id,
+            sizeof(policy_request_id));
     report_waiting = s_rf_report_waiting;
     wait_started_ms = s_rf_wait_started_ms;
     confirmed_ms = s_rf_power_confirmed_ms;
@@ -683,9 +1153,17 @@ static void rf_power_controller_periodic(void)
         s_rf_lqi_ema = -1;
         s_rf_lqi_low_windows = 0;
         s_rf_lqi_high_windows = 0;
+        s_rf_node_mode = RF_MODE_UNKNOWN;
         s_rf_report_waiting = false;
+        s_rf_expected_report_seq = 0;
         s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+        s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+        s_rf_expected_user_transaction = false;
+        s_rf_expected_request_id[0] = '\0';
         s_rf_wait_started_ms = 0;
+        s_rf_policy_apply_pending = true;
+        s_rf_policy_user_transaction = false;
+        s_rf_policy_request_id[0] = '\0';
         taskEXIT_CRITICAL(&s_rf_power_lock);
         return;
     }
@@ -693,11 +1171,15 @@ static void rf_power_controller_periodic(void)
                           now - wait_started_ms >= RF_POWER_SETTLE_MS;
     if (current_power == RF_POWER_UNKNOWN_DBM || wait_timed_out) {
         uint8_t sent_seq = 0;
-        if (rf_power_send_to_node(RF_CMD_QUERY, 0, &sent_seq) == ESP_OK) {
+        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO,
+                                  &sent_seq) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
             s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+            s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+            s_rf_expected_user_transaction = false;
+            s_rf_expected_request_id[0] = '\0';
             s_rf_wait_started_ms = now;
             taskEXIT_CRITICAL(&s_rf_power_lock);
         }
@@ -707,11 +1189,15 @@ static void rf_power_controller_periodic(void)
         now - confirmed_ms >= RF_POWER_RECONCILE_MS) {
         uint8_t sent_seq = 0;
         ESP_LOGI(TAG, "RF power: periodic reconcile current=%d dBm", current_power);
-        if (rf_power_send_to_node(RF_CMD_QUERY, 0, &sent_seq) == ESP_OK) {
+        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO,
+                                  &sent_seq) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
             s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
+            s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+            s_rf_expected_user_transaction = false;
+            s_rf_expected_request_id[0] = '\0';
             s_rf_wait_started_ms = now;
             taskEXIT_CRITICAL(&s_rf_power_lock);
         }
@@ -722,6 +1208,125 @@ static void rf_power_controller_periodic(void)
                  s_rf_expected_report_seq, current_power);
         return;
     }
+
+    if (mode == RF_MODE_MANUAL) {
+        if (node_mode == RF_MODE_MANUAL &&
+            current_power == manual_power) {
+            bool already_confirmed = false;
+            char response_request_id[17] = {0};
+
+            if (policy_pending) {
+                taskENTER_CRITICAL(&s_rf_power_lock);
+                bool state_still_matches =
+                    s_rf_policy_apply_pending &&
+                    s_rf_policy_user_transaction == policy_user &&
+                    s_rf_mode == RF_MODE_MANUAL &&
+                    s_rf_node_addr == addr &&
+                    s_rf_node_mode == RF_MODE_MANUAL &&
+                    s_rf_manual_power_dbm == manual_power &&
+                    s_rf_node_power_dbm == manual_power;
+
+                if (policy_user) {
+                    state_still_matches = state_still_matches &&
+                        rf_power_request_id_valid(policy_request_id) &&
+                        strcmp(s_rf_policy_request_id,
+                               policy_request_id) == 0;
+                } else {
+                    state_still_matches = state_still_matches &&
+                        s_rf_policy_request_id[0] == '\0';
+                }
+
+                // Do not consume a newer transaction if this periodic snapshot
+                // was overtaken before publication.
+                if (state_still_matches) {
+                    if (policy_user) {
+                        strlcpy(response_request_id, policy_request_id,
+                                sizeof(response_request_id));
+                        already_confirmed = true;
+                    }
+                    s_rf_policy_apply_pending = false;
+                    s_rf_policy_user_transaction = false;
+                    s_rf_policy_request_id[0] = '\0';
+                }
+                taskEXIT_CRITICAL(&s_rf_power_lock);
+            }
+            if (already_confirmed) {
+                rf_power_publish_state(addr, manual_power, RF_MODE_MANUAL,
+                                       "confirmed", response_request_id);
+            }
+            return;
+        }
+        ESP_LOGW(TAG,
+                 "RF power: manual policy mismatch actual=%s/%d dBm desired=%d dBm; reconcile",
+                 rf_power_mode_name(node_mode), (int)current_power,
+                 (int)manual_power);
+        policy_pending = true;
+    } else if (mode == RF_MODE_AUTO && node_mode == RF_MODE_MANUAL) {
+        ESP_LOGW(TAG,
+                 "RF power: node is manual but desired is automatic; reconcile");
+        policy_pending = true;
+    }
+
+    if (policy_pending) {
+        uint8_t sent_seq = 0;
+
+        if (mode == RF_MODE_MANUAL) {
+            if (current_power == manual_power &&
+                node_mode == RF_MODE_MANUAL && !policy_user) {
+                taskENTER_CRITICAL(&s_rf_power_lock);
+                s_rf_policy_apply_pending = false;
+                s_rf_policy_user_transaction = false;
+                s_rf_policy_request_id[0] = '\0';
+                taskEXIT_CRITICAL(&s_rf_power_lock);
+                return;
+            }
+            target_power = manual_power;
+            if (rf_power_send_to_node(RF_CMD_SET, target_power,
+                                      RF_MODE_MANUAL,
+                                      &sent_seq) == ESP_OK) {
+                taskENTER_CRITICAL(&s_rf_power_lock);
+                s_rf_report_waiting = true;
+                s_rf_expected_report_seq = sent_seq;
+                s_rf_expected_report_power = target_power;
+                s_rf_expected_report_mode = RF_MODE_MANUAL;
+                s_rf_expected_user_transaction = policy_user;
+                strlcpy(s_rf_expected_request_id, s_rf_policy_request_id, sizeof(s_rf_expected_request_id));
+                s_rf_policy_user_transaction = false;
+                s_rf_policy_request_id[0] = '\0';
+                s_rf_wait_started_ms = now;
+                taskEXIT_CRITICAL(&s_rf_power_lock);
+            }
+            return;
+        }
+
+        if (node_mode == RF_MODE_AUTO && !policy_user) {
+            taskENTER_CRITICAL(&s_rf_power_lock);
+            s_rf_policy_apply_pending = false;
+            s_rf_policy_user_transaction = false;
+            s_rf_policy_request_id[0] = '\0';
+            taskEXIT_CRITICAL(&s_rf_power_lock);
+            return;
+        }
+
+        target_power = current_power;
+        if (rf_power_send_to_node(RF_CMD_SET, target_power,
+                                  RF_MODE_AUTO,
+                                  &sent_seq) == ESP_OK) {
+            taskENTER_CRITICAL(&s_rf_power_lock);
+            s_rf_report_waiting = true;
+            s_rf_expected_report_seq = sent_seq;
+            s_rf_expected_report_power = target_power;
+            s_rf_expected_report_mode = RF_MODE_AUTO;
+            s_rf_expected_user_transaction = policy_user;
+            strlcpy(s_rf_expected_request_id, s_rf_policy_request_id, sizeof(s_rf_expected_request_id));
+            s_rf_policy_user_transaction = false;
+            s_rf_policy_request_id[0] = '\0';
+            s_rf_wait_started_ms = now;
+            taskEXIT_CRITICAL(&s_rf_power_lock);
+        }
+        return;
+    }
+
     if (samples < RF_POWER_SAMPLES_NEEDED) {
         ESP_LOGI(TAG, "RF power: wait samples=%u/%u lqi_ema=%d",
                  samples, RF_POWER_SAMPLES_NEEDED, link_lqi);
@@ -770,13 +1375,15 @@ static void rf_power_controller_periodic(void)
 
     target_power = s_rf_power_table[target_index];
     uint8_t sent_seq = 0;
-    if (rf_power_send_to_node(RF_CMD_SET, target_power, &sent_seq) == ESP_OK) {
+    if (rf_power_send_to_node(RF_CMD_SET, target_power, RF_MODE_AUTO,
+                              &sent_seq) == ESP_OK) {
         // Queue acceptance is not proof. Accept only the node's encrypted
-        // REPORT carrying this request sequence and requested power.
+        // REPORT carrying this request sequence, requested power and mode.
         taskENTER_CRITICAL(&s_rf_power_lock);
         s_rf_report_waiting = true;
         s_rf_expected_report_seq = sent_seq;
         s_rf_expected_report_power = target_power;
+        s_rf_expected_report_mode = RF_MODE_AUTO;
         s_rf_wait_started_ms = now;
         taskEXIT_CRITICAL(&s_rf_power_lock);
     }
@@ -1767,6 +2374,28 @@ static void wifi_start(void)
 
 // ==================== MQTT ====================
 
+static cJSON *rf_command_payload_holder(cJSON *root)
+{
+    cJSON *payload = cJSON_GetObjectItem(root, "payload");
+    return cJSON_IsObject(payload) ? payload : root;
+}
+
+static bool rf_command_get_i8(cJSON *holder, const char *key, int8_t *value)
+{
+    cJSON *item = cJSON_GetObjectItem(holder, key);
+    double number = 0.0;
+
+    if (!cJSON_IsNumber(item)) {
+        return false;
+    }
+    number = item->valuedouble;
+    if (number < -128.0 || number > 127.0 || number != (double)(int8_t)number) {
+        return false;
+    }
+    *value = (int8_t)number;
+    return true;
+}
+
 // Forward a cloud command delivered over MQTT to a Zigbee node as a
 // standard ZCL On/Off cluster command. Topic convention:
 //   {prefix}/{gateway}/nodes/{node}/cmd
@@ -1806,8 +2435,38 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
         return;
     }
     cJSON *command = cJSON_GetObjectItem(root, "command");
+    cJSON *request_id_item = cJSON_GetObjectItem(root, "request_id");
+    const char *request_id = cJSON_IsString(request_id_item)
+                           ? request_id_item->valuestring : NULL;
     uint8_t cmd_id = 0xFF;
     if (cJSON_IsString(command)) {
+        const char *command_name = command->valuestring;
+        if (strcmp(command_name, "rf_query_power") == 0) {
+            ESP_LOGI(TAG, "CMD rf: node=0x%04x query", (unsigned)short_addr);
+            rf_power_remote_query(request_id);
+            cJSON_Delete(root);
+            return;
+        }
+        if (strcmp(command_name, "rf_set_auto") == 0) {
+            ESP_LOGI(TAG, "CMD rf: node=0x%04x automatic", (unsigned)short_addr);
+            rf_power_remote_set_auto(request_id);
+            cJSON_Delete(root);
+            return;
+        }
+        if (strcmp(command_name, "rf_set_power") == 0 ||
+            strcmp(command_name, "rf_manual_power") == 0) {
+            int8_t target_power_dbm = 0;
+            cJSON *holder = rf_command_payload_holder(root);
+            if (rf_command_get_i8(holder, "power_dbm", &target_power_dbm)) {
+                ESP_LOGI(TAG, "CMD rf: node=0x%04x set %d dBm",
+                         (unsigned)short_addr, (int)target_power_dbm);
+                rf_power_remote_set_manual(target_power_dbm, request_id);
+            } else {
+                ESP_LOGW(TAG, "CMD rf: missing/invalid power_dbm");
+            }
+            cJSON_Delete(root);
+            return;
+        }
         if (strcmp(command->valuestring, "on") == 0) {
             cmd_id = ESP_ZB_ZCL_CMD_ON_OFF_ON_ID;
         } else if (strcmp(command->valuestring, "off") == 0) {
@@ -2246,6 +2905,7 @@ static void zb_handle_join_event(const zb_app_event_t *event)
 
     zb_publish_node_status(&status_snap, is_new_child ? "device_joined" : "device_announce", true);
     rf_power_reset_for_announce(event->addr);
+    rf_power_publish_querying(event->addr, NULL);
 }
 
 static void zb_handle_leave_event(const zb_app_event_t *event)
@@ -2359,6 +3019,7 @@ static void zb_handle_report_event(const zb_app_event_t *event)
             ESP_LOGI(TAG, "Zigbee: Device active by report addr=0x%04x", event->addr);
             zb_persist_child_seen();
             rf_power_reset_for_announce(event->addr);
+            rf_power_publish_querying(event->addr, NULL);
             if (need_status) {
                 zb_publish_node_status(&status_snap, "device_active", true);
             }
@@ -2609,6 +3270,8 @@ void app_main(void)
         nvs_flash_erase();
         nvs_flash_init();
     }
+
+    rf_power_policy_init();
 
     {
         nvs_handle_t nvh;

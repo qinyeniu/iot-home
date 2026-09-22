@@ -86,11 +86,15 @@
 #define RF_POWER_CLUSTER_ID    0xFC10
 #define RF_PACKET_MAGIC0       0x52  // 'R'
 #define RF_PACKET_MAGIC1       0x46  // 'F'
-#define RF_PACKET_VERSION      1
-#define RF_PACKET_LEN          6
+#define RF_PACKET_VERSION      2
+#define RF_PACKET_V1_LEN       6
+#define RF_PACKET_LEN          8
 #define RF_CMD_QUERY           1
 #define RF_CMD_SET             2
 #define RF_CMD_REPORT          3
+#define RF_MODE_AUTO           0
+#define RF_MODE_MANUAL         1
+#define RF_MODE_UNKNOWN        0xFF
 #define RF_TASK_REMOTE_BIT     (1u << 0)
 #define RF_TASK_SAVE_BIT       (1u << 1)
 #define RF_TASK_REPORT_BIT     (1u << 2)
@@ -898,6 +902,8 @@ static SemaphoreHandle_t s_rf_apply_mutex;
 static portMUX_TYPE s_rf_power_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint8_t s_rf_remote_cmd;
 static volatile int8_t s_rf_remote_power;
+static volatile uint8_t s_rf_remote_mode;
+static uint8_t s_rf_mode;
 static uint8_t s_rf_aps_failures;
 static uint32_t s_rf_aps_window_start_ms;
 static uint8_t s_rf_commission_failures;
@@ -964,6 +970,7 @@ static void rf_power_init(void)
             ESP_LOGE(TAG, "RF power: apply mutex unavailable; only startup power can be used");
         }
     }
+    s_rf_mode = RF_MODE_AUTO;
     s_rf_power_min_index = rf_power_nearest_index(ZIGBEE_NODE_TX_POWER_AUTO_MIN_DBM);
     s_rf_power_max_index = rf_power_nearest_index(ZIGBEE_NODE_TX_POWER_AUTO_MAX_DBM);
     s_rf_power_index = rf_power_clamp_index(
@@ -1074,7 +1081,7 @@ static bool rf_power_apply_index(uint8_t index, const char *reason,
 }
 
 static esp_err_t rf_power_send_command(uint8_t command, int8_t power_dbm,
-                                       uint8_t sequence)
+                                       uint8_t mode, uint8_t sequence)
 {
     uint8_t asdu[RF_PACKET_LEN] = {
         RF_PACKET_MAGIC0,
@@ -1083,6 +1090,8 @@ static esp_err_t rf_power_send_command(uint8_t command, int8_t power_dbm,
         command,
         sequence,
         (uint8_t)power_dbm,
+        mode,
+        0,
     };
     esp_zb_apsde_data_req_t req = {
         .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
@@ -1100,17 +1109,18 @@ static esp_err_t rf_power_send_command(uint8_t command, int8_t power_dbm,
         .radius = REPORT_APS_RADIUS,
     };
     esp_err_t err = esp_zb_aps_data_request(&req);
-    ESP_LOGI(TAG, "RF power cmd=%u power=%d seq=%u: %s",
-             command, power_dbm, sequence, esp_err_to_name(err));
+    ESP_LOGI(TAG, "RF power cmd=%u power=%d mode=%u seq=%u: %s",
+             command, power_dbm, mode, sequence, esp_err_to_name(err));
     return err;
 }
 
 static void rf_power_handle_remote(uint8_t command, int8_t power_dbm,
-                                   uint8_t sequence)
+                                   uint8_t mode, uint8_t sequence)
 {
     taskENTER_CRITICAL(&s_rf_power_lock);
     s_rf_remote_cmd = command;
     s_rf_remote_power = power_dbm;
+    s_rf_remote_mode = mode;
     s_rf_remote_seq = sequence;
     taskEXIT_CRITICAL(&s_rf_power_lock);
     rf_power_task_notify(RF_TASK_REMOTE_BIT);
@@ -1135,13 +1145,28 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
         return true;
     }
 
-    if (ind.asdu_length == RF_PACKET_LEN && ind.asdu != NULL &&
+    bool packet_v1 = ind.asdu_length == RF_PACKET_V1_LEN &&
+                     ind.asdu != NULL && ind.asdu[2] == 1;
+    bool packet_v2 = ind.asdu_length == RF_PACKET_LEN &&
+                     ind.asdu != NULL && ind.asdu[2] == RF_PACKET_VERSION;
+
+    if ((packet_v1 || packet_v2) &&
         ind.asdu[0] == RF_PACKET_MAGIC0 &&
-        ind.asdu[1] == RF_PACKET_MAGIC1 &&
-        ind.asdu[2] == RF_PACKET_VERSION) {
+        ind.asdu[1] == RF_PACKET_MAGIC1) {
         uint8_t command = ind.asdu[3];
+        uint8_t remote_mode = RF_MODE_UNKNOWN;
+        if (packet_v2) {
+            remote_mode = ind.asdu[6];
+            if ((remote_mode != RF_MODE_AUTO &&
+                 remote_mode != RF_MODE_MANUAL) ||
+                ind.asdu[7] != 0) {
+                ESP_LOGW(TAG, "RF power: malformed policy/mode byte");
+                return true;
+            }
+        }
         if (command == RF_CMD_SET || command == RF_CMD_QUERY) {
-            rf_power_handle_remote(command, (int8_t)ind.asdu[5], ind.asdu[4]);
+            rf_power_handle_remote(command, (int8_t)ind.asdu[5],
+                                   remote_mode, ind.asdu[4]);
         } else {
             ESP_LOGW(TAG, "RF power: reject unexpected command=%u",
                      (unsigned)command);
@@ -1180,7 +1205,8 @@ static bool rf_power_raise_for_aps_if_due(void)
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
     taskENTER_CRITICAL(&s_rf_power_lock);
-    if (s_rf_aps_failures >= RF_APS_FAIL_LIMIT &&
+    if (s_rf_mode == RF_MODE_AUTO &&
+        s_rf_aps_failures >= RF_APS_FAIL_LIMIT &&
         s_rf_connected_ms != 0 &&
         now - s_rf_connected_ms >= RF_CONNECTED_SETTLE_MS &&
         (s_rf_last_local_raise_ms == 0 ||
@@ -1238,7 +1264,8 @@ static bool rf_power_raise_for_commission_if_due(void)
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
     taskENTER_CRITICAL(&s_rf_power_lock);
-    if (s_rf_commission_failures >= RF_COMMISSION_FAIL_LIMIT &&
+    if (s_rf_mode == RF_MODE_AUTO &&
+        s_rf_commission_failures >= RF_COMMISSION_FAIL_LIMIT &&
         s_rf_first_commission_failure_ms != 0 &&
         now - s_rf_first_commission_failure_ms >= RF_COMMISSION_GRACE_MS &&
         s_rf_power_index < s_rf_power_max_index) {
@@ -1273,24 +1300,45 @@ static void rf_power_task(void *arg)
         if ((notify_value & RF_TASK_REMOTE_BIT) != 0) {
             uint8_t command = 0;
             int8_t power_dbm = 0;
+            uint8_t request_mode = RF_MODE_UNKNOWN;
             uint8_t request_seq = 0;
 
             taskENTER_CRITICAL(&s_rf_power_lock);
             command = s_rf_remote_cmd;
             power_dbm = s_rf_remote_power;
+            request_mode = s_rf_remote_mode;
             request_seq = s_rf_remote_seq;
             s_rf_remote_cmd = 0;
+            s_rf_remote_mode = RF_MODE_UNKNOWN;
             taskEXIT_CRITICAL(&s_rf_power_lock);
 
             if (command == RF_CMD_SET) {
-                uint8_t index = rf_power_clamp_index(rf_power_nearest_index(power_dbm));
-                // If the level was already current, still answer the request.
-                (void)rf_power_apply_index(index, "gateway RSSI policy", false);
+                uint8_t index = rf_power_clamp_index(
+                    rf_power_nearest_index(power_dbm));
+                int8_t requested_power = s_rf_power_table[index];
+
+                if (request_mode == RF_MODE_AUTO) {
+                    s_rf_mode = RF_MODE_AUTO;
+                    if (rf_power_get_dbm() != requested_power) {
+                        (void)rf_power_apply_index(index,
+                            "gateway automatic policy", false);
+                    }
+                } else if (request_mode == RF_MODE_MANUAL) {
+                    s_rf_mode = RF_MODE_MANUAL;
+                    // If the level was already current, still answer and lock
+                    // the node into manual mode.
+                    (void)rf_power_apply_index(index,
+                        "gateway manual policy", false);
+                } else {
+                    // Legacy v1 request: change power but preserve local mode.
+                    (void)rf_power_apply_index(index,
+                        "gateway legacy power policy", false);
+                }
                 rf_power_send_command(RF_CMD_REPORT, rf_power_get_dbm(),
-                                      request_seq);
+                                      s_rf_mode, request_seq);
             } else if (command == RF_CMD_QUERY) {
                 rf_power_send_command(RF_CMD_REPORT, rf_power_get_dbm(),
-                                      request_seq);
+                                      s_rf_mode, request_seq);
             }
         }
 
@@ -1306,7 +1354,8 @@ static void rf_power_task(void *arg)
             s_rf_packet_sequence = node_seq;
             uint8_t report_seq = (uint8_t)(0x80 | node_seq);
             s_rf_unsolicited_report_pending = false;
-            rf_power_send_command(RF_CMD_REPORT, rf_power_get_dbm(), report_seq);
+            rf_power_send_command(RF_CMD_REPORT, rf_power_get_dbm(),
+                                  s_rf_mode, report_seq);
         }
     }
 }

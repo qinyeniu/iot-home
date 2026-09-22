@@ -1,7 +1,7 @@
 # Zigbee 自动发射功率控制（ATPC）设计
 
-**更新时间**：2026-09-23  
-**状态**：代码已实现并烧录；自动功率上下限已做成安装配置项；近距离 5 分钟及节点单独复位 3 分钟硬件实测通过  
+**更新时间**：2026-09-23
+**状态**：代码已实现并烧录；自动功率上下限、运行时免烧录查询/手动固定/恢复自动、严格事务边界均已通过硬件实测
 **适用设备**：ESP32-C6 传感器+继电器二合一节点、ESP32-C6 网关
 
 ## 1. 最终设计结论
@@ -152,8 +152,11 @@ ESP32-C6 芯片可支持约 **-15 dBm 到 +20 dBm**。当前默认自动策略�
 队列接受 Zigbee 请求不代表节点已经处理。网关发送 QUERY/SET 后等待加密 REPORT：
 
 - 90 秒未确认则判定本次等待超时；
+- deadline 不只在周期任务中检查：REPORT 实际到达时会按当前时间再次判断；
+- 超时后，即使迟到 REPORT 的序号、功率、模式都正确，也不能再确认原用户事务；
 - 超时后重新 QUERY 当前实际功率；
-- 不盲目重发 SET，防止节点其实已经应用但 REPORT 丢失。
+- 不盲目重发 SET，防止节点其实已经应用但 REPORT 丢失；
+- 链路陈旧只会终止本次用户事务，持久保存的期望模式/手动功率不会丢失，链路恢复后自动对账。
 
 ### 5.3 LQI 的使用边界
 
@@ -231,10 +234,119 @@ ESP32-C6 芯片可支持约 **-15 dBm 到 +20 dBm**。当前默认自动策略�
 
 烧录后的同启观察中，节点前约 106 秒出现过一次父链路验证不一致，随后自动 resteer 并恢复，恢复后持续保持 -10 dBm。因此当前策略可以自恢复，但同启时的完全收敛可能需要约 2 分钟。后续可优化为网关先启动、节点延迟加入，或进一步缩短验证/重导时间。
 
-## 8. 后续可选增强
+## 8. 运行时免烧录修改
 
-- 增加用户可见的手动功率上限/下限设置，自动模式仍默认开启；
+除编译期边界外，当前已经支持在设备运行过程中通过 MQTT 修改策略，不需要为“换一个功率”重新编译或烧录固件。网关订阅节点命令主题：
+
+```text
+iot-home/gw-001/nodes/zb-82cb/cmd
+```
+
+支持命令：
+
+```json
+{"command":"rf_query_power"}
+{"command":"rf_set_power","payload":{"power_dbm":0}}
+{"command":"rf_manual_power","payload":{"power_dbm":8}}
+{"command":"rf_set_auto"}
+```
+
+功率值仍只能选择内置档位：`-10、0、8、14、18、20 dBm`。网关发起 QUERY 时先发布 retained `status:"querying"`；发送加密 Zigbee SET/QUERY 后，不会把“协议栈接受发送请求”当作成功；只有收到节点加密 REPORT，且命令序号、功率和模式均匹配，才更新 retained 状态：
+
+```text
+iot-home/gw-001/nodes/zb-82cb/rf_policy
+```
+
+本地工具：
+
+```powershell
+server/backend/.venv/Scripts/python.exe tools/rf_power_config.py --host 8.163.110.27 query
+server/backend/.venv/Scripts/python.exe tools/rf_power_config.py --host 8.163.110.27 set --power 0
+server/backend/.venv/Scripts/python.exe tools/rf_power_config.py --host 8.163.110.27 auto
+```
+
+工具会生成一次性 `request_id`，网关在 querying/confirmed 状态中原样带回；工具只接受相同 `request_id`、`status:"confirmed"` 且模式/功率匹配的状态，避免订阅时先读到旧 retained 值而误判成功。
+
+### 8.1 手动模式的控制含义
+
+- `rf_set_power` 会让节点进入 `manual` 模式；
+- 节点在手动模式下不会因为真实 APS 失败或入网失败自动升高功率；
+- `rf_set_auto` 会保持当前功率并切换回自动模式，后续失败才允许升功率；
+- 想立即回到近距离安全值，可先设置 `-10 dBm`，再恢复自动。
+
+### 8.2 v1/v2 兼容边界
+
+当前私有协议 v2 为 8 字节，在 v1 6 字节基础上增加 `mode` 和 `flags`：
+
+```text
+magic0 magic1 version command sequence power mode flags
+```
+
+新网关/新节点可以接收 v1 输入，但 v1 REPORT 没有模式字段，不能证明手动模式已锁定。因此手动命令必须收到 v2 的 `mode=manual` REPORT 才算成功；本项目不保证 v1 网关与 v2 节点、v2 网关与 v1 节点的完整混合运行。
+
+### 8.3 事务关联
+
+MQTT 命令可携带：
+
+```json
+{"command":"rf_set_power","request_id":"a1b2c3d4e5f60718","payload":{"power_dbm":0}}
+```
+
+网关将当前事务 ID 保存在 `s_rf_expected_request_id` 中，QUERY/SET 的 confirmed policy 必须带回同一 ID。网络 reset/leave 会清空该 ID。这样即使旧 retained 报文刚好具有同样功率，也不会被当作本次命令的确认。
+
+严格规则：
+
+- 网关命令响应使用低序号 `1..127`；
+- 节点主动上报使用高序号 `0x80..0xFF`；
+- 主动上报永远不能携带本次命令的 `request_id` 充当确认；
+- 只有 v2 REPORT 的序号、功率、模式均匹配当前等待事务，且 `expected_user=true` 时才确认；
+- 幂等场景下若节点状态本来就已满足请求，最终发布 confirmed 前还会在锁内二次校验全局事务，避免抢占并发来的新命令被旧 `request_id` 误确认。
+
+## 9. 2026-09-23 运行时策略硬件复验
+
+- 冷启动时网关先连 Wi‑Fi/MQTT，约 15.2 秒启动 Zigbee，节点约 16.2 秒首次 announce；
+- 由于串口打开导致近乎同冷启动，节点前 10 个父链路探针 APS 失败，随后自动 resteer；约 47.5 秒重新稳定；
+- QUERY 返回 `auto/-10 dBm`；
+- 带 request_id 设置固定 `0 dBm` 返回 `manual/0 dBm`，节点 LQI 从约 25–30 变为约 86–91；
+- 恢复自动后保持当前 `0 dBm`；再设置 `-10 dBm` 并恢复自动，最终为 `auto/-10 dBm`；
+- 后续至 230 秒持续保持 -10 dBm，普通遥测持续，节点最终统计中正常业务 `aps_fail=0、queue_fail=0、items_failed=0、I2C failures=0`。
+
+日志：
+
+- 节点：`firmware/node_zigbee/log.runtime-rf-policy-node-024423.txt`
+- 网关：`firmware/gateway/log.runtime-rf-policy-gw-024423.txt`
+- 加入 request_id 后重新烧录网关，最终 QUERY、SET 0、AUTO、SET -10、AUTO 均只确认本次事务，最终为 `auto/-10 dBm`；
+- 固件备份：`backups/firmware/2026-09-23-runtime-rf-policy/`
+
+## 10. 后续可选增强
+
+- 在用户界面中暴露运行时功率模式、当前功率和可选档位；
 - 在遥测中增加节点当前功率和 LQI，便于界面展示；
-- 将节点移动到更远/隔墙位置，验证失败驱动升功率；
-- 若未来电池供电，再评估 -15 dBm 和更深省电策略；
-- 多节点场景下为每个节点分别维护 LQI、功率和等待状态。
+- 将节点移动到更远/隔墙位置，验证手动固定功率可能失败、自动模式失败驱动升功率的差异；
+- 优化同冷启动收敛，使节点在网关 Zigbee 就绪后再开始 rejoin；
+- 多节点场景下为每个节点分别维护目标、LQI、功率和等待状态。
+
+
+## 11. 2026-09-23 严格事务边界最终加固
+
+### 修复内容
+
+1. 将“网关命令响应”和“节点主动上报”彻底分开：低序号只可能是本次 QUERY/SET 的响应，高序号只可能是节点主动 REPORT；
+2. 手动/自动模式切换必须由加密 v2 REPORT 证明；v1 REPORT 只能观测功率，不能证明模式；
+3. REPORT 到达时实时判断 90 秒 deadline，避免周期任务尚未运行时迟到回包仍确认旧事务；
+4. 链路陈旧超过 120 秒时仅终止用户请求，不删除 NVS 中的 durable desired mode/manual power；恢复后先 QUERY，再按结果 SET；
+5. QUERY 发现 durable desired 与节点实际模式/功率不一致时自动重新对账；
+6. 修复幂等固定功率场景：节点本来已是目标 `manual/power` 时也会发布 confirmed；最终确认前二次校验完整事务上下文，防止 TOCTOU 竞争。
+
+### 最终验证
+
+- 网关只执行 `app-flash` 到 COM6；未刷 bootloader/分区表，未擦 Zigbee NVRAM；
+- 节点本轮未重新烧录，节点 app 仍为前一版本，SHA256 为 `8894C2FEA281D663873B054E535B9A6A396F7C8F8439F47D762598E09F41242F`；
+- 网关重启后第一次查询时，节点仍在重新建立父链路；等待自动恢复后查询成功：`auto/-10 dBm`；
+- 最终运行时序列通过：SET `0 dBm` → AUTO → SET `-10 dBm` → AUTO，最终为 `auto/-10 dBm`；
+- 后端回归：`50 passed, 3 skipped`；
+- 独立代码复审最终结论：P0=0、P1=0、P2=0，APPROVE。
+
+最终网关 app SHA256：`D1EA34AD6CC0052BBEB95662B38FE79DD029963F21C36284013837D1B646B173`。
+
+备份目录：`backups/firmware/2026-09-23-strict-rf-transaction/`。

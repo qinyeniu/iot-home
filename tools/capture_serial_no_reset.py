@@ -50,9 +50,11 @@ def capture(port: str, out: Path, duration: float) -> None:
         port=port,
         baudrate=115200,
         timeout=1,
-        dtr=False,
-        rts=False,
     ) as ser, out.open("wb") as log_file:
+        # pyserial does not accept initial line-state constructor arguments.
+        # Set them immediately after open and never pulse them afterwards.
+        ser.dtr = False
+        ser.rts = False
         start = time.monotonic()
         while time.monotonic() - start < duration:
             data = ser.read(4096)

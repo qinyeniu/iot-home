@@ -63,6 +63,12 @@ class MQTTService:
                 async with aiomqtt.Client(
                     hostname=settings.MQTT_HOST,
                     port=settings.MQTT_PORT,
+                    # 固定 ID + 持久会话：后端短暂重启期间，broker 会替本
+                    # 会话排队消息（受 broker max_queued_messages 限制），
+                    # 重连后补发；随机 ID/clean session 会让这些消息被丢弃。
+                    identifier="iot-home-backend",
+                    protocol=aiomqtt.ProtocolVersion.V311,
+                    clean_session=False,
                     username=settings.MQTT_USER,
                     password=settings.MQTT_PASSWORD,
                     keepalive=60,

@@ -3,6 +3,7 @@
 提供设备查询、指标查询、命令下发等接口
 """
 
+import asyncio
 from datetime import datetime, timedelta
 from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,7 +17,16 @@ from app.services.command_ack import (
     SWITCH_COMMANDS,
     supersede_open_switch_commands,
 )
-from pydantic import BaseModel
+from app.services.rf_policy import (
+    KIND_AUTO,
+    KIND_MANUAL,
+    KIND_QUERY,
+    SUPPORTED_POWERS,
+    new_request_id,
+    rf_policy_states,
+)
+from pydantic import BaseModel, Field
+from typing import Literal
 
 router = APIRouter(prefix="/api", tags=["设备管理"])
 
@@ -58,6 +68,23 @@ class CommandResponse(BaseModel):
     created_at: datetime
     sent_at: Optional[datetime]
     acknowledged_at: Optional[datetime]
+
+
+class RFPolicyRequest(BaseModel):
+    """射频功率策略修改请求。"""
+
+    mode: Literal["manual", "auto"]
+    power_dbm: Optional[int] = Field(
+        default=None, description="手动固定功率，必须是支持的档位"
+    )
+
+
+class RFPolicyResponse(BaseModel):
+    device_id: str
+    mode: Optional[str] = None
+    power_dbm: Optional[int] = None
+    status: str
+    request_id: Optional[str] = None
 
 
 @router.get("/devices", response_model=List[DeviceResponse])
@@ -175,6 +202,149 @@ async def get_latest_metrics(
     
     result = await session.execute(query)
     return result.scalars().all()
+
+
+@router.get("/devices/{device_id}/rf-policy")
+async def get_rf_policy(
+    device_id: str,
+    fresh: bool = Query(False, description="true 时向网关发起一次实时查询"),
+    timeout: float = Query(30, ge=1, le=120, description="fresh 查询等待秒数"),
+    session: AsyncSession = Depends(get_session),
+):
+    """获取节点当前发射功率策略；默认返回后端缓存。"""
+    device = await session.get(Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+
+    if not fresh:
+        state = rf_policy_states.get_state(device_id)
+        if state is None:
+            return {
+                "device_id": device_id,
+                "mode": None,
+                "power_dbm": None,
+                "status": "unknown",
+                "request_id": None,
+            }
+        return state
+
+    return await _request_rf_policy(
+        session, device_id, KIND_QUERY, None, timeout, record_command=False
+    )
+
+
+@router.post("/devices/{device_id}/rf-policy", status_code=200)
+async def set_rf_policy(
+    device_id: str,
+    request: RFPolicyRequest,
+    timeout: float = Query(30, ge=1, le=120, description="等待确认秒数"),
+    session: AsyncSession = Depends(get_session),
+):
+    """修改节点发射功率策略：手动固定功率或恢复自动。"""
+    device = await session.get(Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+
+    if request.mode == "manual":
+        if request.power_dbm is None:
+            raise HTTPException(
+                status_code=422,
+                detail="手动模式必须提供 power_dbm",
+            )
+        if request.power_dbm not in SUPPORTED_POWERS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"power_dbm 必须是支持的档位: {list(SUPPORTED_POWERS)}",
+            )
+        kind, target_power = KIND_MANUAL, request.power_dbm
+    else:
+        kind, target_power = KIND_AUTO, None
+
+    return await _request_rf_policy(
+        session, device_id, kind, target_power, timeout
+    )
+
+
+async def _request_rf_policy(
+    session: AsyncSession,
+    device_id: str,
+    kind: str,
+    target_power: Optional[int],
+    timeout: float,
+    record_command: bool = True,
+) -> dict[str, Any]:
+    """通用：下发 RF 命令并等待与本次 request_id 匹配的 confirmed。"""
+    if kind == KIND_MANUAL:
+        command_name = "rf_set_power"
+        payload: Optional[dict[str, Any]] = {"power_dbm": target_power}
+    elif kind == KIND_AUTO:
+        command_name = "rf_set_auto"
+        payload = {}
+    else:
+        command_name = "rf_query_power"
+        payload = {}
+
+    request_id = new_request_id()
+    command: Optional[Command] = None
+
+    if record_command:
+        command = Command(
+            device_id=device_id,
+            command=command_name,
+            payload=payload,
+            status="pending",
+        )
+        session.add(command)
+        await session.flush()
+
+    # 先登记等待者，避免回报在发布返回前到达而丢失。
+    future = rf_policy_states.register_waiter(
+        request_id, device_id, kind, target_power
+    )
+
+    try:
+        success = await mqtt_service.publish_command(
+            device_id, command_name, payload, request_id=request_id
+        )
+        if not success:
+            rf_policy_states.drop_waiter(request_id)
+            if record_command:
+                await session.rollback()
+                failed = Command(
+                    device_id=device_id,
+                    command=command_name,
+                    payload=payload,
+                    status="failed",
+                )
+                session.add(failed)
+                await session.commit()
+            raise HTTPException(status_code=500, detail="命令发送失败")
+
+        if record_command:
+            assert command is not None
+            command.status = "sent"
+            command.sent_at = datetime.now()
+            await session.commit()
+
+        try:
+            confirmed = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            rf_policy_states.drop_waiter(request_id)
+            raise HTTPException(
+                status_code=504,
+                detail="在等待时间内未收到与本次事务匹配的设备确认",
+            )
+
+        if record_command:
+            assert command is not None
+            command.status = "acknowledged"
+            command.acknowledged_at = datetime.now()
+            await session.commit()
+
+        return confirmed
+    except Exception:
+        rf_policy_states.drop_waiter(request_id)
+        raise
 
 
 @router.post("/devices/{device_id}/commands", response_model=CommandResponse)

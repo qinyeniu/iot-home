@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.services.topics import device_command_topic, split_device_id
 from app.services.command_ack import acknowledge_switch_command
+from app.services.rf_policy import rf_policy_states, SUPPORTED_POWERS
 from app.models.session import async_session_factory
 from app.models.database import Device, Metric, ProcessedMessage
 
@@ -86,7 +87,7 @@ class MQTTService:
                     port=settings.MQTT_PORT,
                     # 固定 ID + 持久会话：后端短暂重启期间，broker 会替本
                     # 会话排队消息，重连后补发；随机 ID/clean session 会丢弃。
-                    identifier="iot-home-backend",
+                    identifier=settings.MQTT_CLIENT_ID,
                     protocol=aiomqtt.ProtocolVersion.V311,
                     clean_session=False,
                     username=settings.MQTT_USER,
@@ -103,8 +104,10 @@ class MQTTService:
                     # QoS0 在网络抖动/处理积压时会静默丢消息。
                     await client.subscribe(settings.mqtt_topic_telemetry, qos=1)
                     await client.subscribe(settings.mqtt_topic_status, qos=1)
+                    await client.subscribe(settings.mqtt_topic_rf_policy, qos=1)
                     logger.info("已订阅(QoS1): %s", settings.mqtt_topic_telemetry)
                     logger.info("已订阅(QoS1): %s", settings.mqtt_topic_status)
+                    logger.info("已订阅(QoS1): %s", settings.mqtt_topic_rf_policy)
 
                     # 网络循环只负责快速排空；数据库写入由独立 worker
                     # 串行完成，保持同一设备的消息顺序。
@@ -318,6 +321,10 @@ class MQTTService:
             await self._handle_status(
                 gateway_id, node_id, payload, message.retain
             )
+        elif msg_type == "rf_policy":
+            await self._handle_rf_policy(
+                gateway_id, node_id, payload, message.retain
+            )
         else:
             logger.warning("忽略未知消息类型 %s: %s", msg_type, topic)
             raise BadMessageError("unknown message type")
@@ -520,11 +527,87 @@ class MQTTService:
             logger.info("新设备已注册: %s", device_id)
         return device
 
+    async def _handle_rf_policy(
+        self,
+        gateway_id: str,
+        node_id: str,
+        payload: dict[str, Any],
+        retained: bool = False,
+    ) -> None:
+        """处理射频功率策略上报，并在 confirmed 时写入历史指标。
+
+        - 任意状态都更新内存缓存，供 REST API 展示与等待者匹配；
+        - 只有 ``status="confirmed"`` 才写入 ``tx_power_dbm`` / ``rf_mode``
+          指标，避免 querying 等中间态污染历史曲线。
+        """
+        device_id = f"{gateway_id}-{node_id}"
+        rf_policy_states.update_state(
+            device_id, payload, retained=retained
+        )
+
+        if payload.get("status") != "confirmed":
+            return
+
+        power = payload.get("power_dbm")
+        mode = payload.get("mode")
+        if (
+            not isinstance(power, int)
+            or isinstance(power, bool)
+            or power not in SUPPORTED_POWERS
+        ):
+            return
+        mode_value: Optional[int]
+        if mode == "auto":
+            mode_value = 0
+        elif mode == "manual":
+            mode_value = 1
+        else:
+            mode_value = None
+
+        now = datetime.now()
+        async with async_session_factory() as session:
+            device = await session.get(Device, device_id)
+            if device is None:
+                if retained:
+                    logger.info(
+                        "忽略无对应设备的 retained rf_policy: %s", device_id
+                    )
+                    return
+                await self._ensure_device(
+                    session, device_id, node_id, "sensor", gateway_id
+                )
+
+            session.add(
+                Metric(
+                    device_id=device_id,
+                    metric="tx_power_dbm",
+                    value=float(power),
+                    ts=now,
+                    received_at=now,
+                )
+            )
+            if mode_value is not None:
+                session.add(
+                    Metric(
+                        device_id=device_id,
+                        metric="rf_mode",
+                        value=float(mode_value),
+                        ts=now,
+                        received_at=now,
+                    )
+                )
+            await session.commit()
+        logger.info(
+            "射频功率策略已保存: %s -> %s/%d dBm",
+            device_id, mode, power,
+        )
+
     async def publish_command(
         self,
         device_id: str,
         command: str,
         payload: Optional[dict[str, Any]] = None,
+        request_id: Optional[str] = None,
     ) -> bool:
         """发布命令到设备"""
         if not self.client:
@@ -542,6 +625,8 @@ class MQTTService:
                 "payload": payload or {},
                 "ts": datetime.now().isoformat(),
             }
+            if request_id:
+                message["request_id"] = request_id
             # QoS1：命令至少送达 broker 一次，失败由上层记录为 failed。
             await self.client.publish(
                 topic, json.dumps(message).encode(), qos=1

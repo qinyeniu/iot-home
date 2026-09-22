@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     MQTT_USER: str = "iot_user"
     MQTT_PASSWORD: str = ""
     MQTT_TOPIC_PREFIX: str = "iot-home"
+    # 固定客户端 ID 才能使用持久会话；本地联调时可用不同 ID，避免与生产
+    # 后端互相踢线。
+    MQTT_CLIENT_ID: str = "iot-home-backend"
     
     # MySQL 配置
     MYSQL_HOST: str = "mysql"
@@ -60,6 +63,11 @@ class Settings(BaseSettings):
     def mqtt_topic_status(self) -> str:
         """设备状态主题"""
         return f"{self.MQTT_TOPIC_PREFIX}/+/nodes/+/status"
+
+    @property
+    def mqtt_topic_rf_policy(self) -> str:
+        """射频功率策略主题"""
+        return f"{self.MQTT_TOPIC_PREFIX}/+/nodes/+/rf_policy"
     
     class Config:
         env_file = ".env"

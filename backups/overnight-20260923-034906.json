@@ -1,0 +1,170 @@
+{
+  "node": {
+    "counters": {
+      "total_lines": 1147,
+      "esp_lines": 954,
+      "resets": 2,
+      "reset_reasons": {
+        "USB_UART_HPSYS": 1,
+        "SW_CPU": 1
+      },
+      "warnings": 39,
+      "errors": 0,
+      "panics": 1,
+      "panic_samples": [
+        "assert failed: vPortExitCritical port.c:618 (port_uxCriticalNesting[0] > 0)"
+      ],
+      "first_uptime_ms": 240421,
+      "last_uptime_ms": 2282473,
+      "observed_ms": 2282473,
+      "last_boot_observed_ms": 2282473,
+      "total_observed_ms": 3788995,
+      "boot_segments": [
+        {
+          "index": 1,
+          "first_uptime_ms": 240421,
+          "last_uptime_ms": 240421,
+          "observed_ms": 240421
+        },
+        {
+          "index": 2,
+          "first_uptime_ms": 23,
+          "last_uptime_ms": 1266101,
+          "observed_ms": 1266101
+        },
+        {
+          "index": 3,
+          "first_uptime_ms": 22,
+          "last_uptime_ms": 2282473,
+          "observed_ms": 2282473
+        }
+      ],
+      "gaps_over_30s": []
+    },
+    "data_samples": 335,
+    "report_sends": 334,
+    "report_send_skips": 0,
+    "last_stats": {
+      "rounds": 214,
+      "repairs": 0,
+      "i2c_th_fail": 0,
+      "i2c_lux_fail": 0,
+      "i2c_resets": 0,
+      "i2c_reinits": 0,
+      "attempts": 642,
+      "queued": 642,
+      "queue_fail": 0,
+      "items_failed": 0,
+      "aps_ok": 633,
+      "aps_fail": 2,
+      "unavail": 5,
+      "recovered": 5,
+      "candidate": 0,
+      "probe_resteer": 0,
+      "probes": 5,
+      "probe_aps_fail": 0,
+      "th_invalid": 0,
+      "lux_invalid": 0,
+      "th_streak": 0,
+      "lux_streak": 0
+    },
+    "max_stats": {
+      "rounds": 214.0,
+      "repairs": 0.0,
+      "i2c_th_fail": 0.0,
+      "i2c_lux_fail": 0.0,
+      "i2c_resets": 0.0,
+      "i2c_reinits": 0.0,
+      "attempts": 642.0,
+      "queued": 642.0,
+      "queue_fail": 0.0,
+      "items_failed": 0.0,
+      "aps_ok": 633.0,
+      "aps_fail": 2.0,
+      "unavail": 5.0,
+      "recovered": 5.0,
+      "candidate": 0.0,
+      "probe_resteer": 0.0,
+      "probes": 5.0,
+      "probe_aps_fail": 0.0,
+      "th_invalid": 0.0,
+      "lux_invalid": 0.0,
+      "th_streak": 0.0,
+      "lux_streak": 0.0
+    },
+    "rejoin_failures": 23,
+    "steering_successes": 0,
+    "link_lost": 0,
+    "device_started": 3,
+    "rf_power_changes": 2,
+    "rf_commands": {
+      "3": 17
+    }
+  },
+  "gateway": {
+    "counters": {
+      "total_lines": 5978215,
+      "esp_lines": 11683,
+      "resets": 1,
+      "reset_reasons": {
+        "USB_UART_HPSYS": 1
+      },
+      "warnings": 33,
+      "errors": 2245,
+      "panics": 0,
+      "panic_samples": [],
+      "first_uptime_ms": 273,
+      "last_uptime_ms": 16105056,
+      "observed_ms": 16105056,
+      "last_boot_observed_ms": 16105056,
+      "total_observed_ms": 16105056,
+      "boot_segments": [
+        {
+          "index": 1,
+          "first_uptime_ms": 273,
+          "last_uptime_ms": 16105056,
+          "observed_ms": 16105056
+        }
+      ],
+      "gaps_over_30s": [
+        {
+          "boot_segment": 1,
+          "from_ms": 13381776,
+          "to_ms": 13441776,
+          "gap_ms": 60000
+        },
+        {
+          "boot_segment": 1,
+          "from_ms": 13441776,
+          "to_ms": 13642406,
+          "gap_ms": 200630
+        }
+      ]
+    },
+    "mqtt_forwarded": 1198,
+    "duplicate_suppressed": 67,
+    "rf_samples": 3853,
+    "rf_clusters": {
+      "0x0402": 1293,
+      "0x0405": 1265,
+      "0x0400": 1264,
+      "0xfc10": 31
+    },
+    "rf_policy_sent": 120,
+    "rf_reports_accepted": 31,
+    "rf_power_keeps": 105,
+    "mqtt_connections": 1,
+    "mqtt_disconnections": 0,
+    "wifi_connections": 1,
+    "wifi_disconnections": 0,
+    "device_joined": 1,
+    "device_announced": 2,
+    "device_left": 0,
+    "unavailable_events": 3
+  },
+  "derived": {
+    "node_aps_success_pct": 99.685,
+    "node_queue_fail_pct": 0.0,
+    "node_i2c_fail_total": 0
+  }
+}

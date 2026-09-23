@@ -1108,7 +1108,25 @@ static esp_err_t rf_power_send_command(uint8_t command, int8_t power_dbm,
         .alias_seq_num = 0,
         .radius = REPORT_APS_RADIUS,
     };
-    esp_err_t err = esp_zb_aps_data_request(&req);
+    esp_err_t err;
+
+    // rf_power_task runs outside the Zigbee main loop. The SDK requires every
+    // non-callback Zigbee API call to be serialized by the global ZBOSS lock;
+    // otherwise concurrent scheduler iterations can corrupt critical-section
+    // state and eventually trip vPortExitCritical.
+    if (!esp_zb_is_started()) {
+        ESP_LOGW(TAG, "RF power cmd=%u seq=%u skipped: stack not started",
+                 command, sequence);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!esp_zb_lock_acquire(portMAX_DELAY)) {
+        ESP_LOGW(TAG, "RF power cmd=%u seq=%u skipped: lock unavailable",
+                 command, sequence);
+        return ESP_ERR_INVALID_STATE;
+    }
+    err = esp_zb_aps_data_request(&req);
+    esp_zb_lock_release();
+
     ESP_LOGI(TAG, "RF power cmd=%u power=%d mode=%u seq=%u: %s",
              command, power_dbm, mode, sequence, esp_err_to_name(err));
     return err;

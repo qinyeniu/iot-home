@@ -107,6 +107,10 @@ _Static_assert(RF_POWER_LEVEL_IS_SUPPORTED(RF_POWER_AUTO_MAX_DBM),
 #define RF_LQI_LOWER_WINDOWS      3
 #define RF_POWER_SETTLE_MS        90000
 #define RF_POWER_RECONCILE_MS     300000
+#define RF_HEALTH_NO_RX_RESTART_MS 180000
+#define RF_HEALTH_MAC_NOBUFFER_EVENTS 100
+#define RF_HEALTH_MAC_NOBUFFER_SPAN_MS 60000
+#define RF_HEALTH_MAC_NOBUFFER_FRESH_MS 5000
 #define RF_ZB_ENDPOINT            10
 
 // Forward declarations
@@ -320,6 +324,10 @@ static bool s_rf_last_report_seq_valid;
 static uint8_t s_rf_last_report_seq;
 static uint32_t s_rf_wait_started_ms;
 static uint32_t s_rf_power_confirmed_ms;
+static volatile uint32_t s_rf_mac_nobuffer_events;
+static volatile uint32_t s_rf_first_mac_nobuffer_ms;
+static volatile uint32_t s_rf_last_mac_nobuffer_ms;
+static vprintf_like_t s_original_log_vprintf;
 static uint8_t s_rf_mode;
 static int8_t s_rf_manual_power_dbm;
 static bool s_rf_policy_apply_pending;
@@ -914,7 +922,24 @@ static esp_err_t rf_power_send_to_node(uint8_t command, int8_t power_dbm,
         .alias_seq_num = 0,
         .radius = 10,
     };
-    esp_err_t err = esp_zb_aps_data_request(&req);
+    esp_err_t err;
+
+    // This function runs in the forwarding/status task, not inside a Zigbee
+    // callback. Serialize SDK access to avoid desynchronizing the port-layer
+    // receive/transmit state.
+    if (!esp_zb_is_started()) {
+        ESP_LOGW(TAG, "RF power -> node=0x%04x seq=%u skipped: stack not started",
+                 (unsigned)addr, seq);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!esp_zb_lock_acquire(portMAX_DELAY)) {
+        ESP_LOGW(TAG, "RF power -> node=0x%04x seq=%u skipped: lock unavailable",
+                 (unsigned)addr, seq);
+        return ESP_ERR_INVALID_STATE;
+    }
+    err = esp_zb_aps_data_request(&req);
+    esp_zb_lock_release();
+
     ESP_LOGI(TAG, "RF power -> node=0x%04x cmd=%u power=%d mode=%s seq=%u: %s",
              (unsigned)addr, command, power_dbm, rf_power_mode_name(mode),
              seq, esp_err_to_name(err));
@@ -2490,7 +2515,23 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
         .on_off_cmd_id = cmd_id,
     };
-    uint8_t zcl_seq = esp_zb_zcl_on_off_cmd_req(&req);
+    uint8_t zcl_seq = 0;
+
+    // MQTT callbacks run outside the Zigbee main loop; acquire the mandatory
+    // ZBOSS lock before issuing a standard ZCL On/Off request.
+    if (!esp_zb_is_started()) {
+        ESP_LOGW(TAG, "CMD fwd: node=0x%04x skipped: stack not started",
+                 (unsigned)short_addr);
+        cJSON_Delete(root);
+        return;
+    }
+    if (esp_zb_lock_acquire(portMAX_DELAY)) {
+        zcl_seq = esp_zb_zcl_on_off_cmd_req(&req);
+        esp_zb_lock_release();
+    } else {
+        ESP_LOGW(TAG, "CMD fwd: node=0x%04x skipped: lock unavailable",
+                 (unsigned)short_addr);
+    }
     ESP_LOGI(TAG, "CMD fwd: node=0x%04x cmd=%s zcl_seq=%u",
              (unsigned)short_addr, command->valuestring, (unsigned)zcl_seq);
     cJSON_Delete(root);
@@ -2787,9 +2828,99 @@ static void oled_task(void *arg)
     }
 }
 
+static uint32_t rf_health_timer_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
+// The exact lower-layer message is emitted from the precompiled ZBOSS port.
+// Hook the shared log sink so ordinary child offline/ESP_ERR_NO_MEM cases are
+// not mistaken for a MAC buffer storm.
+static int rf_health_log_vprintf(const char *fmt, va_list args)
+{
+    char line[256];
+    va_list copy;
+
+    va_copy(copy, args);
+    vsnprintf(line, sizeof(line), fmt, copy);
+    va_end(copy);
+
+    if (strstr(line, "ZB_ESP_MAC") != NULL &&
+        strstr(line, "No buffer, handle it") != NULL) {
+        uint32_t now = rf_health_timer_ms();
+        uint32_t previous_last =
+            __atomic_load_n(&s_rf_last_mac_nobuffer_ms, __ATOMIC_ACQUIRE);
+        uint32_t events;
+
+        // Start a new burst after a quiet gap so old transient events cannot
+        // satisfy the 100-events/60-second storm criterion much later.
+        if (previous_last != 0 &&
+            now - previous_last > RF_HEALTH_MAC_NOBUFFER_FRESH_MS) {
+            __atomic_store_n(&s_rf_first_mac_nobuffer_ms, now,
+                             __ATOMIC_RELEASE);
+            __atomic_store_n(&s_rf_mac_nobuffer_events, 1,
+                             __ATOMIC_RELEASE);
+            events = 1;
+        } else {
+            events = __atomic_add_fetch(&s_rf_mac_nobuffer_events, 1,
+                                       __ATOMIC_ACQ_REL);
+            if (events == 1) {
+                __atomic_store_n(&s_rf_first_mac_nobuffer_ms, now,
+                                 __ATOMIC_RELEASE);
+            }
+        }
+        __atomic_store_n(&s_rf_last_mac_nobuffer_ms, now, __ATOMIC_RELEASE);
+    }
+
+    return s_original_log_vprintf(fmt, args);
+}
+
+static void rf_health_log_init(void)
+{
+    s_original_log_vprintf = esp_log_set_vprintf(rf_health_log_vprintf);
+}
+
+static void rf_power_health_check(void)
+{
+    uint32_t now_ticks = pdTICKS_TO_MS(xTaskGetTickCount());
+    uint32_t now_timer = rf_health_timer_ms();
+    uint16_t addr = 0;
+    uint32_t last_rx = 0;
+    uint32_t mac_events = __atomic_load_n(&s_rf_mac_nobuffer_events,
+                                         __ATOMIC_ACQUIRE);
+    uint32_t first_mac_event = __atomic_load_n(&s_rf_first_mac_nobuffer_ms,
+                                              __ATOMIC_ACQUIRE);
+    uint32_t last_mac_event = __atomic_load_n(&s_rf_last_mac_nobuffer_ms,
+                                             __ATOMIC_ACQUIRE);
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    addr = s_rf_node_addr;
+    last_rx = s_rf_last_rx_ms;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (addr == 0 || last_rx == 0 ||
+        now_ticks - last_rx < RF_HEALTH_NO_RX_RESTART_MS ||
+        mac_events < RF_HEALTH_MAC_NOBUFFER_EVENTS ||
+        first_mac_event == 0 ||
+        now_timer - first_mac_event < RF_HEALTH_MAC_NOBUFFER_SPAN_MS ||
+        now_timer - last_mac_event > RF_HEALTH_MAC_NOBUFFER_FRESH_MS) {
+        return;
+    }
+
+    ESP_LOGW(TAG,
+             "Zigbee health: active MAC no-buffer storm (%lu events over "
+             "%lu ms) and no valid child frame for %lu ms; controlled restart",
+             (unsigned long)mac_events,
+             (unsigned long)(now_timer - first_mac_event),
+             (unsigned long)(now_ticks - last_rx));
+    // Give logging and the retained offline status a brief chance to flush.
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
 static void status_task(void *arg)
 {
     while (1) {
+        rf_power_health_check();
         if (s_mqtt_ok) {
             int64_t us = esp_timer_get_time() / 1000000;
             char msg[128];
@@ -3272,6 +3403,7 @@ void app_main(void)
     }
 
     rf_power_policy_init();
+    rf_health_log_init();
 
     {
         nvs_handle_t nvh;

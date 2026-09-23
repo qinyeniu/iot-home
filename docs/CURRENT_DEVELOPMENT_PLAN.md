@@ -163,3 +163,30 @@
 - 不使用 `git add -A`，只显式添加本次相关文件；
 - 不读取、不打印、不落文档任何密码文件或真实凭据；
 - 打开 COM5/COM6 前要意识到可能触发热复位。
+
+## 6. 2026-09-24 夜间产品化补充
+
+### 6.1 已确认的新约束
+
+- 云服务器为**阿里云 ECS**；
+- MQTT 安全部署、TLS/WSS、VPN 暂不执行，后续在维护窗口内教学并共同操作；
+- 新增阿里云配置计划：`docs/ALIYUN_SERVER_MAINTENANCE_PLAN.md`；
+- 本地配网与凭据管理进入实施阶段：`docs/LOCAL_PROVISIONING_CREDENTIALS_DESIGN.md`；
+- Flash 断网缓存必须低磨损：`docs/LOW_WEAR_FLASH_SPOOL_DESIGN.md`；
+- 电池节点采用独立设备路线：`docs/BATTERY_NODE_LOW_POWER_PLAN.md`。
+
+### 6.2 当前代码风险提醒
+
+为验证新组件，网关构建目录执行过本地 fullclean/重建。当前构建使用项目清单中固定的 Zigbee 组件 1.6.0；此前工作区中曾存在较新的 1.6.4/1.6.8 管理组件。当前构建产物不能被误认为昨晚已硬件验证并烧录的版本，后续恢复硬件时应先复核组件版本、构建 SHA 和固件功能，再决定是否烧录。
+
+当前应用分区剩余约 5%，后续加入 SoftAP/HTTP 配网功能前应关注固件体积，避免功能堆叠导致分区不足。
+
+### 6.3 更新后的推荐顺序
+
+1. 新 NVS 配置组件和回退路径；
+2. 硬件在线时验证 NVS 读取/保存与编译时回退；
+3. 再做 SoftAP 本地网页；
+4. 长稳定性复测；
+5. 阿里云 MQTT 账号/ACL/TLS 维护；
+6. 独立电池 SED/deep-sleep 实验工程；
+7. deferred command、设备能力模型和 Grafana 电池面板。

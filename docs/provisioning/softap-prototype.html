@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IoT-Home 网关配网</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f7fb;
+      --card: #ffffff;
+      --text: #1d2736;
+      --muted: #667085;
+      --line: #d9e1ec;
+      --primary: #2563eb;
+      --primary-dark: #1d4ed8;
+      --danger-bg: #fef2f2;
+      --danger-line: #fecaca;
+      --danger: #b91c1c;
+      --success: #047857;
+      --warning: #b45309;
+      --shadow: 0 18px 45px rgba(31, 41, 55, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at top left, #e0edff 0, var(--bg) 36rem);
+      color: var(--text);
+      font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+
+    .shell {
+      width: min(760px, calc(100% - 32px));
+      margin: 36px auto 56px;
+    }
+
+    header { margin-bottom: 20px; }
+
+    .eyebrow {
+      margin: 0 0 6px;
+      color: var(--primary);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+
+    h1, h2, legend { margin: 0; }
+
+    h1 { font-size: clamp(28px, 4vw, 40px); line-height: 1.2; }
+
+    .muted, .note { color: var(--muted); }
+
+    .card, form {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }
+
+    .status-card { padding: 18px 20px; margin-bottom: 18px; }
+
+    .status-row { display: flex; gap: 14px; align-items: flex-start; }
+
+    .dot {
+      width: 13px;
+      height: 13px;
+      margin-top: 7px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex: 0 0 auto;
+    }
+
+    .dot.testing { background: var(--warning); animation: pulse 1s infinite; }
+    .dot.passed, .dot.committed { background: var(--success); }
+    .dot.failed { background: var(--danger); }
+
+    @keyframes pulse { 50% { opacity: 0.35; } }
+
+    form { padding: 8px 22px 22px; }
+
+    fieldset {
+      margin: 18px 0;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+    }
+
+    legend { padding: 0 8px; font-weight: 700; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .field { display: flex; flex-direction: column; gap: 7px; }
+    .field.full { grid-column: 1 / -1; }
+
+    label { font-weight: 650; }
+    .hint { color: var(--muted); font-size: 12.5px; font-weight: 400; }
+
+    input[type="text"], input[type="password"], input[type="number"] {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid #c4cedb;
+      border-radius: 10px;
+      font: inherit;
+      background: #fff;
+    }
+
+    input:focus {
+      outline: 3px solid rgba(37, 99, 235, 0.16);
+      border-color: var(--primary);
+    }
+
+    .checks { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+    .check { display: flex; gap: 9px; align-items: flex-start; color: var(--muted); font-weight: 400; }
+    .check input { margin-top: 4px; }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 20px;
+    }
+
+    button {
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      padding: 11px 16px;
+      font: inherit;
+      font-weight: 700;
+      background: #fff;
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+    button.primary:hover { background: var(--primary-dark); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .error-summary {
+      margin-top: 18px;
+      padding: 13px 15px;
+      border: 1px solid var(--danger-line);
+      border-radius: 12px;
+      background: var(--danger-bg);
+      color: var(--danger);
+    }
+
+    .error-summary ul { margin: 8px 0 0; padding-left: 20px; }
+    .invalid { border-color: var(--danger) !important; }
+
+    @media (max-width: 620px) {
+      .grid { grid-template-columns: 1fr; }
+      .shell { width: min(100% - 20px, 760px); margin-top: 20px; }
+      form { padding: 4px 14px 16px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <p class="eyebrow">SOFTAP 离线原型</p>
+      <h1>IoT-Home 网关配网</h1>
+      <p class="muted">先验证连接，验证通过后才保存配置。当前文件是静态原型，不会写入设备，也不会改变网络。</p>
+    </header>
+
+    <section class="card status-card" aria-live="polite">
+      <div class="status-row">
+        <span id="statusDot" class="dot"></span>
+        <div>
+          <strong id="statusTitle">等待填写</strong>
+          <p id="statusText" class="muted" style="margin: 3px 0 0;">请填写家里的 Wi-Fi 和 MQTT Broker 信息。</p>
+        </div>
+      </div>
+    </section>
+
+    <form id="provisionForm" novalidate>
+      <fieldset>
+        <legend>家庭 Wi-Fi</legend>
+        <div class="grid">
+          <div class="field full">
+            <label for="wifiSsid">Wi-Fi 名称</label>
+            <input id="wifiSsid" name="wifiSsid" type="text" autocomplete="off" required>
+            <span class="hint">最长 32 字节，中文会占用更多字节。</span>
+          </div>
+          <div class="field full">
+            <label for="wifiPassword">Wi-Fi 密码</label>
+            <input id="wifiPassword" name="wifiPassword" type="password" autocomplete="new-password">
+            <span id="wifiPasswordHint" class="hint">WPA/WPA2 密码长度为 8–63 字节。</span>
+          </div>
+        </div>
+        <div class="checks">
+          <label class="check"><input id="openNetwork" type="checkbox"> 这是没有密码的开放网络（产品化默认不推荐）</label>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>MQTT Broker</legend>
+        <div class="grid">
+          <div class="field">
+            <label for="mqttHost">主机名或 IP 地址</label>
+            <input id="mqttHost" type="text" placeholder="例如 your-server.example.com">
+          </div>
+          <div class="field">
+            <label for="mqttPort">端口</label>
+            <input id="mqttPort" type="number" min="1" max="65535" value="1883">
+          </div>
+          <div class="field full">
+            <label class="check"><input id="mqttTls" type="checkbox" disabled> 启用 TLS（当前先不启用，后续在维护窗口配置证书）</label>
+          </div>
+          <div class="field">
+            <label for="mqttUsername">MQTT 用户名（可选）</label>
+            <input id="mqttUsername" type="text" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="mqttPassword">MQTT 密码（可选）</label>
+            <input id="mqttPassword" type="password" autocomplete="new-password">
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>高级</legend>
+        <div class="field">
+          <label for="gatewayId">网关 ID（可选）</label>
+          <input id="gatewayId" type="text" placeholder="留空则自动生成">
+          <span class="hint">最长 64 字节。普通使用建议留空。</span>
+        </div>
+      </fieldset>
+
+      <div id="errorSummary" class="error-summary" hidden>
+        <strong>请先处理以下问题</strong>
+        <ul id="errorList"></ul>
+      </div>
+
+      <div class="actions">
+        <button id="testButton" class="primary" type="submit">测试连接</button>
+        <button id="commitButton" type="button" disabled>通过后保存并切换</button>
+        <button id="cancelButton" type="button" disabled>取消测试</button>
+        <button id="resetButton" type="reset">清空重填</button>
+      </div>
+      <p class="note">演示提示：在 Wi-Fi 名称或 Broker 地址中输入“失败”，可以查看失败提示。</p>
+    </form>
+  </main>
+
+  <script>
+    const form = document.getElementById("provisionForm");
+    const testButton = document.getElementById("testButton");
+    const commitButton = document.getElementById("commitButton");
+    const cancelButton = document.getElementById("cancelButton");
+    const openNetwork = document.getElementById("openNetwork");
+    const errorSummary = document.getElementById("errorSummary");
+    const errorList = document.getElementById("errorList");
+    const statusDot = document.getElementById("statusDot");
+    const statusTitle = document.getElementById("statusTitle");
+    const statusText = document.getElementById("statusText");
+    const encoder = new TextEncoder();
+
+    const fields = {
+      wifiSsid: document.getElementById("wifiSsid"),
+      wifiPassword: document.getElementById("wifiPassword"),
+      mqttHost: document.getElementById("mqttHost"),
+      mqttPort: document.getElementById("mqttPort"),
+      mqttUsername: document.getElementById("mqttUsername"),
+      mqttPassword: document.getElementById("mqttPassword"),
+      gatewayId: document.getElementById("gatewayId"),
+    };
+
+    let testTimerId = null;
+    let commitTimerId = null;
+    let activeTest = null;
+    let acceptedTest = null;
+
+    function bytes(value) {
+      return encoder.encode(value).length;
+    }
+
+    function setStatus(state, title, text) {
+      statusTitle.textContent = title;
+      statusText.textContent = text;
+      statusDot.className = "dot " + state;
+    }
+
+    function updateCancelButton() {
+      cancelButton.disabled = !(testTimerId || acceptedTest);
+    }
+
+    function addError(errors, fieldId, message) {
+      errors.push({ fieldId, message });
+    }
+
+    function markInvalidFields(errors) {
+      Object.values(fields).forEach((field) => field.classList.remove("invalid"));
+      errors.forEach((error) => {
+        if (fields[error.fieldId]) fields[error.fieldId].classList.add("invalid");
+      });
+    }
+
+    function hasWhitespace(value) {
+      return Array.from(value).some((character) => character.trim() === "");
+    }
+
+    function hasControlCharacter(value) {
+      return Array.from(value).some((character) => {
+        const code = character.codePointAt(0);
+        return code < 32 || code === 127;
+      });
+    }
+
+    function isGatewayIdCharacter(character) {
+      return (
+        (character >= "A" && character <= "Z") ||
+        (character >= "a" && character <= "z") ||
+        (character >= "0" && character <= "9") ||
+        character === "_" ||
+        character === "-"
+      );
+    }
+
+    function createTestId() {
+      return "tmp-" + Date.now().toString(36) + "-" +
+        Math.random().toString(36).slice(2, 8);
+    }
+
+    function validateForm() {
+      const errors = [];
+      const wifiSsid = fields.wifiSsid.value;
+      const wifiPassword = fields.wifiPassword.value;
+      const mqttHost = fields.mqttHost.value;
+      const mqttPortValue = Number(fields.mqttPort.value);
+      const mqttUsername = fields.mqttUsername.value;
+      const mqttPassword = fields.mqttPassword.value;
+      const gatewayId = fields.gatewayId.value;
+
+      if (!wifiSsid.trim()) addError(errors, "wifiSsid", "请填写 Wi-Fi 名称。");
+      if (bytes(wifiSsid) > 32) addError(errors, "wifiSsid", "Wi-Fi 名称不能超过 32 字节。");
+      if (hasControlCharacter(wifiSsid)) addError(errors, "wifiSsid", "Wi-Fi 名称不能包含控制字符。");
+
+      if (openNetwork.checked) {
+        if (wifiPassword.length > 0) addError(errors, "wifiPassword", "开放网络不需要密码，请清空密码。");
+      } else if (bytes(wifiPassword) < 8 || bytes(wifiPassword) > 63) {
+        addError(errors, "wifiPassword", "非开放网络的 Wi-Fi 密码必须为 8–63 字节。");
+      }
+
+      if (!mqttHost.trim()) addError(errors, "mqttHost", "请填写 MQTT Broker 主机名或 IP。");
+      if (hasWhitespace(mqttHost)) addError(errors, "mqttHost", "Broker 地址中不能包含空白字符。");
+      if (hasControlCharacter(mqttHost)) addError(errors, "mqttHost", "Broker 地址中不能包含控制字符。");
+
+      const forbiddenHostCharacters = [
+        String.fromCharCode(92), "/", "?", "#", "@", "[", "]", ":",
+      ];
+      forbiddenHostCharacters.forEach((character) => {
+        if (mqttHost.includes(character)) {
+          addError(errors, "mqttHost", "第一版仅支持普通主机名或 IPv4，不支持路径、用户信息、IPv6 或反斜杠。");
+        }
+      });
+
+      if (!Number.isInteger(mqttPortValue) || mqttPortValue < 1 || mqttPortValue > 65535) {
+        addError(errors, "mqttPort", "端口必须是 1–65535 之间的整数。");
+      }
+
+      const scheme = "mqtt://";
+      if (bytes(scheme + mqttHost + ":" + mqttPortValue) > 160) {
+        addError(errors, "mqttHost", "生成后的 MQTT URI 不能超过 160 字节。");
+      }
+
+      if (bytes(mqttUsername) > 64) addError(errors, "mqttUsername", "MQTT 用户名不能超过 64 字节。");
+      if (bytes(mqttPassword) > 64) addError(errors, "mqttPassword", "MQTT 密码不能超过 64 字节。");
+
+      if (gatewayId.length > 0) {
+        const gatewayCharacters = Array.from(gatewayId);
+        if (bytes(gatewayId) > 64 || gatewayCharacters.some((character) => !isGatewayIdCharacter(character))) {
+          addError(errors, "gatewayId", "网关 ID 只能包含字母、数字、下划线和中划线，长度 1–64；留空则自动生成。");
+        }
+      }
+
+      return {
+        errors,
+        payload: {
+          wifi_ssid: wifiSsid,
+          wifi_password: wifiPassword,
+          open_network: openNetwork.checked,
+          mqtt_host: mqttHost,
+          mqtt_port: mqttPortValue,
+          mqtt_tls: false,
+          mqtt_username: mqttUsername,
+          mqtt_password: mqttPassword,
+          gateway_id: gatewayId,
+        },
+      };
+    }
+
+    function showErrors(errors) {
+      markInvalidFields(errors);
+      errorList.innerHTML = "";
+      errors.forEach((error) => {
+        const item = document.createElement("li");
+        item.textContent = error.message;
+        errorList.appendChild(item);
+      });
+      errorSummary.hidden = false;
+    }
+
+    function clearErrors() {
+      errorSummary.hidden = true;
+      errorList.innerHTML = "";
+      markInvalidFields([]);
+    }
+
+    function clearTestTimer() {
+      if (testTimerId !== null) {
+        window.clearTimeout(testTimerId);
+        testTimerId = null;
+      }
+    }
+
+    function clearCommitTimer() {
+      if (commitTimerId !== null) {
+        window.clearTimeout(commitTimerId);
+        commitTimerId = null;
+      }
+    }
+
+    function cancelActiveInteraction(title, text) {
+      clearTestTimer();
+      activeTest = null;
+      acceptedTest = null;
+      testButton.disabled = false;
+      commitButton.disabled = true;
+      updateCancelButton();
+      setStatus("", title, text);
+    }
+
+    function handleFormChange() {
+      if (testTimerId !== null) {
+        cancelActiveInteraction("测试已取消", "表单已变化，请重新测试。");
+      } else if (acceptedTest) {
+        acceptedTest = null;
+        commitButton.disabled = true;
+        testButton.disabled = false;
+        updateCancelButton();
+        setStatus("", "测试结果已失效", "表单已变化，请重新测试。");
+      }
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      clearErrors();
+      clearTestTimer();
+      clearCommitTimer();
+      activeTest = null;
+      acceptedTest = null;
+
+      const result = validateForm();
+      if (result.errors.length > 0) {
+        showErrors(result.errors);
+        setStatus("failed", "信息需要修正", "请根据页面提示修改后重新测试。");
+        commitButton.disabled = true;
+        updateCancelButton();
+        return;
+      }
+
+      const testId = createTestId();
+      activeTest = { id: testId, payload: result.payload };
+      testButton.disabled = true;
+      commitButton.disabled = true;
+      updateCancelButton();
+      setStatus("testing", "正在测试连接", "模拟设备测试 Wi-Fi 和 MQTT；真实设备此阶段不会写入 NVS。");
+
+      testTimerId = window.setTimeout(() => {
+        testTimerId = null;
+        updateCancelButton();
+        if (!activeTest || activeTest.id !== testId) return;
+
+        const snapshot = activeTest.payload;
+        activeTest = null;
+        testButton.disabled = false;
+
+        const shouldFail = snapshot.wifi_ssid.includes("失败") ||
+          snapshot.mqtt_host.toLowerCase().includes("fail");
+        if (shouldFail) {
+          setStatus("failed", "连接测试失败", "设备不会保存本次失败配置。请检查名称、密码或 Broker 地址。");
+          return;
+        }
+
+        acceptedTest = { id: testId, payload: snapshot };
+        commitButton.disabled = false;
+        updateCancelButton();
+        setStatus("passed", "连接测试通过", "保存将使用本次测试快照；若再修改字段，需要重新测试。");
+      }, 900);
+    });
+
+    commitButton.addEventListener("click", () => {
+      if (!acceptedTest) return;
+      const context = acceptedTest;
+      const testId = context.id;
+      acceptedTest = null;
+
+      testButton.disabled = true;
+      commitButton.disabled = true;
+      cancelButton.disabled = true;
+      setStatus("testing", "正在保存", "真实设备会通过 test_id 提交 RAM 中已验证的不可变配置快照。");
+
+      commitTimerId = window.setTimeout(() => {
+        commitTimerId = null;
+        if (!context || context.id !== testId) return;
+        setStatus("committed", "配置已保存", "真实设备下一步可重启并连接新网络；静态原型到此结束。");
+      }, 700);
+    });
+
+    cancelButton.addEventListener("click", () => {
+      if (testTimerId !== null) {
+        cancelActiveInteraction("等待填写", "测试已取消，未写入任何配置。");
+      } else if (acceptedTest) {
+        acceptedTest = null;
+        commitButton.disabled = true;
+        updateCancelButton();
+        setStatus("", "等待填写", "已取消保存，原测试结果不再可用。");
+      }
+    });
+
+    openNetwork.addEventListener("change", () => {
+      fields.wifiPassword.disabled = openNetwork.checked;
+      fields.wifiPassword.value = "";
+    });
+
+    form.addEventListener("input", handleFormChange);
+    form.addEventListener("change", handleFormChange);
+
+    form.addEventListener("reset", () => {
+      clearTestTimer();
+      clearCommitTimer();
+      activeTest = null;
+      acceptedTest = null;
+      testButton.disabled = false;
+      commitButton.disabled = true;
+      cancelButton.disabled = true;
+
+      window.setTimeout(() => {
+        clearErrors();
+        fields.wifiPassword.disabled = false;
+        setStatus("", "等待填写", "请填写家里的 Wi-Fi 和 MQTT Broker 信息。");
+      }, 0);
+    });
+  </script>
+</body>
+</html>

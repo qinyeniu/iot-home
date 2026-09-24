@@ -560,6 +560,17 @@ static void rf_power_policy_persist(uint8_t mode, int8_t manual_power_dbm)
         return;
     }
 
+    uint8_t stored_mode = RF_MODE_UNKNOWN;
+    int8_t stored_manual_power = RF_POWER_UNKNOWN_DBM;
+    esp_err_t mode_err = nvs_get_u8(handle, "mode", &stored_mode);
+    esp_err_t power_err = nvs_get_i8(handle, "mpwr", &stored_manual_power);
+    if (mode_err == ESP_OK && power_err == ESP_OK &&
+        stored_mode == mode && stored_manual_power == manual_power_dbm) {
+        nvs_close(handle);
+        ESP_LOGI(TAG, "RF power policy unchanged; skip Flash write");
+        return;
+    }
+
     esp_err_t err = nvs_set_u8(handle, "mode", mode);
     if (err == ESP_OK) {
         err = nvs_set_i8(handle, "mpwr", manual_power_dbm);

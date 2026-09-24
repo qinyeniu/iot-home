@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 04:15（Asia/Shanghai；网关 backoff 版本已烧录，8 小时复测进行中）
+更新时间：2026-09-25 04:30（Asia/Shanghai；网关 backoff 版本已烧录，8 小时复测进行中）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -102,7 +102,7 @@
 
 ### P1：NVS A/B 接口尚未硬件验证
 
-A/B bundle 已离线编译并复审通过，但尚未验证真实硬件上的 save → restart → load、写入失败、掉电恢复和 legacy 回退。当前不得直接把启动读取切换到 bundle。
+A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 save → restart → load、写入失败、异常 marker、掉电恢复和 legacy 回退。当前不得直接烧录或加入 SoftAP/HTTP。
 
 ### P1：仓库工作区较乱
 
@@ -124,8 +124,9 @@ A/B bundle 已离线编译并复审通过，但尚未验证真实硬件上的 sa
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；
 2. 测试 save → load → restart → load；
 3. 测试写入失败/取消/旧配置仍可用；
-4. 确定启动优先级：bundle > legacy keys > build default，或保留更保守的显式启用方式；
-5. 验证通过后再考虑接入 SoftAP。
+4. 验证离线接入的启动优先级：bundle > legacy keys > build default；
+5. 验证异常 marker/CRC 回退和写入期间掉电恢复；
+6. 验证通过后再考虑接入 SoftAP。
 
 ### 阶段 C：MQTT 安全部署（需要用户在场和维护窗口）
 

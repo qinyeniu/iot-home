@@ -1,7 +1,7 @@
 # 固件全链路说明：节点、网关、MQTT 与后端
 
 更新时间：2026-09-25 03:50
-状态：COM6 已运行 RF 发送失败后退避版本；仓库中的 RF policy Flash 去重与 On/Off 陈旧目标保护均仅离线编译，尚未烧录
+状态：COM6 已运行 RF 发送失败后退避版本；仓库中的 RF policy Flash 去重、On/Off 陈旧目标保护和 A/B bundle 启动路径均仅离线编译，尚未烧录
 适用工程：
 
 - 网关：`firmware/gateway/`
@@ -573,7 +573,7 @@ iot-home/{gateway_id}/nodes/{node_id}/cmd
    烧录前长测中，网关在上行正常的情况下连续 RF 下发失败；03:33 已完成受控应用区更新，03:38 已启动新的 8 小时复测。最终报告前不得直接升级协议栈或加入新的自动重启策略。
 
 2. **NVS A/B Bundle 需硬件验证**
-   多个 legacy 字符串键不能靠一次 `nvs_commit()` 形成事务；当前已离线实现 `cfg_a/cfg_b/cfg_commit` A/B 接口。SoftAP `/commit` 前仍需在真实网关上验证 save/load/restart、掉电恢复和旧配置回退，当前运行时尚未调用该接口。
+   当前已离线实现 `cfg_a/cfg_b/cfg_commit` A/B 接口，并且网关启动路径已按 bundle → legacy → build default 接入；但尚未烧录或验证 save/load/restart、掉电恢复、异常 marker 回退和旧配置回退。
 
 3. **节点身份稳定性**
    短地址可能变化，不能作为长期产品 ID。建议以 IEEE address/安装阶段生成的稳定 node ID 做映射，短地址只作为当前路由地址。
@@ -586,7 +586,7 @@ iot-home/{gateway_id}/nodes/{node_id}/cmd
 
 ### 8.2 产品化阶段处理
 
-1. SoftAP + 本地网页配网；
+1. SoftAP + 本地网页配网（当前只完成 NVS bundle 与启动路径，尚未加入 SoftAP/HTTP）；
 2. 凭据保存与 NVS 加密路线评估；
 3. 低磨损 Flash spool，仅在明确需要且使用专用分区时实施；
 4. 电池节点独立工程：已离线完成 SED、60 秒采集上报、按需 I2C；下一步硬件实测电流，再决定负载开关或 deep sleep；

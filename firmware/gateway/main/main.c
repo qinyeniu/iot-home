@@ -150,6 +150,21 @@ static void product_runtime_config_init(void)
     iot_mqtt_config_t mqtt_cfg;
     esp_err_t wifi_err;
     esp_err_t mqtt_err;
+    esp_err_t bundle_err;
+
+    bundle_err = iot_product_config_load_bundle(&wifi_cfg, &mqtt_cfg);
+    if (bundle_err == ESP_OK) {
+        s_product_wifi = wifi_cfg;
+        s_product_mqtt = mqtt_cfg;
+        s_product_wifi_from_nvs = true;
+        s_product_mqtt_from_nvs = true;
+        ESP_LOGI(TAG, "Runtime config: wifi=A/B-bundle mqtt=A/B-bundle");
+        return;
+    }
+    if (bundle_err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Product A/B config unavailable: %s; trying legacy keys",
+                 esp_err_to_name(bundle_err));
+    }
 
     strlcpy(s_product_wifi.ssid, WIFI_SSID, sizeof(s_product_wifi.ssid));
     strlcpy(s_product_wifi.password, WIFI_PASSWORD,

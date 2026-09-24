@@ -1,168 +1,164 @@
 # IoT-Home Gateway Firmware
 
-ESP32-C6 网关固件，实现 Zigbee 协调器 + Wi-Fi STA + MQTT 客户端 + OLED 状态显示。
+ESP32-C6 网关固件，承担以下职责：
 
-## 功能特性
+- Zigbee 3.0 coordinator；
+- Wi‑Fi STA 接入家庭网络；
+- MQTT 客户端和 Zigbee ↔ MQTT 桥接；
+- 节点传感器数据缓存、聚合和去重；
+- RF 功率策略、远程 QUERY/SET/AUTO 和发送失败后退避；
+- OLED SSD1306 状态显示；
+- 本地产品配置 NVS 读取。
 
-- ✅ Wi-Fi STA 连接
-- ✅ MQTT 客户端（数据上传和命令接收）
-- ⏳ Zigbee 协调器（待实现）
-- ⏳ OLED 状态显示（待实现）
-- ⏳ 命令转发（待实现）
+> 当前事实来源：`docs/CURRENT_DEVELOPMENT_PLAN.md`、`docs/FIRMWARE_FULL_CHAIN_WALKTHROUGH.md` 和最新 `docs/HANDOFF_*.md`。
 
-## 硬件要求
+## 1. 当前功能状态
 
-- ESP32-C6 开发板（SuperMini 或 DevKitM-1）
-- USB-C 数据线
-- 电脑（Windows/Linux/macOS）
+### 已在硬件上验证
 
-## 软件要求
+- Zigbee coordinator、channel 26；
+- 现网节点 secure join / authenticated secure rejoin；
+- 温湿度、光照遥测从 Zigbee 到网关、MQTT、后端、MySQL 的上行链路；
+- 标准 on/off/toggle 远程控制及 OnOff 状态回报；
+- RF QUERY → SET 0 → SET -10 → AUTO 短序列；
+- RF 发送失败后自动退避版本；
+- 正常拔掉节点不会导致网关重启；
+- OLED 状态显示。
 
-- ESP-IDF v5.5.4（已安装）
-- Python 3.11+（已安装）
+### 仓库离线就绪但尚未全部烧录
 
-## 编译步骤
+- RF policy 相同值不重复写入 NVS，降低 Flash 磨损；
+- On/Off 陈旧目标保护：节点超过 180 秒未存活时跳过开关命令；
+- NVS A/B 完整配置 bundle 和启动优先级；
+- RF 命令 selected node 目标匹配，避免多节点阶段误控；
+- SoftAP/HTTP 配网本身尚未接入。
 
-### 1. 打开 ESP-IDF 终端
+这些能力只有在硬件维护窗口验证后才能视为上线。
 
-在 Windows 上，打开开始菜单，找到：
-- ESP-IDF v5.5.4 → ESP-IDF PowerShell
+## 2. 硬件和软件环境
 
-或者手动设置环境变量：
-`powershell
-cd C:\Espressif\v5.5.4\esp-idf
-.\export.ps1
-`
+- 芯片：ESP32-C6；
+- 调试端口：实际端口以 Windows 设备枚举为准；历史测试中网关常为 COM6、节点常为 COM5，但不能默认固定；
+- ESP-IDF：v5.5.4；
+- 构建主机：Windows PowerShell。
 
-### 2. 进入固件目录
+注意：打开串口监视器或重新烧录可能触发布局复位；长测期间不要操作串口。
 
-`powershell
+## 3. 编译
+
+```powershell
 cd C:\Users\HJB\Documents\iot-home\firmware\gateway
-`
-
-### 3. 配置项目
-
-`powershell
-idf.py menuconfig
-`
-
-在配置菜单中：
-- Component config → ESP WiFi → WiFi SSID（设置你的 WiFi 名称）
-- Component config → ESP WiFi → WiFi Password（设置你的 WiFi 密码）
-
-### 4. 编译固件
-
-`powershell
+. C:\Espressif\v5.5.4\esp-idf\export.ps1
 idf.py build
-`
-
-### 5. 烧录固件
-
-连接 ESP32-C6 开发板，然后运行：
-
-`powershell
-idf.py -p COM3 flash
-`
-
-（将 COM3 替换为你的串口名称）
-
-### 6. 查看日志
-
-`powershell
-idf.py -p COM3 monitor
-`
-
-## 配置说明
-
-### Wi-Fi 配置
-
-在 sdkconfig.defaults 中修改：
-
-`
-CONFIG_ESP_WIFI_SSID="your_wifi_ssid"
-CONFIG_ESP_WIFI_PASSWORD="your_wifi_password"
-`
-
-### MQTT 配置
-
-在 main/main.c 中修改：
-
-`c
-#define MQTT_BROKER_URI "mqtt://localhost:1883"
-#define MQTT_TOPIC_PREFIX "iot-home/gw-001"
-`
-
-## MQTT 主题
-
-| 主题 | 说明 |
-|------|------|
-| iot-home/gw-001/nodes/+/telemetry | 遥测数据上报 |
-| iot-home/gw-001/nodes/+/status | 设备状态上报 |
-| iot-home/gw-001/nodes/+/cmd | 命令下发 |
-
-## 故障排除
-
-### 1. 编译失败
-
-确保 ESP-IDF 环境已正确设置：
-`powershell
-cd C:\Espressif\v5.5.4\esp-idf
-.\export.ps1
-`
-
-### 2. 烧录失败
-
-检查串口连接：
-`powershell
-idf.py -p COM3 flash
-`
-
-如果失败，尝试按住 BOOT 按钮再插入 USB。
-
-### 3. Wi-Fi 连接失败
-
-检查 Wi-Fi 名称和密码是否正确。
-
-### 4. MQTT 连接失败
-
-确保 MQTT 服务器正在运行：
-`powershell
-docker compose ps mosquitto
-`
-
-## 下一步开发
-
-1. ✅ Wi-Fi STA 连接
-2. ✅ MQTT 客户端
-3. ⏳ Zigbee 协调器
-4. ⏳ OLED 状态显示
-5. ⏳ 命令转发
-6. ⏳ 断线重连
-7. ⏳ OTA 更新
-
-## 参考资源
-
-- [ESP-IDF 编程指南](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32c6/get-started/)
-- [ESP-Zigbee-SDK](https://github.com/espressif/esp-zigbee-sdk)
-- [MQTT 协议](https://mqtt.org/)
-
-
-## WiFi 凭据配置（2026-09-10 起）
-
-真实 WiFi 名称和密码不再写入 Git。首次构建前复制模板：
-
-```powershell
-Copy-Item main/wifi_secrets.h.example main/wifi_secrets.h
 ```
 
-然后编辑 `main/wifi_secrets.h`，填入一个 2.4GHz SSID 和密码。该文件已被 `.gitignore` 忽略。
+构建产物：
 
-## MQTT 凭据配置（2026-09-16 起）
-
-```powershell
-Copy-Item main/mqtt_secrets.h.example main/mqtt_secrets.h
+```text
+build\iot-home-gateway.bin
+build\iot-home-gateway.elf
 ```
 
-然后编辑 `main/mqtt_secrets.h`，填入与服务器 `server/.env` 一致的 MQTT 用户名和密码。该文件已被 `.gitignore` 忽略，不能提交。Broker 关闭匿名访问前，必须先烧录携带该凭据的网关固件。
+烧录前必须重新计算并记录 SHA256：
 
-若 OLED 显示 `WIFI:NO`，先看 `docs/GATEWAY_WIFI_RECOVERY.md`，不要直接判断为 MQTT 或 OLED 故障。
+```powershell
+Get-FileHash -Algorithm SHA256 build\iot-home-gateway.bin
+```
+
+如果应用分区剩余低于 5%，不得继续叠加 SoftAP/HTTP 等大功能，应先精简页面/代码或重新规划分区。
+
+## 4. 安全烧录原则
+
+未经用户明确授权：
+
+- 不刷 bootloader；
+- 不刷分区表；
+- 不整片擦 Flash；
+- 不擦 Zigbee NVRAM；
+- 不烧录节点。
+
+维护窗口中若只更新网关应用区，先停止占用 COM6 的采集进程，再执行应用区写入：
+
+```powershell
+python -m esptool --chip esp32c6 --port COM6 --baud 460800 `
+  --before default_reset --after hard_reset write_flash `
+  --flash_mode dio --flash_size 4MB --flash_freq 80m `
+  0x10000 build\iot-home-gateway.bin
+```
+
+实际 COM 端口和二进制路径必须按当时情况复核。
+
+## 5. 凭据与配置
+
+### 实验室编译期回退
+
+本地开发可使用被 `.gitignore` 忽略的：
+
+- `main/wifi_secrets.h`
+- `main/mqtt_secrets.h`
+
+模板分别为：
+
+- `main/wifi_secrets.h.example`
+- `main/mqtt_secrets.h.example`
+
+不要读取、打印、提交或在文档中记录真实密码文件。
+
+### 产品化 NVS
+
+共享组件位于：
+
+```text
+firmware/common/iot_product_config/
+```
+
+当前支持：
+
+- legacy `iotcfg` 散列键读取；
+- `cfg_a` / `cfg_b` / `cfg_commit` A/B 完整配置；
+- 启动时按 bundle → legacy → 编译期默认值尝试。
+
+SoftAP/HTTP、配置测试连接、恢复出厂和错误回滚尚未接入。NVS encryption、Flash encryption、Secure Boot 涉及不可逆 eFuse，必须由用户明确确认后再做。
+
+## 6. MQTT 主题约定
+
+| 主题 | 方向 | 说明 |
+|---|---|---|
+| `iot-home/{gateway}/nodes/{node}/telemetry` | 网关发布 | 温湿度、光照、OnOff 状态 |
+| `iot-home/{gateway}/nodes/{node}/status` | 网关发布 | retained 在线状态 |
+| `iot-home/{gateway}/nodes/{node}/cmd` | 网关订阅 | on/off/toggle、RF 命令 |
+| `iot-home/{gateway}/nodes/{node}/rf_policy` | 网关发布 | RF 策略/命令状态 |
+| `iot-home/gateway/{gateway}/status` | 网关发布 | 网关 LWT/状态 |
+
+短地址会变化，产品化阶段应使用 IEEE address 或稳定 node ID 做长期身份映射，短地址只用于当前通信。
+
+## 7. 常见问题
+
+### Wi‑Fi 连接失败
+
+先看串口和 OLED 状态，不要切换电脑网卡或热点。可参考：
+
+- `docs/GATEWAY_WIFI_RECOVERY.md`
+- `docs/FIRMWARE_FULL_CHAIN_WALKTHROUGH.md`
+
+### MQTT 登录失败
+
+检查当前运行配置来自 bundle、legacy NVS 还是编译期默认；日志不得输出密码。
+
+### RF 下行失败
+
+单次失败不等同节点离线；若出现连续明确失败，分析器会按规则降级或 FAIL。不要在未确认根因时升级 ZBOSS、加入重启循环或擦 Zigbee NVRAM。
+
+### 串口打不开
+
+可能已有采集进程占用。先枚举和确认进程用途，不能为了释放端口直接结束未知进程。
+
+## 8. 后续维护顺序
+
+1. 完成烧录后 8 小时双串口长测；
+2. 根据最终报告决定是否烧录当前离线候选；
+3. 硬件窗口验证 stale On/Off 和节点拔插；
+4. 验证 NVS A/B bundle 的 save/load/restart 和掉电恢复；
+5. 再实施最小 SoftAP/HTTP；
+6. 用户有空时教学式完成 MQTT ACL、TLS/WSS 或 VPN；
+7. 稳定后再拆分 `main.c` 和推进电池节点硬件实测。

@@ -494,6 +494,7 @@
         updateCancelButton();
         setStatus("passed", "连接测试通过", "保存将使用本次测试快照；若再修改字段，需要重新测试。");
       }, 900);
+      updateCancelButton();
     });
 
     commitButton.addEventListener("click", () => {

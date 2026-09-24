@@ -700,15 +700,19 @@ static void sensor_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     for (;;) {
+        if (!s_joined) {
+            if (i2c_bus_ready()) {
+                i2c_bus_deinit();
+                aht20_ready = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
         if (!i2c_bus_ready()) {
             if (i2c_bus_rebuild("bus unavailable") != ESP_OK) {
                 vTaskDelay(pdMS_TO_TICKS(2000));
             }
-            continue;
-        }
-
-        if (!s_joined) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
@@ -790,6 +794,10 @@ static void sensor_task(void *arg)
             }
         }
 
+        /* Release the I2C controller between samples; sensors use low-power
+         * states and BH1750 was already started in one-shot mode. */
+        i2c_bus_deinit();
+        aht20_ready = false;
         vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
     }
 }
@@ -846,11 +854,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Battery sensor SED starting");
 
-    if (i2c_bus_init() == ESP_OK) {
-        ESP_LOGI(TAG, "I2C ready: SDA=%d SCL=%d", I2C_SDA_PIN, I2C_SCL_PIN);
-    } else {
-        ESP_LOGE(TAG, "I2C unavailable at startup; sensor task will retry");
-    }
+    ESP_LOGI(TAG, "I2C is powered on demand after Zigbee joins");
 
     xTaskCreate(sensor_task, "sensor", 4096, NULL, 5, NULL);
     xTaskCreate(zigbee_task, "zigbee", 6144, NULL, 5, NULL);

@@ -1,6 +1,6 @@
 # 电池传感器 SED 实验工程
 
-状态：阶段 2，已加入 AHT20/BH1750 周期采集与 ZCL 上报；仅离线编译，**未烧录**。
+状态：阶段 3，已在阶段 2 基础上加入按需 I2C 控制器初始化/释放；仅离线编译，**未烧录**。
 
 ## 目标
 
@@ -49,7 +49,9 @@ lux = 10^(raw / 10000) - 1
 ## 低功耗与失败策略
 
 - BH1750 使用 one-shot high-resolution 命令 `0x20`，转换结束后自动断电；不使用现网常供电节点的连续测量命令 `0x10`。
-- AHT20 初始化只在启动或需要恢复时执行；测量完成后不主动写 Flash。
+- 启动时不初始化 I2C；Zigbee 入网后每次采样前临时初始化 I2C，采样和 ZCL 请求提交后释放 I2C 控制器。
+- 未入网时不初始化 I2C；如果入网期间 I2C 已存在但链路断开，会主动释放 I2C。
+- AHT20 每个采样周期按需初始化；测量完成后不主动写 Flash。
 - 如果 ZCL/APS 请求在本地提交阶段被拒绝，最多立即重试 3 次。
 - 如果帧已经发出但 APS 未确认，本阶段不做无线补报，等待下一个采样周期，以减少电量消耗和射频重试。
 - AHT20/BH1750 任一读取失败时，会把对应本地 ZCL MeasuredValue 恢复为 invalid（温度 `0x8000`，湿度/光照 `0xFFFF`），避免网关主动 Read 时读到陈旧值；本阶段不主动发送 invalid report。
@@ -64,7 +66,16 @@ lux = 10^(raw / 10000) - 1
 idf.py build
 ```
 
-阶段 2 结果：
+阶段 3 结果：
+
+```text
+binary size 0x7d7a0 bytes
+app partition 0xe1000 bytes
+free 0x63860 bytes (44%)
+SHA256 7AC688C7E0EA2D1178D8E3B1CDAF336C2C89399D42338C9A508BBDA896480A53
+```
+
+阶段 2 结果（保留作对比）：
 
 ```text
 binary size 0x7d800 bytes
@@ -83,13 +94,15 @@ free 0x6c480 bytes (48%)
 
 1. 启动 NVS 和 Power Management；
 2. 配置 FreeRTOS tickless / light sleep；
-3. 初始化 I2C 和 AHT20/BH1750 设备句柄；
+3. 不保持 I2C 控制器；
 4. 初始化 Zigbee ZED，关闭 idle 接收；
 5. 注册 Basic、Identify、Temperature Measurement、Humidity Measurement、Illuminance Measurement clusters；
 6. 工厂新设备执行 network steering；已配网设备尝试基于保存状态 rejoin；重试采用 5 秒 → 30 秒 → 60 秒退避；
 7. 入网成功后日志打印 PAN、Extended PAN ID、channel 和 short address；
-8. 每 60 秒读取一次 AHT20 与 BH1750，更新本地 ZCL 属性并向协调器发送三条报告；
-9. 收到 `ESP_ZB_COMMON_SIGNAL_CAN_SLEEP` 时进入 Zigbee sleep。
+8. Zigbee 入网后每 60 秒临时初始化 I2C；
+9. 读取 AHT20 与 BH1750，更新本地 ZCL 属性并向协调器发送三条报告；
+10. 请求提交后释放 I2C 控制器；
+11. 收到 `ESP_ZB_COMMON_SIGNAL_CAN_SLEEP` 时进入 Zigbee sleep。
 
 ## 硬件在线时的验收
 
@@ -101,7 +114,7 @@ free 0x6c480 bytes (48%)
 4. 验证能在 channel 26 加入目标 coordinator，而不是同信道其他开放网络；
 5. 核对 PAN、Extended PAN ID、short address；
 6. 验证网关每 60 秒收到温度、湿度、光照三项，且光照反算结果合理；
-7. 验证空闲时进入 light sleep；
+7. 验证空闲时进入 light sleep，且 I2C 控制器未保持运行；
 8. 用功率分析仪或低功耗电流表记录睡眠、轮询和上报电流；
 9. 不擦 Zigbee NVRAM、不刷 bootloader/分区表，除非用户另行明确授权。
 
@@ -117,4 +130,4 @@ free 0x6c480 bytes (48%)
 
 当前只固定 channel 26，尚未预置目标 Extended PAN ID、install code 或其他网络身份约束。因此在同信道存在多个开放网络时，仍可能加入非预期 coordinator。硬件测试时应确认 channel 26 上只有目标网络开放加入；后续产品化再选择预置 Extended PAN ID 或 install code 路线。
 
-后续真正进入电池产品化前，还需要确认：AHT20/BH1750 的供电门控、I2C 上拉来源、板上 LED/USB 芯片功耗、keep-alive 与采样周期是否对齐，并用实物电流测试代替理论估算。
+后续真正进入电池产品化前，还需要确认：AHT20/BH1750 的供电门控、I2C 上拉来源、板上 LED/USB 芯片功耗、keep-alive 与采样周期是否对齐，并用实物电流测试代替理论估算。当前“释放 I2C 控制器”不等同于完全切断传感器电源，不能替代负载开关和电流实测。

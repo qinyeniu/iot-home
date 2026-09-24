@@ -530,7 +530,7 @@ ZB_ESP_MAC: No buffer, handle it
 
 网关在节点表中用 `last_seen_ms` 记录最近一次 join/announce 或有效 ZCL report：
 
-- RF QUERY/SET/AUTO 只要求 topic 中的短地址是 active child；
+- RF QUERY/SET/AUTO 要求 topic 中的短地址是 active child，并且等于当前全局 selected RF node，防止多节点阶段误控；
 - 标准 on/off/toggle 还要求该节点 180 秒内存活；
 - 节点拔出且没有 leave 时，超过 180 秒的开关命令会在串口记录 warning 并停止下发；
 - 该保护不写 NVS，也不会把节点 active 状态直接改成 offline。

@@ -2722,9 +2722,20 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
             strcmp(command_name, "rf_set_auto") == 0 ||
             strcmp(command_name, "rf_set_power") == 0 ||
             strcmp(command_name, "rf_manual_power") == 0;
+        uint16_t selected_rf_addr = 0;
+        taskENTER_CRITICAL(&s_rf_power_lock);
+        selected_rf_addr = s_rf_node_addr;
+        taskEXIT_CRITICAL(&s_rf_power_lock);
         if (is_rf_command && !rf_power_known_active_child(short_addr)) {
             ESP_LOGW(TAG, "CMD rf: node=0x%04x skipped: not an active child",
                      (unsigned)short_addr);
+            cJSON_Delete(root);
+            return;
+        }
+        if (is_rf_command && selected_rf_addr != short_addr) {
+            ESP_LOGW(TAG,
+                     "CMD rf: node=0x%04x skipped: selected RF node is 0x%04x",
+                     (unsigned)short_addr, (unsigned)selected_rf_addr);
             cJSON_Delete(root);
             return;
         }

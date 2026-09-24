@@ -10,7 +10,7 @@
 | `capture_serial_stream.py` | 串口流式记录；使用前需确认是否会触发复位 |
 | `capture_serial_no_reset.py` | 尽量保持 DTR/RTS inactive 的被动串口记录 |
 | `analyze_serial_log.py` | 流式分析单份 ESP 串口日志，识别重启、panic、MAC no-buffer、Zigbee/MQTT/Wi‑Fi 等 |
-| `analyze_long_test.py` | 同时分析节点/网关双日志，识别网关 RF 下发持续失败，输出 `PASS / DEGRADED / FAIL / INCOMPLETE` 报告 |
+| `analyze_long_test.py` | 同时分析节点/网关双日志，识别 RF 下发持续失败、业务黑障、节点 rejoin failure 风暴和网关 `wifi:m f null` 风暴，输出 `PASS / DEGRADED / FAIL / INCOMPLETE` 报告 |
 | `analyze_overnight_logs.py` | 旧版整夜双日志分析脚本，保留作历史兼容 |
 | `rf_power_config.py` | 通过 MQTT 执行 RF QUERY/SET/AUTO 联调 |
 | `simulator.py` | 模拟设备向 MQTT 发布数据 |
@@ -28,8 +28,8 @@ python tools/analyze_long_test.py `
 
 判定规则：
 
-- `FAIL`：assert/panic/abort、重启标志、uptime 回跳、MAC no-buffer 风暴，或网关连续 RF 下发失败达到阈值（默认 5 次）；
-- `DEGRADED`：节点 APS/I2C/队列失败、观察缺口、未达风暴阈值的 MAC no-buffer、单次 RF 明确失败或 RF 结果无法解析；
+- `FAIL`：assert/panic/abort、重启标志、uptime 回跳、MAC no-buffer 风暴、网关连续 RF 下发失败达到阈值（默认 5 次），或节点 rejoin failure / 网关 `wifi:m f null` 风暴叠加双端全链路业务中断；
+- `DEGRADED`：节点 APS/I2C/队列失败、观察缺口、未达风暴阈值的 MAC no-buffer、单次 RF 明确失败、RF 结果无法解析、无错误风暴佐证的双端业务黑障，或未叠加双端业务中断的错误风暴；
 - `INCOMPLETE`：目标时长未满足，且未发现失败或降级线索；
 - `PASS`：达到目标时长且未发现异常。
 

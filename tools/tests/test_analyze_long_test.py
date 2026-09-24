@@ -485,3 +485,261 @@ def test_redacts_json_quoted_credentials():
     assert "secret" not in safe
     assert "abc" not in safe
     assert "***" in safe
+
+
+def test_fail_on_rejoin_and_wifi_storm_during_business_blackout(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    node_lines = [
+        node_stats(1000, 10),
+        "I (1000) zb-sensor: DATA: {'temp':25.0}",
+        "I (1000) zb-sensor: REPORT_SEND: reason=sample flags=0x07",
+        "W (305000) zb-sensor: Zigbee: Startup/rejoin failed",
+    ]
+    node_lines.extend(
+        "ZBOSS: nwk/nwk_join.c:629   Rejoin failure: no dev with xpanid"
+        for _ in range(25)
+    )
+    node_lines.append("I (310000) zb-sensor: Waiting for Zigbee network...")
+    gateway_lines = [
+        gateway_line(1000, True),
+    ]
+    gateway_lines.extend(
+        f"W ({305000 + index * 100}) wifi:m f null"
+        for index in range(25)
+    )
+    write_log(node_log, node_lines)
+    write_log(gateway_log, gateway_lines)
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        gap_threshold_s=300,
+    )
+
+    assert result["verdict"] == "FAIL"
+    assert result["paired_business_blackouts"]
+    assert result["node"]["node_rejoin_storm"]["significant_burst_count"] == 1
+    assert result["gateway"]["wifi_mf_storm"]["significant_burst_count"] == 1
+    assert any("rejoin failure" in item for item in result["failure_reasons"])
+    assert any("m f null" in item for item in result["failure_reasons"])
+    report = analyze_long_test.format_markdown(result)
+    assert "业务连续性" in report
+    assert "错误风暴" in report
+
+
+def test_plain_business_blackout_is_degraded_not_failed(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    write_log(
+        node_log,
+        [
+            node_stats(1000, 10),
+            "I (1000) zb-sensor: DATA: {'temp':25.0}",
+            "I (1000) zb-sensor: REPORT_SEND: reason=sample flags=0x07",
+            "I (310000) zb-sensor: Waiting for Zigbee network...",
+        ],
+    )
+    write_log(
+        gateway_log,
+        [gateway_line(1000, True), gateway_line(310000, False)],
+    )
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        gap_threshold_s=300,
+    )
+
+    assert result["verdict"] == "DEGRADED"
+    assert result["paired_business_blackouts"]
+    assert not result["failure_reasons"]
+
+
+def test_storm_without_business_blackout_is_degraded(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    node_lines = [
+        node_stats(1000, 10),
+        "I (1000) zb-sensor: DATA: {'temp':25.0}",
+        "I (1000) zb-sensor: REPORT_SEND: reason=sample flags=0x07",
+        "W (5000) zb-sensor: Zigbee: Startup/rejoin failed",
+    ]
+    node_lines.extend(
+        "ZBOSS: nwk/nwk_join.c:629   Rejoin failure: no dev with xpanid"
+        for _ in range(25)
+    )
+    node_lines.extend(
+        [
+            "I (10000) zb-sensor: DATA: {'temp':25.1}",
+            "I (10000) zb-sensor: REPORT_SEND: reason=sample flags=0x07",
+            node_stats(10000, 11),
+        ]
+    )
+    gateway_lines = [
+        gateway_line(1000, True),
+    ]
+    gateway_lines.extend(
+        f"W ({5000 + index * 100}) wifi:m f null"
+        for index in range(25)
+    )
+    gateway_lines.append(gateway_line(10000, True))
+    write_log(node_log, node_lines)
+    write_log(gateway_log, gateway_lines)
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        gap_threshold_s=300,
+    )
+
+    assert result["verdict"] == "DEGRADED"
+    assert result["node"]["node_rejoin_storm"]["significant_burst_count"] == 1
+    assert result["gateway"]["wifi_mf_storm"]["significant_burst_count"] == 1
+
+
+def test_single_node_rejoin_outage_is_degraded_not_failed(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    node_lines = [
+        node_stats(1000, 10),
+        "I (1000) zb-sensor: DATA: {'temp':25.0}",
+        "I (1000) zb-sensor: REPORT_SEND: reason=sample",
+        "W (305000) zb-sensor: Startup/rejoin failed",
+    ]
+    node_lines.extend(
+        "ZBOSS: nwk/nwk_join.c:629   Rejoin failure: no dev"
+        for _ in range(25)
+    )
+    write_log(node_log, node_lines)
+    write_log(gateway_log, [gateway_line(305000, True)])
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        gap_threshold_s=300,
+    )
+
+    assert result["verdict"] == "DEGRADED"
+    assert not result["paired_business_blackouts"]
+    assert any("节点上报出现中断" in r for r in result["degraded_reasons"])
+    assert not result["failure_reasons"]
+
+
+def test_single_gateway_wifi_outage_is_degraded_not_failed(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    gateway_lines = [
+        gateway_line(1000, True),
+    ]
+    gateway_lines.extend(
+        f"W ({305000 + index * 100}) wifi:m f null"
+        for index in range(25)
+    )
+    node_lines = []
+    for uptime, rounds in ((1000, 10), (100000, 10), (310000, 11)):
+        node_lines.extend(
+            [
+                node_stats(uptime, rounds),
+                f"I ({uptime}) zb-sensor: DATA: {{'temp':25.0}}",
+                f"I ({uptime}) zb-sensor: REPORT_SEND: reason=sample",
+            ]
+        )
+    write_log(node_log, node_lines)
+    write_log(gateway_log, gateway_lines)
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        gap_threshold_s=300,
+    )
+
+    assert result["verdict"] == "DEGRADED"
+    assert not result["paired_business_blackouts"]
+    assert any("网关 MQTT 出现中断" in r for r in result["degraded_reasons"])
+    assert not result["failure_reasons"]
+
+
+def test_raw_rejoin_tail_is_degraded_but_not_timed_failure(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    node_lines = [
+        node_stats(1000, 10),
+        "I (1000) zb-sensor: DATA: {'temp':25.0}",
+        "I (1000) zb-sensor: REPORT_SEND: reason=sample",
+    ]
+    node_lines.extend(
+        "ZBOSS: nwk/nwk_join.c:629   Rejoin failure: no dev"
+        for _ in range(25)
+    )
+    write_log(node_log, node_lines)
+    write_log(gateway_log, [gateway_line(1000, True)])
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        gap_threshold_s=300,
+    )
+
+    assert result["verdict"] == "DEGRADED"
+    assert result["node"]["counts"]["raw_rejoin_failures"] == 25
+    assert any("无时间戳" in r for r in result["degraded_reasons"])
+    assert not result["failure_reasons"]
+
+
+def test_uptime_rollback_resets_segment_timeline(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+
+    def node_business(uptime: int, rounds: int):
+        return [
+            node_stats(uptime, rounds),
+            f"I ({uptime}) zb-sensor: DATA: {{'temp':25.0}}",
+            f"I ({uptime}) zb-sensor: REPORT_SEND: reason=sample",
+        ]
+
+    node_lines = node_business(1000, 10)
+    node_lines.extend(node_business(200000, 20))
+    node_lines.extend(node_business(1000, 1))
+    node_lines.extend(node_business(50000, 5))
+
+    gateway_lines = [gateway_line(1000, True), gateway_line(200000, True)]
+    gateway_lines.extend(
+        [gateway_line(1000, True), gateway_line(50000, True)]
+    )
+
+    write_log(node_log, node_lines)
+    write_log(gateway_log, gateway_lines)
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=300,
+        gap_threshold_s=300,
+    )
+
+    assert result["verdict"] == "FAIL"
+    assert result["node"]["uptime_rollbacks"] == 1
+    assert result["duration_s"] == 248.0
+    assert len(result["node"]["boot_segments"]) == 2
+    assert len(result["gateway"]["boot_segments"]) == 2
+    assert not result["paired_business_blackouts"]
+
+
+def test_timed_storm_uses_half_open_window_boundary():
+    storm = analyze_long_test.TimedEventStorm(
+        "test", window_s=60, threshold=2
+    )
+
+    storm.add(0, 1)
+    storm.add(60000, 2)
+
+    assert storm.total == 2
+    assert storm.max_events_in_window == 1
+    assert storm.significant_burst_count == 0

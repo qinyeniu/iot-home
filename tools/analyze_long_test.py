@@ -5,7 +5,7 @@
 
 - PASS：目标时长满足，且未识别到严重问题或降级线索；
 - DEGRADED：时长可能未满足，但已出现 APS/I2C/队列失败、观察缺口等；
-- FAIL：出现断言、panic、重启、uptime 回跳，或 MAC no-buffer 风暴；
+- FAIL：出现断言、panic、重启、uptime 回跳、MAC no-buffer 风暴，或错误风暴叠加业务黑障；
 - INCOMPLETE：未达到目标时长，且尚未出现明确降级或失败线索。
 """
 
@@ -36,6 +36,8 @@ RF_SEND_RESULT_RE = re.compile(
 )
 RF_ACCEPTED_RE = re.compile(r"\bRF power: report accepted\b")
 RF_KEEP_RE = re.compile(r"\bRF power: keep\b")
+NODE_REJOIN_FAILURE_RE = re.compile(r"\bRejoin failure:")
+WIFI_MF_NULL_RE = re.compile(r"^m f null$")
 URI_USERINFO_RE = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]*://)[^\s/@]+@")
 URL_QUERY_SECRET_RE = re.compile(
     r"(?i)([?&](?:access_token|refresh_token|token|api[_-]?key|apikey|"
@@ -174,6 +176,134 @@ def add_sample(
         samples.append(event)
 
 
+class TimedEventStorm:
+    """按滑动窗口统计带 uptime 的重复事件。"""
+
+    def __init__(
+        self,
+        event_type: str,
+        window_s: float,
+        threshold: int,
+    ) -> None:
+        self.event_type = event_type
+        self.window_s = window_s
+        self.threshold = threshold
+        self.total = 0
+        self.max_events_in_window = 0
+        self.significant_burst_count = 0
+        self.significant_bursts: list[dict[str, Any]] = []
+        self._events: deque[tuple[int, int]] = deque()
+        self._active = False
+
+    def reset(self) -> None:
+        """uptime 回跳后丢弃旧启动段事件。"""
+        self.total = 0
+        self.max_events_in_window = 0
+        self.significant_burst_count = 0
+        self.significant_bursts.clear()
+        self._events.clear()
+        self._active = False
+
+    def add(self, uptime_ms: int | None, line_no: int) -> None:
+        if uptime_ms is None:
+            return
+        self.total += 1
+        self._events.append((uptime_ms, line_no))
+        while (
+            self._events
+            and uptime_ms - self._events[0][0] >= self.window_s * 1000
+        ):
+            self._events.popleft()
+        count = len(self._events)
+        if count > self.max_events_in_window:
+            self.max_events_in_window = count
+        if count >= self.threshold and not self._active:
+            self._active = True
+            self.significant_burst_count += 1
+            add_sample(
+                self.significant_bursts,
+                {
+                    "event_type": self.event_type,
+                    "start_uptime_ms": self._events[0][0],
+                    "end_uptime_ms": uptime_ms,
+                    "count": count,
+                    "line": line_no,
+                },
+            )
+        elif count >= self.threshold and self._active:
+            if self.significant_bursts:
+                self.significant_bursts[-1].update(
+                    {
+                        "start_uptime_ms": self._events[0][0],
+                        "end_uptime_ms": uptime_ms,
+                        "count": count,
+                        "line": line_no,
+                    }
+                )
+        elif count < self.threshold:
+            self._active = False
+
+    def asdict(self) -> dict[str, Any]:
+        return {
+            "event_type": self.event_type,
+            "total": self.total,
+            "max_events_in_window": self.max_events_in_window,
+            "window_s": self.window_s,
+            "threshold": self.threshold,
+            "significant_bursts": self.significant_bursts,
+            "significant_burst_count": self.significant_burst_count,
+            "sample_limit": EVENT_SAMPLE_LIMIT,
+        }
+
+
+def build_business_outages(
+    events: list[tuple[int, int]],
+    first_uptime_ms: int | None,
+    last_uptime_ms: int | None,
+    threshold_s: float,
+    total_lines: int,
+) -> list[dict[str, Any]]:
+    """找出长时间没有成功业务事件的区间。"""
+    if (
+        first_uptime_ms is None
+        or last_uptime_ms is None
+        or not events
+    ):
+        return []
+
+    ordered = sorted(set(events))
+    threshold_ms = int(threshold_s * 1000)
+    outages: list[dict[str, Any]] = []
+
+    previous_up, previous_line = ordered[0]
+    for uptime_ms, line_no in ordered[1:]:
+        gap = uptime_ms - previous_up
+        if gap >= threshold_ms:
+            outages.append(
+                {
+                    "start_uptime_ms": previous_up,
+                    "end_uptime_ms": uptime_ms,
+                    "duration_s": round(gap / 1000.0, 3),
+                    "start_line": previous_line,
+                    "end_line": line_no,
+                }
+            )
+        previous_up, previous_line = uptime_ms, line_no
+
+    tail = last_uptime_ms - previous_up
+    if tail >= threshold_ms:
+        outages.append(
+            {
+                "start_uptime_ms": previous_up,
+                "end_uptime_ms": last_uptime_ms,
+                "duration_s": round(tail / 1000.0, 3),
+                "start_line": previous_line,
+                "end_line": total_lines,
+            }
+        )
+    return outages
+
+
 def analyze_log(
     path: str | Path,
     role: str,
@@ -223,6 +353,15 @@ def analyze_log(
     rf_sustained_active = False
     rf_failure_start: dict[str, Any] | None = None
 
+    node_rejoin_storm = TimedEventStorm(
+        "node_rejoin_failure", 60.0, 20
+    )
+    wifi_mf_storm = TimedEventStorm("wifi_mf_null", 60.0, 20)
+    business_events: list[tuple[int, int]] = []
+    business_event_segments: list[list[tuple[int, int]]] = []
+    boot_segment_bounds: list[tuple[int, int]] = []
+    accumulated_duration_ms = 0
+
     def reset_rf_failure_run() -> None:
         """重启或遇到未知结果时，只断开当前连续失败段；累计历史保留。"""
         nonlocal rf_current_failed_run, rf_sustained_active, rf_failure_start
@@ -267,6 +406,22 @@ def analyze_log(
                 and MAC_NO_BUFFER_RE.search(body)
             )
 
+            signal_uptime_ms = (
+                uptime_ms if uptime_ms is not None else previous_uptime_ms
+            )
+            if role == "node" and NODE_REJOIN_FAILURE_RE.search(body):
+                counts["rejoin_failures"] += 1
+                node_rejoin_storm.add(signal_uptime_ms, line_no)
+                if not match:
+                    counts["raw_rejoin_failures"] += 1
+            if (
+                role == "gateway"
+                and match
+                and match.group("tag") == "wifi"
+                and WIFI_MF_NULL_RE.search(body)
+            ):
+                wifi_mf_storm.add(uptime_ms, line_no)
+
             if not match:
                 continue
 
@@ -279,9 +434,25 @@ def analyze_log(
                 if delta_ms < 0:
                     uptime_rollbacks += 1
                     restart_count += 1
+                    # 先封存旧启动段，再按新启动段重置时间轴。
+                    if first_uptime_ms is not None:
+                        accumulated_duration_ms += (
+                            previous_uptime_ms - first_uptime_ms
+                        )
+                        boot_segment_bounds.append(
+                            (first_uptime_ms, previous_uptime_ms)
+                        )
+                        business_event_segments.append(business_events)
                     # 重启后不能把旧启动段的 MAC/RF 连续段混进新窗口。
                     mac_window.clear()
                     mac_burst_active = False
+                    node_rejoin_storm.reset()
+                    wifi_mf_storm.reset()
+                    business_events = []
+                    first_stats = None
+                    last_stats = None
+                    first_uptime_ms = uptime_ms
+                    last_uptime_ms = uptime_ms
                     reset_rf_failure_run()
                     add_sample(
                         restart_events,
@@ -317,10 +488,13 @@ def analyze_log(
                     counts["data_samples"] += 1
                 if text.startswith("REPORT_SEND:"):
                     counts["report_sends"] += 1
+                if text.startswith(("DATA:", "REPORT_SEND:")):
+                    business_events.append((uptime_ms, line_no))
 
             if role == "gateway":
                 if TELEMETRY_RE.search(text):
                     counts["telemetry_published"] += 1
+                    business_events.append((uptime_ms, line_no))
                 if DUPLICATE_RE.search(text):
                     counts["duplicate_suppressed"] += 1
                 if CACHED_REPORT_RE.search(text):
@@ -392,7 +566,7 @@ def analyze_log(
                 mac_window.append(uptime_ms)
                 while (
                     mac_window
-                    and uptime_ms - mac_window[0] > mac_window_s * 1000
+                    and uptime_ms - mac_window[0] >= mac_window_s * 1000
                 ):
                     mac_window.popleft()
                 window_count = len(mac_window)
@@ -416,9 +590,38 @@ def analyze_log(
             previous_uptime_ms = uptime_ms
             saw_uptime = True
 
-    duration_s = 0.0
     if first_uptime_ms is not None and last_uptime_ms is not None:
-        duration_s = round((last_uptime_ms - first_uptime_ms) / 1000.0, 3)
+        boot_segment_bounds.append((first_uptime_ms, last_uptime_ms))
+        business_event_segments.append(business_events)
+
+    business_outages: list[dict[str, Any]] = []
+    for segment_index, (events, bounds) in enumerate(
+        zip(business_event_segments, boot_segment_bounds)
+    ):
+        segment_first, segment_last = bounds
+        segment_outages = build_business_outages(
+            events,
+            segment_first,
+            segment_last,
+            gap_threshold_s,
+            total_lines,
+        )
+        for outage in segment_outages:
+            outage["segment_index"] = segment_index
+            outage["segment_base_ms"] = segment_first
+            business_outages.append(outage)
+    business_outage_count = len(business_outages)
+
+    duration_s = round(accumulated_duration_ms / 1000.0, 3)
+    if first_uptime_ms is not None and last_uptime_ms is not None:
+        duration_s = round(
+            (
+                accumulated_duration_ms
+                + (last_uptime_ms - first_uptime_ms)
+            )
+            / 1000.0,
+            3,
+        )
 
     return {
         "file": str(path),
@@ -433,6 +636,20 @@ def analyze_log(
         "last_report_stats": last_stats,
         "observation_gaps": observation_gaps,
         "observation_gap_count": observation_gap_count,
+        "business_events": business_events,
+        "business_event_segments": business_event_segments,
+        "boot_segments": [
+            {
+                "segment_index": index,
+                "first_uptime_ms": first,
+                "last_uptime_ms": last,
+            }
+            for index, (first, last) in enumerate(boot_segment_bounds)
+        ],
+        "business_outages": business_outages,
+        "business_outage_count": business_outage_count,
+        "node_rejoin_storm": node_rejoin_storm.asdict(),
+        "wifi_mf_storm": wifi_mf_storm.asdict(),
         "fatal_events": fatal_events,
         "fatal_event_count": fatal_count,
         "restart_events": restart_events,
@@ -497,6 +714,112 @@ def _role_events(report: dict[str, Any]) -> list[str]:
             f"（阈值 {rf_send['sustained_run_threshold']}），下行 APS 链路持续不可用"
         )
     return reasons
+
+
+def _interval_overlap(
+    first: dict[str, Any], second: dict[str, Any]
+) -> tuple[int, int] | None:
+    start = max(first["start_uptime_ms"], second["start_uptime_ms"])
+    end = min(first["end_uptime_ms"], second["end_uptime_ms"])
+    if end > start:
+        return start, end
+    return None
+
+
+def _storm_overlaps_blackouts(
+    report: dict[str, Any],
+    storm_key: str,
+    blackouts: list[dict[str, Any]],
+    base_key: str,
+) -> list[dict[str, Any]]:
+    """检查错误风暴是否落在双端业务黑障对应一侧。"""
+    overlaps: list[dict[str, Any]] = []
+    storm = report[storm_key]
+    for blackout in blackouts:
+        base = blackout[base_key]
+        blackout_absolute = {
+            "start_uptime_ms": base + blackout["start_relative_ms"],
+            "end_uptime_ms": base + blackout["end_relative_ms"],
+        }
+        for burst in storm["significant_bursts"]:
+            start = max(
+                blackout_absolute["start_uptime_ms"],
+                burst["start_uptime_ms"],
+            )
+            end = min(
+                blackout_absolute["end_uptime_ms"],
+                burst["end_uptime_ms"],
+            )
+            # 无 uptime 的 ZBOSS 批次可能只形成一个时间点；
+            # 该点落入黑障区间即可作为佐证，不把零长度本身当持续时间证据。
+            if start > end:
+                continue
+            overlaps.append(
+                {
+                    "segment_index": blackout["segment_index"],
+                    "start_uptime_ms": start,
+                    "end_uptime_ms": end,
+                    "duration_s": round(
+                        max(0, end - start) / 1000.0, 3
+                    ),
+                    "storm_total": storm["total"],
+                    "storm_window_peak": storm[
+                        "max_events_in_window"
+                    ],
+                    "threshold": storm["threshold"],
+                }
+            )
+    return overlaps
+
+
+def _paired_business_blackouts(
+    node: dict[str, Any], gateway: dict[str, Any]
+) -> list[dict[str, Any]]:
+    blackouts: list[dict[str, Any]] = []
+    for node_outage in node["business_outages"]:
+        for gateway_outage in gateway["business_outages"]:
+            if (
+                node_outage["segment_index"]
+                != gateway_outage["segment_index"]
+            ):
+                continue
+            node_base = node_outage["segment_base_ms"]
+            gateway_base = gateway_outage["segment_base_ms"]
+            node_rel = {
+                "start_uptime_ms": (
+                    node_outage["start_uptime_ms"] - node_base
+                ),
+                "end_uptime_ms": (
+                    node_outage["end_uptime_ms"] - node_base
+                ),
+            }
+            gateway_rel = {
+                "start_uptime_ms": (
+                    gateway_outage["start_uptime_ms"] - gateway_base
+                ),
+                "end_uptime_ms": (
+                    gateway_outage["end_uptime_ms"] - gateway_base
+                ),
+            }
+            match = _interval_overlap(node_rel, gateway_rel)
+            if match is None:
+                continue
+            start, end = match
+            blackouts.append(
+                {
+                    "segment_index": node_outage["segment_index"],
+                    "start_relative_ms": start,
+                    "end_relative_ms": end,
+                    "duration_s": round((end - start) / 1000.0, 3),
+                    "node_start_line": node_outage["start_line"],
+                    "gateway_start_line": gateway_outage[
+                        "start_line"
+                    ],
+                    "node_segment_base_ms": node_base,
+                    "gateway_segment_base_ms": gateway_base,
+                }
+            )
+    return blackouts
 
 
 def analyze_pair(
@@ -567,8 +890,90 @@ def analyze_pair(
                 f"{role}有 {rf_send['unknown']} 次 RF 下发结果无法解析"
             )
 
+    paired_business_blackouts = _paired_business_blackouts(
+        node, gateway
+    )
+    node_rejoin_outages = _storm_overlaps_blackouts(
+        node,
+        "node_rejoin_storm",
+        paired_business_blackouts,
+        "node_segment_base_ms",
+    )
+    wifi_mf_outages = _storm_overlaps_blackouts(
+        gateway,
+        "wifi_mf_storm",
+        paired_business_blackouts,
+        "gateway_segment_base_ms",
+    )
+
+    if node_rejoin_outages:
+        failure_reasons.append(
+            "节点 rejoin failure 风暴叠加全链路业务中断：最长重叠 "
+            f"{max(x['duration_s'] for x in node_rejoin_outages):.1f} 秒，"
+            "节点无法重新接入网关"
+        )
+    if wifi_mf_outages:
+        failure_reasons.append(
+            "网关 `wifi:m f null` 风暴叠加全链路业务中断：最长重叠 "
+            f"{max(x['duration_s'] for x in wifi_mf_outages):.1f} 秒"
+        )
+
     if duration_s >= 60 and gateway["counts"].get("telemetry_published", 0) == 0:
         degraded_reasons.append("网关超过 60 秒未发布 MQTT 遥测")
+
+    paired_segments = {
+        item["segment_index"] for item in paired_business_blackouts
+    }
+    node_single_outages = [
+        outage
+        for outage in node["business_outages"]
+        if outage["segment_index"] not in paired_segments
+    ]
+    gateway_single_outages = [
+        outage
+        for outage in gateway["business_outages"]
+        if outage["segment_index"] not in paired_segments
+    ]
+    if node_single_outages:
+        degraded_reasons.append(
+            "节点上报出现中断，但网关 MQTT 未在同一启动段同时中断；最长 "
+            f"{max(x['duration_s'] for x in node_single_outages):.1f} 秒"
+        )
+    if gateway_single_outages:
+        degraded_reasons.append(
+            "网关 MQTT 出现中断，但节点上报未在同一启动段同时中断；最长 "
+            f"{max(x['duration_s'] for x in gateway_single_outages):.1f} 秒"
+        )
+
+    if paired_business_blackouts and not (
+        node_rejoin_outages or wifi_mf_outages
+    ):
+        degraded_reasons.append(
+            "全链路业务黑障：节点上报和网关 MQTT 同时中断，最长 "
+            f"{max(x['duration_s'] for x in paired_business_blackouts):.1f} 秒"
+        )
+
+    raw_rejoin = node["counts"].get("raw_rejoin_failures", 0)
+    if raw_rejoin >= 20:
+        degraded_reasons.append(
+            f"日志中存在 {raw_rejoin} 条无时间戳 rejoin failure，"
+            "无法仅凭串口行确认持续时长"
+        )
+
+    if (
+        node["node_rejoin_storm"]["significant_burst_count"] > 0
+        and not node_rejoin_outages
+    ):
+        degraded_reasons.append(
+            "节点出现 rejoin failure 风暴，但未与全链路业务中断重叠"
+        )
+    if (
+        gateway["wifi_mf_storm"]["significant_burst_count"] > 0
+        and not wifi_mf_outages
+    ):
+        degraded_reasons.append(
+            "网关出现 `wifi:m f null` 风暴，但未与全链路业务中断重叠"
+        )
 
     incomplete_reasons: list[str] = []
     if duration_s < target_duration_s:
@@ -605,6 +1010,7 @@ def analyze_pair(
         "incomplete_reasons": incomplete_reasons,
         "node": node,
         "gateway": gateway,
+        "paired_business_blackouts": paired_business_blackouts,
     }
 
 
@@ -651,6 +1057,53 @@ def format_markdown(result: dict[str, Any]) -> str:
         "| 指标 | 首轮 | 末轮 | 增量 |",
         "| --- | ---: | ---: | ---: |",
     ]
+
+    def outage_summary(label: str, report: dict[str, Any]) -> list[str]:
+        out = [
+            f"- {label}：{report['business_outage_count']} 段",
+        ]
+        for outage in report["business_outages"][:5]:
+            out.append(
+                f"  - 第 {outage['start_line']}–{outage['end_line']} 行："
+                f"{outage['duration_s']:.1f} 秒无成功业务事件"
+            )
+        return out
+
+    lines.extend(
+        [
+            "",
+            "## 业务连续性",
+            "",
+            *outage_summary("节点上报黑障", node),
+            *outage_summary("网关 MQTT 黑障", gateway),
+            f"- 双端重叠黑障：{len(result['paired_business_blackouts'])} 段",
+        ]
+    )
+    for blackout in result["paired_business_blackouts"][:5]:
+        lines.append(
+            "  - "
+            f"节点第 {blackout['node_start_line']} 行、网关第 "
+            f"{blackout['gateway_start_line']} 行起，重叠 "
+            f"{blackout['duration_s']:.1f} 秒"
+        )
+
+    node_rejoin = node["node_rejoin_storm"]
+    wifi_mf = gateway["wifi_mf_storm"]
+    lines.extend(
+        [
+            "",
+            "## 错误风暴",
+            "",
+            "- 节点 rejoin failure："
+            f"{node_rejoin['total']} 次，60 秒窗口峰值 "
+            f"{node_rejoin['max_events_in_window']}，显著突发 "
+            f"{node_rejoin['significant_burst_count']} 个",
+            "- 网关 wifi:m f null："
+            f"{wifi_mf['total']} 次，60 秒窗口峰值 "
+            f"{wifi_mf['max_events_in_window']}，显著突发 "
+            f"{wifi_mf['significant_burst_count']} 个",
+        ]
+    )
 
     keys = tuple(dict.fromkeys((*NODE_STAT_KEYS, *first_stats, *last_stats)))
     for key in keys:
@@ -801,7 +1254,7 @@ def parse_args() -> argparse.Namespace:
         "--gap-threshold",
         type=positive_float,
         default=300,
-        help="观察缺口阈值，默认 300 秒",
+        help="观察缺口和业务黑障阈值，默认 300 秒",
     )
     parser.add_argument(
         "--mac-storm-threshold",

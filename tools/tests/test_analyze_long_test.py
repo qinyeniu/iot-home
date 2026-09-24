@@ -279,3 +279,209 @@ def test_empty_logs_are_incomplete(tmp_path):
     assert any("节点日志为空" in item for item in result["incomplete_reasons"])
 
 
+def gateway_rf_send_line(uptime: int, seq: int, result: str = "ESP_OK"):
+    return (
+        f"I ({uptime}) iot-gw: RF power -> node=0x82cb cmd=1 power=0 "
+        f"mode=auto seq={seq}: {result}"
+    )
+
+
+def test_single_rf_send_failure_is_degraded(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    write_log(node_log, [node_stats(1000, 10), node_stats(20000, 20)])
+    write_log(
+        gateway_log,
+        [
+            gateway_rf_send_line(1000, 34, "ESP_ERR_NO_MEM"),
+            gateway_line(2000, True),
+        ],
+    )
+
+    result = analyze_long_test.analyze_pair(
+        node_log, gateway_log, target_duration_s=1
+    )
+
+    assert result["verdict"] == "DEGRADED"
+    rf_send = result["gateway"]["rf_send"]
+    assert rf_send["failed"] == 1
+    assert rf_send["max_consecutive_failures"] == 1
+    assert rf_send["status_counts"]["ESP_ERR_NO_MEM"] == 1
+    assert any("RF 下发明确失败" in item for item in result["degraded_reasons"])
+
+
+def test_sustained_rf_send_failure_fails(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    write_log(node_log, [node_stats(1000, 10), node_stats(20000, 20)])
+    write_log(
+        gateway_log,
+        [
+            gateway_rf_send_line(1000 + index * 1000, 34 + index, "ESP_ERR_NO_MEM")
+            for index in range(5)
+        ],
+    )
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        rf_failure_run_threshold=5,
+    )
+
+    assert result["verdict"] == "FAIL"
+    rf_send = result["gateway"]["rf_send"]
+    assert rf_send["failed"] == 5
+    assert rf_send["max_consecutive_failures"] == 5
+    assert rf_send["sustained_run_count"] == 1
+    assert any("连续" in item for item in result["failure_reasons"])
+
+
+def test_successful_rf_send_resets_failure_run(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    gateway_lines = [
+        gateway_rf_send_line(1000 + index * 1000, 34 + index, "ESP_ERR_NO_MEM")
+        for index in range(4)
+    ]
+    gateway_lines.append(gateway_rf_send_line(5000, 38, "ESP_OK"))
+    gateway_lines.extend(
+        gateway_rf_send_line(6000 + index * 1000, 39 + index, "ESP_ERR_NO_MEM")
+        for index in range(4)
+    )
+    write_log(node_log, [node_stats(1000, 10), node_stats(20000, 20)])
+    write_log(gateway_log, gateway_lines)
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        rf_failure_run_threshold=5,
+    )
+
+    assert result["verdict"] == "DEGRADED"
+    rf_send = result["gateway"]["rf_send"]
+    assert rf_send["failed"] == 8
+    assert rf_send["ok"] == 1
+    assert rf_send["max_consecutive_failures"] == 4
+    assert rf_send["sustained_run_count"] == 0
+
+
+def test_rf_failure_run_resets_after_restart_marker(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    write_log(node_log, [node_stats(1000, 10), node_stats(10000, 20)])
+    write_log(
+        gateway_log,
+        [
+            gateway_rf_send_line(1000, 1, "ESP_ERR_NO_MEM"),
+            gateway_rf_send_line(2000, 2, "ESP_ERR_NO_MEM"),
+            "rst:0x1 (POWERON_RESET),boot:0x",
+            gateway_rf_send_line(1000, 3, "ESP_ERR_NO_MEM"),
+        ],
+    )
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        rf_failure_run_threshold=5,
+    )
+
+    assert result["verdict"] == "FAIL"
+    rf_send = result["gateway"]["rf_send"]
+    assert rf_send["failed"] == 3
+    assert rf_send["max_consecutive_failures"] == 2
+    assert rf_send["status_counts"]["ESP_ERR_NO_MEM"] == 3
+
+
+def test_unknown_rf_send_result_is_degraded_but_not_failed(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    write_log(node_log, [node_stats(1000, 10), node_stats(10000, 20)])
+    write_log(
+        gateway_log,
+        [
+            "I (1000) iot-gw: RF power -> node=0x82cb cmd=1 power=0 "
+            "mode=auto seq=34",
+            gateway_line(2000, True),
+        ],
+    )
+
+    result = analyze_long_test.analyze_pair(
+        node_log, gateway_log, target_duration_s=1
+    )
+
+    assert result["verdict"] == "DEGRADED"
+    rf_send = result["gateway"]["rf_send"]
+    assert rf_send["failed"] == 0
+    assert rf_send["unknown"] == 1
+    assert rf_send["max_consecutive_failures"] == 0
+    assert any("无法解析" in item for item in result["degraded_reasons"])
+
+
+def test_rf_failure_samples_are_bounded_but_counts_remain_total(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    write_log(node_log, [node_stats(1000, 10), node_stats(30000, 20)])
+    write_log(
+        gateway_log,
+        [
+            gateway_rf_send_line(1000 + index * 1000, 1 + index, "ESP_ERR_NO_MEM")
+            for index in range(25)
+        ],
+    )
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        rf_failure_run_threshold=5,
+    )
+
+    rf_send = result["gateway"]["rf_send"]
+    assert result["verdict"] == "FAIL"
+    assert rf_send["failure_count"] == 25
+    assert rf_send["failed"] == 25
+    assert len(rf_send["failures"]) <= 20
+    assert rf_send["max_consecutive_failures"] == 25
+
+
+def test_second_sustained_rf_failure_run_is_counted_after_recovery(tmp_path):
+    node_log = tmp_path / "node.txt"
+    gateway_log = tmp_path / "gateway.txt"
+    gateway_lines = [
+        gateway_rf_send_line(1000 + index * 1000, 1 + index, "ESP_ERR_NO_MEM")
+        for index in range(5)
+    ]
+    gateway_lines.append(gateway_rf_send_line(6000, 6, "ESP_OK"))
+    gateway_lines.extend(
+        gateway_rf_send_line(7000 + index * 1000, 7 + index, "ESP_ERR_NO_MEM")
+        for index in range(5)
+    )
+    write_log(node_log, [node_stats(1000, 10), node_stats(20000, 20)])
+    write_log(gateway_log, gateway_lines)
+
+    result = analyze_long_test.analyze_pair(
+        node_log,
+        gateway_log,
+        target_duration_s=1,
+        rf_failure_run_threshold=5,
+    )
+
+    rf_send = result["gateway"]["rf_send"]
+    assert result["verdict"] == "FAIL"
+    assert rf_send["failed"] == 10
+    assert rf_send["ok"] == 1
+    assert rf_send["max_consecutive_failures"] == 5
+    assert rf_send["sustained_run_count"] == 2
+
+
+def test_redacts_json_quoted_credentials():
+    text = '{"password":"secret","api-key":"abc"}'
+
+    safe = analyze_long_test.redact(text)
+
+    assert "secret" not in safe
+    assert "abc" not in safe
+    assert "***" in safe

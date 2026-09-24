@@ -31,6 +31,9 @@ DUPLICATE_RE = re.compile(r"MQTT duplicate suppressed\b")
 CACHED_REPORT_RE = re.compile(r"cached report node=")
 RF_SAMPLE_RE = re.compile(r"\bRF sample\b")
 RF_SEND_RE = re.compile(r"\bRF power -> node=")
+RF_SEND_RESULT_RE = re.compile(
+    r"\bRF power -> node=.*:\s*(?P<result>ESP_[A-Z0-9_]+)\s*$"
+)
 RF_ACCEPTED_RE = re.compile(r"\bRF power: report accepted\b")
 RF_KEEP_RE = re.compile(r"\bRF power: keep\b")
 URI_USERINFO_RE = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]*://)[^\s/@]+@")
@@ -39,8 +42,8 @@ URL_QUERY_SECRET_RE = re.compile(
     r"secret|password|passwd|pwd)=)[^&#\s]+"
 )
 SENSITIVE_KV_RE = re.compile(
-    r"(?i)\b(password|passwd|pwd|token|api[_-]?key|apikey|secret)"
-    r"\s*[:=]\s*[\"']?[^\"'\s,}]+"
+    r"(?i)\b[\"']?(password|passwd|pwd|token|api[_-]?key|apikey|secret)"
+    r"[\"']?\s*[:=]\s*[\"']?[^\"'\s,}]+"
 )
 EVENT_SAMPLE_LIMIT = 20
 
@@ -177,6 +180,7 @@ def analyze_log(
     gap_threshold_s: float,
     mac_storm_threshold: int = 20,
     mac_window_s: float = 60.0,
+    rf_failure_run_threshold: int = 5,
 ) -> dict[str, Any]:
     """流式分析单份 ESP 串口日志。"""
     total_lines = 0
@@ -207,6 +211,25 @@ def analyze_log(
     mac_bursts: list[dict[str, Any]] = []
     mac_burst_active = False
 
+    rf_status_counts: Counter[str] = Counter()
+    rf_send_failed_total = 0
+    rf_send_failures: list[dict[str, Any]] = []
+    rf_sustained_runs: list[dict[str, Any]] = []
+    rf_send_recoveries: list[dict[str, Any]] = []
+    rf_send_unknown_total = 0
+    rf_current_failed_run = 0
+    rf_max_failed_run = 0
+    rf_sustained_run_count = 0
+    rf_sustained_active = False
+    rf_failure_start: dict[str, Any] | None = None
+
+    def reset_rf_failure_run() -> None:
+        """重启或遇到未知结果时，只断开当前连续失败段；累计历史保留。"""
+        nonlocal rf_current_failed_run, rf_sustained_active, rf_failure_start
+        rf_current_failed_run = 0
+        rf_sustained_active = False
+        rf_failure_start = None
+
     with Path(path).open("r", encoding="utf-8", errors="ignore") as handle:
         for raw_line in handle:
             total_lines += 1
@@ -226,6 +249,7 @@ def analyze_log(
             # boot/rst 行通常没有 uptime 前缀。观察开始后的此类行视为重启。
             if saw_uptime and any(pattern.search(body) for pattern in RESTART_PATTERNS):
                 restart_count += 1
+                reset_rf_failure_run()
                 add_sample(restart_events, _event(line_no, uptime_ms, body))
             elif not saw_uptime and any(
                 pattern.search(body) for pattern in RESTART_PATTERNS
@@ -255,9 +279,10 @@ def analyze_log(
                 if delta_ms < 0:
                     uptime_rollbacks += 1
                     restart_count += 1
-                    # uptime 已进入新启动段，不能把旧段 MAC 事件混进新窗口。
+                    # 重启后不能把旧启动段的 MAC/RF 连续段混进新窗口。
                     mac_window.clear()
                     mac_burst_active = False
+                    reset_rf_failure_run()
                     add_sample(
                         restart_events,
                         {
@@ -302,8 +327,61 @@ def analyze_log(
                     counts["cached_reports"] += 1
                 if RF_SAMPLE_RE.search(text):
                     counts["rf_samples"] += 1
-                if RF_SEND_RE.search(text):
+                rf_send_match = RF_SEND_RE.search(text)
+                if rf_send_match:
                     counts["rf_commands_sent"] += 1
+                    result_match = RF_SEND_RESULT_RE.search(text)
+                    send_result = (
+                        result_match.group("result")
+                        if result_match
+                        else "UNKNOWN"
+                    )
+                    rf_status_counts[send_result] += 1
+                    send_event = _event(line_no, uptime_ms, text)
+
+                    if send_result == "ESP_OK":
+                        if rf_current_failed_run > 0:
+                            add_sample(rf_send_recoveries, send_event)
+                        rf_current_failed_run = 0
+                        rf_sustained_active = False
+                    elif send_result.startswith("ESP_ERR_"):
+                        rf_send_failed_total += 1
+                        if rf_current_failed_run == 0:
+                            rf_failure_start = send_event
+                        rf_current_failed_run += 1
+                        add_sample(rf_send_failures, send_event)
+                        if rf_current_failed_run > rf_max_failed_run:
+                            rf_max_failed_run = rf_current_failed_run
+                        if (
+                            rf_current_failed_run >= rf_failure_run_threshold
+                            and not rf_sustained_active
+                        ):
+                            rf_sustained_active = True
+                            rf_sustained_run_count += 1
+                            add_sample(
+                                rf_sustained_runs,
+                                {
+                                    "line": line_no,
+                                    "start_line": (
+                                        rf_failure_start["line"]
+                                        if rf_failure_start
+                                        else line_no
+                                    ),
+                                    "start_uptime_ms": (
+                                        rf_failure_start["uptime_ms"]
+                                        if rf_failure_start
+                                        else uptime_ms
+                                    ),
+                                    "trigger_uptime_ms": uptime_ms,
+                                    "length": rf_current_failed_run,
+                                    "threshold": rf_failure_run_threshold,
+                                },
+                            )
+                    else:
+                        # UNKNOWN 可能来自截断或非标准日志。它需要降级提示，
+                        # 但不能计入明确的 ESP_ERR_* 失败次数。
+                        rf_send_unknown_total += 1
+                        reset_rf_failure_run()
                 if RF_ACCEPTED_RE.search(text):
                     counts["rf_reports_accepted"] += 1
                 if RF_KEEP_RE.search(text):
@@ -371,6 +449,22 @@ def analyze_log(
             "significant_burst_count": mac_burst_count,
             "sample_limit": EVENT_SAMPLE_LIMIT,
         },
+        "rf_send": {
+            "total": counts.get("rf_commands_sent", 0),
+            "ok": rf_status_counts.get("ESP_OK", 0),
+            "failed": rf_send_failed_total,
+            "unknown": rf_send_unknown_total,
+            "status_counts": dict(rf_status_counts),
+            "failures": rf_send_failures,
+            "failure_count": rf_send_failed_total,
+            "unknown_count": rf_send_unknown_total,
+            "max_consecutive_failures": rf_max_failed_run,
+            "sustained_run_threshold": rf_failure_run_threshold,
+            "sustained_run_count": rf_sustained_run_count,
+            "sustained_runs": rf_sustained_runs,
+            "recoveries": rf_send_recoveries,
+            "sample_limit": EVENT_SAMPLE_LIMIT,
+        },
     }
 
 
@@ -391,6 +485,17 @@ def _role_events(report: dict[str, Any]) -> list[str]:
             f"{role}出现 MAC no-buffer 风暴：{mac['window_s']} 秒窗口峰值 "
             f"{mac['max_events_in_window']}，阈值 {mac['storm_threshold']}"
         )
+
+    rf_send = report.get("rf_send")
+    if (
+        rf_send
+        and rf_send["max_consecutive_failures"]
+        >= rf_send["sustained_run_threshold"]
+    ):
+        reasons.append(
+            f"{role}连续 {rf_send['max_consecutive_failures']} 次 RF 下发失败"
+            f"（阈值 {rf_send['sustained_run_threshold']}），下行 APS 链路持续不可用"
+        )
     return reasons
 
 
@@ -400,6 +505,7 @@ def analyze_pair(
     target_duration_s: float = 28800,
     gap_threshold_s: float = 300,
     mac_storm_threshold: int = 20,
+    rf_failure_run_threshold: int = 5,
 ) -> dict[str, Any]:
     """分析双日志并给出汇总判定。"""
     node = analyze_log(
@@ -407,12 +513,14 @@ def analyze_pair(
         "node",
         gap_threshold_s=gap_threshold_s,
         mac_storm_threshold=mac_storm_threshold,
+        rf_failure_run_threshold=rf_failure_run_threshold,
     )
     gateway = analyze_log(
         gateway_log,
         "gateway",
         gap_threshold_s=gap_threshold_s,
         mac_storm_threshold=mac_storm_threshold,
+        rf_failure_run_threshold=rf_failure_run_threshold,
     )
 
     first_stats = node.get("first_report_stats") or {}
@@ -441,6 +549,22 @@ def analyze_pair(
         if mac["total"] > 0 and mac["max_events_in_window"] < mac["storm_threshold"]:
             degraded_reasons.append(
                 f"{role}出现 {mac['total']} 次 MAC no-buffer，但未达到风暴阈值"
+            )
+        rf_send = report.get("rf_send")
+        if rf_send and rf_send["failed"] > 0:
+            failed_statuses = ", ".join(
+                f"{status}×{count}"
+                for status, count in sorted(rf_send["status_counts"].items())
+                if status.startswith("ESP_ERR_")
+            )
+            degraded_reasons.append(
+                f"{role}RF 下发明确失败 {rf_send['failed']} 次"
+                f"（{failed_statuses}），最长连续 "
+                f"{rf_send['max_consecutive_failures']} 次"
+            )
+        if rf_send and rf_send["unknown"] > 0:
+            degraded_reasons.append(
+                f"{role}有 {rf_send['unknown']} 次 RF 下发结果无法解析"
             )
 
     if duration_s >= 60 and gateway["counts"].get("telemetry_published", 0) == 0:
@@ -537,6 +661,7 @@ def format_markdown(result: dict[str, Any]) -> str:
 
     node_counts = node["counts"]
     gateway_counts = gateway["counts"]
+    gateway_rf_send = gateway["rf_send"]
     lines.extend(
         [
             "",
@@ -548,7 +673,11 @@ def format_markdown(result: dict[str, Any]) -> str:
             f"重复抑制：{gateway_counts.get('duplicate_suppressed', 0)}；"
             f"缓存 report：{gateway_counts.get('cached_reports', 0)}。",
             f"- 网关 RF samples：{gateway_counts.get('rf_samples', 0)}；"
-            f"RF 下发：{gateway_counts.get('rf_commands_sent', 0)}；"
+            f"RF 下发：{gateway_counts.get('rf_commands_sent', 0)}"
+            f"（OK {gateway_rf_send['ok']} / 明确失败 "
+            f"{gateway_rf_send['failed']} / 未知 "
+            f"{gateway_rf_send['unknown']}，最长连续 "
+            f"{gateway_rf_send['max_consecutive_failures']}）；"
             f"RF accepted：{gateway_counts.get('rf_reports_accepted', 0)}；"
             f"keep：{gateway_counts.get('rf_keeps', 0)}。",
             "",
@@ -591,6 +720,30 @@ def format_markdown(result: dict[str, Any]) -> str:
             lines.append(
                 f"  - {role}第 {event['line']} 行：{event['text']}"
             )
+
+    rf_status_bits = ", ".join(
+        f"{status}×{count}"
+        for status, count in sorted(gateway_rf_send["status_counts"].items())
+    ) or "无"
+    lines.extend(
+        [
+            "",
+            "## 网关 RF 下发结果",
+            "",
+            f"- 总数：{gateway_rf_send['total']}；成功：{gateway_rf_send['ok']}；"
+            f"明确失败：{gateway_rf_send['failed']}；"
+            f"未知：{gateway_rf_send['unknown']}。",
+            f"- 状态分布：{rf_status_bits}。",
+            f"- 最长连续失败：{gateway_rf_send['max_consecutive_failures']}；"
+            f"持续失败阈值：{gateway_rf_send['sustained_run_threshold']}；"
+            f"持续失败段：{gateway_rf_send['sustained_run_count']}。",
+        ]
+    )
+    for event in gateway_rf_send["failures"][:10]:
+        lines.append(
+            f"  - 第 {event['line']} 行（uptime {event['uptime_ms']} ms）："
+            f"{event['text']}"
+        )
 
     for report in (node, gateway):
         role = "节点" if report["role"] == "node" else "网关"
@@ -656,6 +809,12 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="MAC no-buffer 风暴阈值，默认 60 秒内 20 次",
     )
+    parser.add_argument(
+        "--rf-failure-run-threshold",
+        type=positive_int,
+        default=5,
+        help="连续 RF 下发失败阈值，默认 5 次",
+    )
     parser.add_argument("--json", type=Path, help="写入 JSON 结果")
     parser.add_argument("--markdown", type=Path, help="写入 Markdown 报告")
     return parser.parse_args()
@@ -675,6 +834,7 @@ def main() -> int:
         target_duration_s=args.target_duration,
         gap_threshold_s=args.gap_threshold,
         mac_storm_threshold=args.mac_storm_threshold,
+        rf_failure_run_threshold=args.rf_failure_run_threshold,
     )
 
     markdown = format_markdown(result)

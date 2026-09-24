@@ -1,12 +1,13 @@
 # 固件全链路说明：节点、网关、MQTT 与后端
 
-更新时间：2026-09-24  
-状态：基于当前仓库代码梳理；本次只写文档，未修改固件运行逻辑  
+更新时间：2026-09-25 02:25
+状态：基于当前仓库代码与夜间长测状态梳理；本文件只做文档更新，未修改固件运行逻辑  
 适用工程：
 
 - 网关：`firmware/gateway/`
 - 组合节点：`firmware/node_zigbee/`
 - 共享配置组件：`firmware/common/iot_product_config/`
+- 独立电池实验工程：`firmware/node_battery_sensor/`
 - 后端参考：`server/backend/`
 
 ## 1. 一句话总览
@@ -517,8 +518,8 @@ iot-home/{gateway_id}/nodes/{node_id}/cmd
 
 ### 8.1 先解决，不建议绕过
 
-1. **NVS 配置事务**  
-   多个独立字符串键不能靠一次 `nvs_commit()` 形成事务。SoftAP `/commit` 前应选择完整 blob 或 staging blob + durable marker。
+1. **NVS A/B Bundle 需硬件验证**  
+   多个 legacy 字符串键不能靠一次 `nvs_commit()` 形成事务；当前已离线实现 `cfg_a/cfg_b/cfg_commit` A/B 接口。SoftAP `/commit` 前仍需在真实网关上验证 save/load/restart、掉电恢复和旧配置回退，当前运行时尚未调用该接口。
 
 2. **节点身份稳定性**  
    短地址可能变化，不能作为长期产品 ID。建议以 IEEE address/安装阶段生成的稳定 node ID 做映射，短地址只作为当前路由地址。
@@ -534,7 +535,7 @@ iot-home/{gateway_id}/nodes/{node_id}/cmd
 1. SoftAP + 本地网页配网；
 2. 凭据保存与 NVS 加密路线评估；
 3. 低磨损 Flash spool，仅在明确需要且使用专用分区时实施；
-4. 电池节点独立工程：先 SED，再 deep sleep；
+4. 电池节点独立工程：已离线完成 SED、60 秒采集上报、按需 I2C；下一步硬件实测电流，再决定负载开关或 deep sleep；
 5. deferred command 和电池节点“不保证即时到达”的前后端状态；
 6. TLS/WSS、MQTT ACL、VPN 或安全组白名单；
 7. 后端积压、dead letter、磁盘和数据库资源监控。
@@ -557,7 +558,8 @@ iot-home/{gateway_id}/nodes/{node_id}/cmd
 ## 9. 本次没有做的事
 
 - 未修改固件运行逻辑；
-- 未烧录、未打开串口；
+- 现网短序列和拔节点测试已完成，8 小时长测仍在进行；
+- 电池实验工程与新 NVS 接口未烧录/未接入运行时；
 - 未修改网卡、热点、安全组或云服务器；
 - 未读取、打印或记录真实密码文件；
 - 未修改分区表；

@@ -252,6 +252,56 @@ class RFPolicyAPITests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(resp.status_code, 504)
 
+    def test_rf_policy_timeout_bounds(self):
+        resp = self.client.get(
+            f"/api/devices/{DEVICE_ID}/rf-policy?timeout=0"
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(
+            resp.json()["detail"][0]["loc"], ["query", "timeout"]
+        )
+
+        resp = self.client.get(
+            f"/api/devices/{DEVICE_ID}/rf-policy?timeout=121"
+        )
+        self.assertEqual(resp.status_code, 422)
+
+        resp = self.client.get(
+            f"/api/devices/{DEVICE_ID}/rf-policy?timeout=not-a-number"
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(
+            resp.json()["detail"][0]["loc"], ["query", "timeout"]
+        )
+
+        resp = self.client.post(
+            f"/api/devices/{DEVICE_ID}/rf-policy?timeout=0",
+            json={"mode": "auto"},
+        )
+        self.assertEqual(resp.status_code, 422)
+
+        resp = self.client.post(
+            f"/api/devices/{DEVICE_ID}/rf-policy?timeout=121",
+            json={"mode": "auto"},
+        )
+        self.assertEqual(resp.status_code, 422)
+
+        resp = self.client.post(
+            f"/api/devices/{DEVICE_ID}/rf-policy?timeout=not-a-number",
+            json={"mode": "auto"},
+        )
+        self.assertEqual(resp.status_code, 422)
+
+        resp = self.client.get(
+            f"/api/devices/{DEVICE_ID}/rf-policy?fresh=false&timeout=1"
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        resp = self.client.get(
+            f"/api/devices/{DEVICE_ID}/rf-policy?fresh=false&timeout=120"
+        )
+        self.assertEqual(resp.status_code, 200)
+
     def test_command_history_limit_bounds(self):
         resp = self.client.get("/api/commands?limit=0")
         self.assertEqual(resp.status_code, 422)

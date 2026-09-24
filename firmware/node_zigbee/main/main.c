@@ -985,26 +985,57 @@ int8_t rf_power_get_dbm(void)
 static void rf_power_save_if_pending(void)
 {
     nvs_handle_t handle;
+    int8_t current_power = 0;
+    bool power_locked = false;
 
     if (!s_rf_save_pending) {
         return;
     }
 
+    // Serialize with rf_power_apply_index(); otherwise an old save pass could
+    // clear the dirty flag set by a newer power change.
+    if (s_rf_apply_mutex != NULL) {
+        if (xSemaphoreTake(s_rf_apply_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            ESP_LOGW(TAG, "RF power: persistence skipped; apply mutex busy");
+            return;
+        }
+        power_locked = true;
+    }
+    current_power = rf_power_get_dbm();
+
     // Diagnostic only: the learned value is retained for inspection/tooling, but
     // startup intentionally ignores it and always returns to -10 dBm.
     if (nvs_open("rfctl", NVS_READWRITE, &handle) == ESP_OK) {
-        esp_err_t err = nvs_set_i8(handle, "txp2", rf_power_get_dbm());
+        int8_t stored_power = 0;
+        esp_err_t get_err = nvs_get_i8(handle, "txp2", &stored_power);
+        esp_err_t err = ESP_OK;
+
+        if (get_err == ESP_OK && stored_power == current_power) {
+            nvs_close(handle);
+            s_rf_save_pending = false;
+            if (power_locked) {
+                xSemaphoreGive(s_rf_apply_mutex);
+            }
+            return;
+        }
+
+        err = nvs_set_i8(handle, "txp2", current_power);
         if (err == ESP_OK) {
             err = nvs_commit(handle);
         }
-        if (err != ESP_OK) {
+        if (err == ESP_OK) {
+            s_rf_save_pending = false;
+        } else {
             ESP_LOGW(TAG, "RF power persistence failed: %s", esp_err_to_name(err));
         }
         nvs_close(handle);
     } else {
         ESP_LOGW(TAG, "RF power persistence namespace unavailable");
     }
-    s_rf_save_pending = false;
+
+    if (power_locked) {
+        xSemaphoreGive(s_rf_apply_mutex);
+    }
 }
 
 // The installed SDK exposes a void setter, so verify the resulting radio level.
@@ -1312,8 +1343,10 @@ static void rf_power_task(void *arg)
 
     for (;;) {
         uint32_t notify_value = 0;
+        BaseType_t notified;
 
-        xTaskNotifyWait(0, UINT32_MAX, &notify_value, pdMS_TO_TICKS(60000));
+        notified = xTaskNotifyWait(0, UINT32_MAX, &notify_value,
+                                   pdMS_TO_TICKS(60000));
 
         if ((notify_value & RF_TASK_REMOTE_BIT) != 0) {
             uint8_t command = 0;
@@ -1374,6 +1407,12 @@ static void rf_power_task(void *arg)
             s_rf_unsolicited_report_pending = false;
             rf_power_send_command(RF_CMD_REPORT, rf_power_get_dbm(),
                                   s_rf_mode, report_seq);
+        }
+
+        // Retry best-effort diagnostic persistence only after a quiet 60-second
+        // timeout; this avoids busy retries after a transient NVS failure.
+        if (notified == pdFALSE && s_rf_save_pending) {
+            rf_power_save_if_pending();
         }
     }
 }

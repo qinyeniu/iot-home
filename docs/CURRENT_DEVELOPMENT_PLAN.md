@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 04:45（Asia/Shanghai；网关 backoff 版本已烧录，8 小时复测进行中）
+更新时间：2026-09-25 06:30（Asia/Shanghai；恢复后 1 小时 DEGRADED，新事务防护离线就绪）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -8,6 +8,8 @@
 ## 1. 当前真实进度
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
+
+> 06:30 状态：恢复后 1 小时覆盖 3627.6 秒，业务连续且无重启/黑障；节点出现 1 次 APS fail，故判 DEGRADED。最终 QUERY 为 `auto/-10 dBm`。
 
 ### 1.1 已经验证的主链路
 
@@ -67,6 +69,18 @@
    - 缺键、读取错误或值变化时保守写入；
    - 离线构建与复审通过，**尚未烧录**。
 
+6. **RF 远程/周期事务 generation guard**
+   - 周期节流检查、占用和策略版本快照在同一把 RF 状态锁内完成；
+   - 用户 QUERY/SET/AUTO 会更新 policy generation；
+   - 周期快照若在预留 Zigbee 序号前被用户命令 overtaken，会跳过旧发送，不再占用第二个有效序号；
+   - 网关 bin `0x15f540`，SHA256 `D748CE3C635F9E2A7AFCD05BB9FCF4047AE3DCC6A200FCD2059C037D1320DFBB`，复审 **Approve**，尚未烧录。
+
+7. **节点诊断 NVS 低磨损保存**
+   - `rfctl/txp2` 已保存相同值时跳过 Flash 写入；
+   - 保存与功率变更共用互斥锁，当前功率只快照一次；
+   - NVS 失败保留 dirty，安静 60 秒超时后低频补试；
+   - 节点 bin `0xdb190`，SHA256 `7349CF157F59B336B0D14D7F44624B1903179B9923F688A455BB6610D22C853C`，复审 **Approve**，尚未烧录。
+
 6. **On/Off 陈旧目标保护**
    - RF QUERY/SET/AUTO 只校验 active child；
    - on/off/toggle 额外要求 180 秒内有 join/announce 或有效 ZCL report；
@@ -104,6 +118,10 @@
 ### P1：NVS A/B 接口尚未硬件验证
 
 A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 save → restart → load、写入失败、异常 marker、掉电恢复和 legacy 回退。当前不得直接烧录或加入 SoftAP/HTTP。
+
+### P1：RF 发送仍应收敛到单命令队列
+
+当前 generation guard 已关闭“周期任务锁外节流”和“预留序号前被插队”的竞态；复审仍指出一个更窄窗口：周期任务预留序号后、实际调用 ZBOSS API 前，如果远程命令插入，旧周期请求仍可能被提交。该问题不阻塞当前离线补丁，但后续应将所有 RF 私有命令收敛为单一队列：远程/周期任务只提交意图，一个消费者负责预留序号、发送和安装等待事务。
 
 ### P1：仓库工作区较乱
 

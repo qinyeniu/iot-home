@@ -1,7 +1,9 @@
 # 固件全链路说明：节点、网关、MQTT 与后端
 
-更新时间：2026-09-25 03:50
+更新时间：2026-09-25 06:10
 状态：COM6 已运行 RF 发送失败后退避版本；仓库中的 RF policy Flash 去重、On/Off 陈旧目标保护和 A/B bundle 启动路径均仅离线编译，尚未烧录
+
+> **06:10 更新**：网关新增 RF policy generation guard，节点新增诊断功率 NVS 去重、保存互斥和 60 秒安静补试；两者均已离线构建和独立复审通过，但仍未烧录。详见文末“第 10 节补充”。
 适用工程：
 
 - 网关：`firmware/gateway/`
@@ -619,3 +621,74 @@ iot-home/{gateway_id}/nodes/{node_id}/cmd
 - 未修改分区表；
 - 未清除 Zigbee NVRAM；
 - 未启用 NVS encryption、Secure Boot 或 Flash encryption。
+
+## 10. 06:10 补充：RF 事务竞态离线加固
+
+### 10.1 已确认的故障形态
+
+恢复后短序列结束时，早前 SET 0 的旧周期事务 `seq=4` 延迟到达节点。节点据此切回 `manual/0`，而网关因为当前最新序号已经是 `seq=8`，拒绝该旧状态回报。fresh QUERY 证实节点真实状态确实偏离为 `manual/0`。
+
+这说明问题不只是客户端等待序号错位：旧周期事务在特定时序下可能真实重放策略。
+
+### 10.2 网关 generation guard
+
+本次在网关侧加入：
+
+- `s_rf_policy_generation`：策略版本号；
+- `RF_POLICY_GENERATION_ANY`：远程直接命令使用的通配版本；
+- `rf_policy_bump_generation_locked()`：用户 QUERY、SET MANUAL、SET AUTO 更新策略版本；
+- `rf_power_send_to_node(..., expected_generation)`：发送前在 RF 状态锁内校验版本。
+
+周期任务现在将以下操作放在同一个临界区：
+
+1. 检查并占用 60 秒评估窗口；
+2. 检查发送退避；
+3. 读取 `snapshot_generation`；
+4. 快照模式、功率、等待状态和 request ID。
+
+如果周期快照在真正预留 Zigbee 序号前被用户命令 overtaken，发送函数会发现版本不一致并返回 `ESP_ERR_INVALID_STATE`，不再递增序号，也不会调用 ZBOSS 发送。
+
+构建结果：
+
+```text
+gateway bin 0x15f540
+SHA256 D748CE3C635F9E2A7AFCD05BB9FCF4047AE3DCC6A200FCD2059C037D1320DFBB
+```
+
+复审结论：**Approve**。状态：未烧录。
+
+### 10.3 节点诊断 NVS 低磨损保存
+
+`rfctl/txp2` 仅作诊断，不参与启动恢复。本次将节点保存路径改为：
+
+1. 保存任务获取 `s_rf_apply_mutex`，与功率应用路径串行；
+2. 在锁内只快照一次 `current_power`；
+3. 先读取 NVS 旧值，只有“读取成功且旧值等于当前值”才跳过写入；
+4. 缺键、读取错误或值变化时保守写入；
+5. NVS 打开、设置或提交失败时保留 `s_rf_save_pending`；
+6. 仅在任务安静等待满 60 秒超时后做一次低频补试。
+
+构建结果：
+
+```text
+node bin 0xdb190
+SHA256 7349CF157F59B336B0D14D7F44624B1903179B9923F688A455BB6610D22C853C
+```
+
+复审结论：**Approve**。状态：未烧录。
+
+### 10.4 仍需单命令队列
+
+当前 generation guard 关闭了主要竞态，但“周期任务已预留序号、尚未调用 ZBOSS API”这一最后窗口仍可能被远程命令插入。后续应把所有 RF 私有命令收敛到单一命令队列，由一个消费者统一预留序号、发送并安装等待事务。该改造涉及发送任务和等待状态，不与当前小补丁混在一起。
+
+### 10.5 恢复后 1 小时最终结果
+
+完整一小时分析结论为 **DEGRADED**：
+
+- 覆盖 3627.6 秒；
+- 无重启、观察缺口、业务黑障、MAC no-buffer 和网关 RF 发送失败；
+- 网关 RF 下发 22 次，全部 ESP_OK；
+- 节点 `aps_fail` 增量 1；
+- 最终 QUERY：`auto/-10 dBm`。
+
+这说明恢复后的业务可用，但链路仍有一次孤立 APS 失败；不能用该结果推翻早前长测 FAIL。

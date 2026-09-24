@@ -31,6 +31,7 @@ ESP32-C6 网关固件，承担以下职责：
 - On/Off 陈旧目标保护：节点超过 180 秒未存活时跳过开关命令；
 - NVS A/B 完整配置 bundle 和启动优先级；
 - RF 命令 selected node 目标匹配，避免多节点阶段误控；
+- RF 远程命令与周期任务之间新增 policy generation guard：若周期快照在预留 Zigbee 序号前被用户命令插队，会跳过旧周期发送；
 - SoftAP/HTTP 配网本身尚未接入。
 
 这些能力只有在硬件维护窗口验证后才能视为上线。
@@ -161,4 +162,5 @@ SoftAP/HTTP、配置测试连接、恢复出厂和错误回滚尚未接入。NVS
 4. 验证 NVS A/B bundle 的 save/load/restart 和掉电恢复；
 5. 再实施最小 SoftAP/HTTP；
 6. 用户有空时教学式完成 MQTT ACL、TLS/WSS 或 VPN；
-7. 稳定后再拆分 `main.c` 和推进电池节点硬件实测。
+7. 稳定后再拆分 `main.c` 和推进电池节点硬件实测；
+8. 后续将 RF 私有命令收敛到单一命令队列，彻底封闭“序号已预留但尚未提交”的最后竞态窗口。

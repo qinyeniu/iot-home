@@ -97,6 +97,7 @@ _Static_assert(RF_POWER_LEVEL_IS_SUPPORTED(RF_POWER_AUTO_MIN_DBM),
 _Static_assert(RF_POWER_LEVEL_IS_SUPPORTED(RF_POWER_AUTO_MAX_DBM),
                "RF_POWER_AUTO_MAX_DBM must exactly match a power-table level");
 #define RF_POWER_EVAL_MS          60000
+#define RF_POLICY_GENERATION_ANY  UINT32_MAX
 #define RF_POWER_FRESH_MS         120000
 #define RF_POWER_SAMPLES_NEEDED   6
 // Use LQI only as a diagnostic/down-control signal. On this ESP32-C6 setup,
@@ -430,6 +431,7 @@ static uint32_t s_rf_last_rx_ms;
 static int8_t s_rf_node_power_dbm = RF_POWER_UNKNOWN_DBM;
 static uint8_t s_rf_node_mode = RF_MODE_UNKNOWN;
 static uint8_t s_rf_packet_sequence;
+static uint32_t s_rf_policy_generation;
 static uint32_t s_rf_last_eval_ms;
 static uint8_t s_rf_lqi_low_windows;
 static uint8_t s_rf_lqi_high_windows;
@@ -605,6 +607,14 @@ static void rf_set_policy_request_id_locked(const char *request_id)
     if (rf_power_request_id_valid(request_id)) {
         strlcpy(s_rf_policy_request_id, request_id,
                 sizeof(s_rf_policy_request_id));
+    }
+}
+
+static void rf_policy_bump_generation_locked(void)
+{
+    ++s_rf_policy_generation;
+    if (s_rf_policy_generation == RF_POLICY_GENERATION_ANY) {
+        s_rf_policy_generation = 1;
     }
 }
 
@@ -1046,23 +1056,36 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
 }
 
 static esp_err_t rf_power_send_to_node(uint8_t command, int8_t power_dbm,
-                                       uint8_t mode, uint8_t *sent_seq)
+                                       uint8_t mode, uint8_t *sent_seq,
+                                       uint32_t expected_generation)
 {
     uint8_t seq = 0;
     uint16_t addr = 0;
+    bool generation_stale = false;
 
     if (mode != RF_MODE_AUTO && mode != RF_MODE_MANUAL) {
         return ESP_ERR_INVALID_ARG;
     }
 
     taskENTER_CRITICAL(&s_rf_power_lock);
-    addr = s_rf_node_addr;
-    seq = ++s_rf_packet_sequence;
-    if (seq == 0 || seq >= 0x80) {
-        seq = 1;
-        s_rf_packet_sequence = 1;
+    if (expected_generation != RF_POLICY_GENERATION_ANY &&
+        expected_generation != s_rf_policy_generation) {
+        generation_stale = true;
+    } else {
+        addr = s_rf_node_addr;
+        seq = ++s_rf_packet_sequence;
+        if (seq == 0 || seq >= 0x80) {
+            seq = 1;
+            s_rf_packet_sequence = 1;
+        }
     }
     taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (generation_stale) {
+        ESP_LOGW(TAG, "RF power -> skip stale periodic dispatch generation=%lu",
+                 (unsigned long)expected_generation);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     uint8_t asdu[RF_PACKET_LEN] = {
         RF_PACKET_MAGIC0,
@@ -1170,12 +1193,14 @@ static void rf_power_remote_query(const char *request_id)
     taskENTER_CRITICAL(&s_rf_power_lock);
     s_rf_expected_user_transaction = true;
     rf_power_set_request_id_locked(request_id);
+    rf_policy_bump_generation_locked();
     taskEXIT_CRITICAL(&s_rf_power_lock);
     request_id = s_rf_expected_request_id[0] != '\0' ? s_rf_expected_request_id : NULL;
 
     uint8_t sent_seq = 0;
     rf_power_publish_querying(addr, request_id);
-    if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq) == ESP_OK) {
+    if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq,
+                                  RF_POLICY_GENERATION_ANY) == ESP_OK) {
         taskENTER_CRITICAL(&s_rf_power_lock);
         s_rf_report_waiting = true;
         s_rf_expected_report_seq = sent_seq;
@@ -1213,9 +1238,13 @@ static void rf_power_remote_set_manual(int8_t target_power_dbm, const char *requ
     s_rf_expected_user_transaction = false;
     s_rf_expected_request_id[0] = '\0';
     s_rf_wait_started_ms = 0;
-    s_rf_last_eval_ms = 0;
+    /* The known-node path sends below; retain the periodic cooldown. The
+       generation check below also blocks a periodic snapshot overtaken by this
+       command before it can reserve a second Zigbee sequence. */
+    s_rf_last_eval_ms = now;
     s_rf_policy_user_transaction = true;
     rf_set_policy_request_id_locked(request_id);
+    rf_policy_bump_generation_locked();
     addr = s_rf_node_addr;
     current_power_dbm = s_rf_node_power_dbm;
     taskEXIT_CRITICAL(&s_rf_power_lock);
@@ -1228,7 +1257,8 @@ static void rf_power_remote_set_manual(int8_t target_power_dbm, const char *requ
     }
     if (current_power_dbm == RF_POWER_UNKNOWN_DBM) {
         uint8_t sent_seq = 0;
-        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq) == ESP_OK) {
+        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq,
+                                  RF_POLICY_GENERATION_ANY) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
@@ -1243,7 +1273,8 @@ static void rf_power_remote_set_manual(int8_t target_power_dbm, const char *requ
     }
 
     uint8_t sent_seq = 0;
-    if (rf_power_send_to_node(RF_CMD_SET, target_power_dbm, RF_MODE_MANUAL, &sent_seq) == ESP_OK) {
+    if (rf_power_send_to_node(RF_CMD_SET, target_power_dbm, RF_MODE_MANUAL, &sent_seq,
+                              RF_POLICY_GENERATION_ANY) == ESP_OK) {
         taskENTER_CRITICAL(&s_rf_power_lock);
         s_rf_report_waiting = true;
         s_rf_expected_report_seq = sent_seq;
@@ -1274,9 +1305,13 @@ static void rf_power_remote_set_auto(const char *request_id)
     s_rf_expected_user_transaction = false;
     s_rf_expected_request_id[0] = '\0';
     s_rf_wait_started_ms = 0;
-    s_rf_last_eval_ms = 0;
+    /* The known-node path sends below; retain the periodic cooldown. The
+       generation check below also blocks a periodic snapshot overtaken by this
+       command before it can reserve a second Zigbee sequence. */
+    s_rf_last_eval_ms = now;
     s_rf_policy_user_transaction = true;
     rf_set_policy_request_id_locked(request_id);
+    rf_policy_bump_generation_locked();
     addr = s_rf_node_addr;
     current_power_dbm = s_rf_node_power_dbm;
     taskEXIT_CRITICAL(&s_rf_power_lock);
@@ -1290,7 +1325,8 @@ static void rf_power_remote_set_auto(const char *request_id)
     }
     if (current_power_dbm == RF_POWER_UNKNOWN_DBM) {
         uint8_t sent_seq = 0;
-        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq) == ESP_OK) {
+        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq,
+                                  RF_POLICY_GENERATION_ANY) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
@@ -1305,7 +1341,8 @@ static void rf_power_remote_set_auto(const char *request_id)
     }
 
     uint8_t sent_seq = 0;
-    if (rf_power_send_to_node(RF_CMD_SET, current_power_dbm, RF_MODE_AUTO, &sent_seq) == ESP_OK) {
+    if (rf_power_send_to_node(RF_CMD_SET, current_power_dbm, RF_MODE_AUTO, &sent_seq,
+                              RF_POLICY_GENERATION_ANY) == ESP_OK) {
         taskENTER_CRITICAL(&s_rf_power_lock);
         s_rf_report_waiting = true;
         s_rf_expected_report_seq = sent_seq;
@@ -1338,17 +1375,19 @@ static void rf_power_controller_periodic(void)
     bool report_waiting = false;
     uint32_t wait_started_ms = 0;
     uint32_t confirmed_ms = 0;
+    uint32_t snapshot_generation = 0;
 
+    taskENTER_CRITICAL(&s_rf_power_lock);
     if (now - s_rf_last_eval_ms < RF_POWER_EVAL_MS) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
         return;
     }
     s_rf_last_eval_ms = now;
-
-    taskENTER_CRITICAL(&s_rf_power_lock);
     if (rf_tx_backoff_active_locked(now)) {
         taskEXIT_CRITICAL(&s_rf_power_lock);
         return;
     }
+    snapshot_generation = s_rf_policy_generation;
     addr = s_rf_node_addr;
     last_rx = s_rf_last_rx_ms;
     link_lqi = s_rf_lqi_ema;
@@ -1394,7 +1433,7 @@ static void rf_power_controller_periodic(void)
     if (current_power == RF_POWER_UNKNOWN_DBM || wait_timed_out) {
         uint8_t sent_seq = 0;
         if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO,
-                                  &sent_seq) == ESP_OK) {
+                                  &sent_seq, snapshot_generation) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
@@ -1412,7 +1451,7 @@ static void rf_power_controller_periodic(void)
         uint8_t sent_seq = 0;
         ESP_LOGI(TAG, "RF power: periodic reconcile current=%d dBm", current_power);
         if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO,
-                                  &sent_seq) == ESP_OK) {
+                                  &sent_seq, snapshot_generation) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
@@ -1505,7 +1544,7 @@ static void rf_power_controller_periodic(void)
             target_power = manual_power;
             if (rf_power_send_to_node(RF_CMD_SET, target_power,
                                       RF_MODE_MANUAL,
-                                      &sent_seq) == ESP_OK) {
+                                      &sent_seq, snapshot_generation) == ESP_OK) {
                 taskENTER_CRITICAL(&s_rf_power_lock);
                 s_rf_report_waiting = true;
                 s_rf_expected_report_seq = sent_seq;
@@ -1533,7 +1572,7 @@ static void rf_power_controller_periodic(void)
         target_power = current_power;
         if (rf_power_send_to_node(RF_CMD_SET, target_power,
                                   RF_MODE_AUTO,
-                                  &sent_seq) == ESP_OK) {
+                                  &sent_seq, snapshot_generation) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
@@ -1598,7 +1637,7 @@ static void rf_power_controller_periodic(void)
     target_power = s_rf_power_table[target_index];
     uint8_t sent_seq = 0;
     if (rf_power_send_to_node(RF_CMD_SET, target_power, RF_MODE_AUTO,
-                              &sent_seq) == ESP_OK) {
+                              &sent_seq, snapshot_generation) == ESP_OK) {
         // Queue acceptance is not proof. Accept only the node's encrypted
         // REPORT carrying this request sequence, requested power and mode.
         taskENTER_CRITICAL(&s_rf_power_lock);

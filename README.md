@@ -1,175 +1,176 @@
-# iot-home — IoT 三层架构学习原型
+# iot-home — ESP32-C6 三层架构 IoT 原型
 
-一个"终端 + 网关 + 服务器"完整三层架构的项目原型，作为后续扩展的基座。
-第一版主题：**室内环境监测 + 远程开关**。主题不重要，核心要求是**扩展性**：
-以后增加新传感器、新执行器、新终端节点时，不需要重构现有代码和数据库。
+本项目是一个中文、设计先行、硬件实测驱动的智能家居原型，当前主题为：
 
-## 技术选型
+```text
+Zigbee 传感/开关节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana
+```
 
-| 层 | 方案 |
-|----|------|
-| 终端 / 网关 | ESP32-C6（内置 Wi-Fi 6 + BLE + Zigbee 3.0/Thread） |
-| 终端 ↔ 网关 | Zigbee 3.0（乐鑫 ESP-Zigbee-SDK，标准 ZCL 簇） |
-| 网关上联 | Wi-Fi STA + MQTT |
-| 消息中间件 | Mosquitto（MQTT） |
-| 服务端 | FastAPI + MySQL 8.0（独立库 iot_home）+ Grafana |
-| 本地开发 | Windows + Docker Compose 一键环境（Mosquitto + MySQL + FastAPI + Grafana） |
-| 服务器部署 | 阿里云 ECS，systemd 管理（**已后置**，等服务器资源优化） |
+第一版业务目标：**室内环境监测 + 远程开关**；长期目标是支持产品化配网、凭据管理、电池低功耗节点和多节点扩展。
 
-## 快速开始
+## 1. 当前真实状态
 
-### 1. 启动 Docker Desktop
+### 已在硬件上验证
 
-确保 Docker Desktop 已启动并运行。
+- ESP32-C6 Zigbee coordinator 与 end device 组网；
+- channel 26，节点 authenticated secure rejoin；
+- AHT20 温湿度、BH1750 光照通过标准 ZCL report 上报；
+- 网关聚合 Zigbee 数据并发布 MQTT；
+- FastAPI 订阅 MQTT 并写入 MySQL；
+- Grafana 展示环境数据；
+- on/off/toggle 远程控制继电器并回报 OnOff 状态；
+- RF QUERY → SET 0 → SET -10 → AUTO 命令链路；
+- RF 发送失败后自动退避；
+- 正常拔掉节点不会导致网关重启。
 
-### 2. 启动服务
+### 离线完成，等待硬件维护窗口
 
-`ash
-cd server
-start.bat
-`
+- RF policy 相同值不重复写 NVS，降低 Flash 磨损；
+- On/Off 陈旧目标保护；
+- NVS A/B 完整配置 bundle 与启动路径；
+- RF selected node 目标匹配；
+- 电池 SED 60 秒采样上报和参数配置化；
+- 小规格阿里云 ECS 的资源预算和默认不生效的 Docker 资源保护覆盖文件。
 
-### 3. 运行模拟设备
+### 明确暂不自动执行
 
-`ash
-pip install paho-mqtt
-python tools/simulator.py
-`
+- MQTT ACL 公网部署；
+- TLS/WSS、证书、VPN；
+- 安全组、DNS、远程容器重启；
+- NVS encryption、Flash encryption、Secure Boot；
+- bootloader/分区表写入；
+- Zigbee NVRAM 擦除；
+- 网卡/热点切换。
 
-### 4. 访问服务
+这些事项需要用户在场，按维护窗口和回退方案执行。
 
-| 服务 | 地址 | 说明 |
-|------|------|------|
-| FastAPI 后端 | http://localhost:8000 | REST API |
-| API 文档 | http://localhost:8000/docs | Swagger UI |
-| Grafana 看板 | http://localhost:3000 | 数据可视化 |
-| MQTT | localhost:1883 | 消息中间件 |
-| MySQL | localhost:3306 | 数据库 |
+## 2. 技术栈
 
-### 5. 默认登录信息
+| 层级 | 技术 |
+|---|---|
+| 节点 | ESP32-C6、Zigbee End Device、AHT20、BH1750、继电器、本地按键 |
+| 网关 | ESP32-C6、Zigbee Coordinator、Wi‑Fi STA、MQTT、OLED SSD1306 |
+| 消息 | Mosquitto MQTT |
+| 后端 | FastAPI、SQLAlchemy、Paho MQTT |
+| 数据库 | MySQL 8 |
+| 可视化 | Grafana |
+| 本地环境 | Windows、ESP-IDF v5.5.4、Docker Compose |
+| 后期服务器 | 阿里云 ECS（小规格，需要保留资源余量） |
 
-| 服务 | 用户名 | 密码 |
-|------|--------|------|
-| Grafana | admin | 见 server/.env |
-| MySQL | iot_home | 见 server/.env |
-| MQTT | iot_user | 见 server/.env |
+## 3. 目录结构
 
-## 目录结构
+```text
+docs/
+  HANDOFF/                  # 每日入口摘要索引
+  HANDOFF_YYYY-MM-DD.md     # 每日完整交接（核心长期记忆）
+  CURRENT_DEVELOPMENT_PLAN.md
+  FIRMWARE_FULL_CHAIN_WALKTHROUGH.md
+  ALIYUN_SERVER_MAINTENANCE_PLAN.md
+firmware/
+  gateway/                  # 网关固件
+  node_zigbee/              # 现网“传感器 + 继电器”组合节点
+  node_battery_sensor/      # 独立电池 SED 实验工程
+  common/iot_product_config/
+server/
+  backend/                  # FastAPI 后端与测试
+  mysql/
+  mosquitto/
+  grafana/
+  docker-compose.yml
+  docker-compose-resource-guard.yml
+tools/
+  analyze_long_test.py
+  capture_serial*.py
+hardware/
+```
 
-`
-iot-home/
-├── docs/                          # 分阶段中文文档（设计先行）
-│   ├── PROJECT_STATUS.md          # 项目状态文档
-│   ├── DEVELOPMENT_GUIDE.md       # 开发指南
-│   └── hardware/                  # 硬件设计文档
-├── firmware/                      # 固件（ESP32-C6）
-│   ├── gateway/                   # 网关固件：Zigbee 协调器 + Wi-Fi + MQTT + OLED
-│   ├── node_sensor/               # 传感器终端：AHT20 + BH1750 + SSD1306
-│   ├── node_switch/               # 开关终端：继电器 / WS2812B
-│   └── common/                    # 共享模块：传感器驱动注册表、MQTT 主题常量
-├── server/                        # 服务端
-│   ├── backend/                   # FastAPI 后端：MQTT 订阅入库 + 设备/命令 API
-│   ├── docker-compose.yml         # 本地一键环境
-│   ├── grafana/                   # 数据源与看板 provisioning
-│   ├── mysql/init/                # 建库建表初始化脚本
-│   ├── mosquitto/config/          # MQTT 配置
-│   └── .env.example               # 环境变量模板
-├── hardware/                      # 接线图、BOM、KiCad 底板图纸
-└── tools/                         # 模拟器与调试工具（硬件到货前联调用）
-`
+大量串口日志、构建目录和临时补丁脚本可能处于未跟踪状态；不得使用 `git add -A`。
 
-## 阶段计划
+## 4. 本地服务快速启动
 
-| 阶段 | 内容 | 状态 |
-|------|------|------|
-| 阶段 0：硬件先行 | 可行性分析 → 采购确认 → 到货验收（串口 / I2C 逐模块实测） | ✅ 完成 |
-| 第 1–2 周 | 本地 Docker 端到端：模拟设备 → MQTT → 入库 → Grafana 曲线 | ✅ 完成 |
-| 第 3–4 周 | 网关固件：ESP-IDF + Wi-Fi + MQTT + OLED + 断线重连（实机测试驱动） | ⏳ 待开始 |
-| 第 5–7 周 | Zigbee 组网、传感器节点、开关节点；Grafana + 远程控制接口（实机测试驱动） | ⏳ 待开始 |
-| 第 8–9 周 | 可靠性（OTA、重连、可选 TLS）+ KiCad 底板 → 嘉立创 SMT 贴片 | ⏳ 待开始 |
-| 第 10 周起 | 按兴趣扩展：低功耗电池、更多传感器、告警推送、Matter、Web App | ⏳ 待开始 |
+1. 启动 Docker Desktop；
+2. 进入 `server/`；
+3. 按现有脚本启动本地 Compose；
+4. 后端 API 默认在 `http://localhost:8000`；
+5. Grafana 默认在 `http://localhost:3000`。
 
-## API 接口
+真实数据库、Grafana 或 MQTT 密码只从本地环境文件读取，不要在对话或文档中打印。
 
-### 设备管理
+## 5. 固件构建
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | /api/devices | 获取设备列表 |
-| GET | /api/devices/{id} | 获取单个设备详情 |
-| GET | /api/devices/{id}/metrics | 获取设备指标数据 |
-| POST | /api/devices/{id}/commands | 发送命令到设备 |
+### 网关
 
-### 指标查询
+```powershell
+cd firmware\gateway
+. C:\Espressif\v5.5.4\esp-idf\export.ps1
+idf.py build
+```
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | /api/metrics/latest | 获取最新指标数据 |
+### 电池 SED
 
-### 健康检查
+```powershell
+cd firmware\node_battery_sensor
+. C:\Espressif\v5.5.4\esp-idf\export.ps1
+idf.py build
+```
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | /api/health | 服务健康检查 |
+烧录前必须重新确认端口、二进制 SHA256 和应用分区剩余空间。未经明确授权，只能在维护窗口写应用分区；不得刷 bootloader/分区表或擦 Zigbee NVRAM。
 
-## MQTT 主题规范
+## 6. MQTT 主题
 
 | 主题 | 说明 |
-|------|------|
-| iot-home/{gateway_id}/nodes/{node_id}/telemetry | 遥测数据上报 |
-| iot-home/{gateway_id}/nodes/{node_id}/status | 设备状态上报 |
-| iot-home/{gateway_id}/nodes/{node_id}/cmd | 命令下发 |
+|---|---|
+| `iot-home/{gateway}/nodes/{node}/telemetry` | 传感器/开关状态 |
+| `iot-home/{gateway}/nodes/{node}/status` | 节点 retained 状态 |
+| `iot-home/{gateway}/nodes/{node}/cmd` | 命令下发 |
+| `iot-home/{gateway}/nodes/{node}/rf_policy` | RF 策略状态 |
+| `iot-home/gateway/{gateway}/status` | 网关状态/LWT |
 
-## 扩展性设计
+短地址不是稳定产品 ID；后续应以 IEEE address 或安装阶段生成的稳定 ID 做长期映射。
 
-1. **指标表设计**: device_id + metric + ts + value，新指标无需改表
-2. **传感器驱动注册表**: 新增传感器只加文件，不改主逻辑
-3. **I2C 扩展排针**: 3V3/GND/SDA/SCL + 2个备用 GPIO
-4. **JSON 公共字段 + extras**: 服务器接口不随传感器种类变化
+## 7. 测试
 
-## 安全约定
+本地后端：
 
-- 所有凭据（MQTT 密码、MySQL 密码、服务器密码、AI API Key）只放 .env，严禁写入代码、文档或提交仓库。
-- .env 已加入 .gitignore；仓库只提交 .env.example 占位模板。
+```powershell
+cd server\backend
+.\.venv\Scripts\python.exe -m pytest tests -q
+```
 
-## 工作方式
+长测分析器：
 
-- 全程中文沟通；设计先行，每阶段先给简明文档再写代码。
-- 每交付一个阶段先自测/自查，再给出可复现的操作步骤。
-- 每一步完成后先汇报，经确认再进入下一步。
+```powershell
+.\.venv\Scripts\python.exe -m pytest tools\tests\test_analyze_long_test.py -q
+```
 
-### 硬件实测驱动（本项目核心原则）
+历史 MicroPython 测试依赖 `machine`，不能直接用 CPython 全量运行。
 
-- **先硬件后代码**：任何功能模块必须先通过实机测试（串口日志、传感器读数、命令响应、稳定性观察）才算完成；"理论上应该能用"只是待验证假设，不算完成。
-- **拒绝未经实测的假设**：我提出的每个设计点，都必须在硬件上跑出效果后，才进入"完整功能模块"清单。可行性文档中所有"待实测"项都不作为设计依据。
-- **串口联调**：设备通过 USB-C 接到电脑后，由我直接读取 COM 口日志与测试数据辅助开发；工具链（esptool、pyserial 等）在 	ools/ 文档中维护。
-- **采购门槛**：硬件采购前必须先过可行性分析并经用户确认；到货后按"到货验收流程"逐模块验证，通过后才进入固件开发。
+## 8. 推荐后续顺序
 
-## 文档索引
+1. 完成烧录后 8 小时双串口长测并形成最终结论；
+2. 用户确认后，小步验证离线固件候选；
+3. 验证 NVS bundle save/load/restart、异常 marker 和掉电恢复；
+4. 做最小 SoftAP/HTTP，不一次加入完整配网状态机；
+5. 教学式部署 MQTT ACL；
+6. 用户准备域名后再配置 TLS/WSS；
+7. 管理入口按 VPN 或安全组白名单收紧；
+8. 电池节点接入负载开关并做电流实测；
+9. 关键行为稳定后再拆分大型 `main.c`。
 
-| 文档 | 说明 |
-|------|------|
-| [PROJECT_STATUS.md](docs/PROJECT_STATUS.md) | 项目状态文档 |
-| [DEVELOPMENT_GUIDE.md](docs/DEVELOPMENT_GUIDE.md) | 开发指南 |
-| [硬件可行性分析](docs/hardware/01-硬件可行性分析与采购清单.md) | 硬件选型与采购 |
-| [接线图](docs/hardware/02-接线图与首次上电.md) | 硬件接线指南 |
-| [面包板入门](docs/hardware/03-面包板入门与接线详解.md) | 面包板使用教程 |
-| [排针焊接入门](docs/hardware/04-排针焊接入门.md) | 焊接教程 |
-| [ESP-IDF 工具链安装](docs/ESP-IDF工具链安装.md) | ESP-IDF 安装指南 |
+## 9. 工作规则
 
-## 贡献指南
+- 全程中文；
+- 设计先行、硬件实测驱动；
+- 每次会话/阶段结束必须更新本地交接文档；
+- 显式 `git add` 相关文件，不使用 `git add -A`；
+- 不 push、不部署，除非用户明确要求；
+- 不记录真实 Wi‑Fi、MQTT、数据库密码；
+- 不切换用户电脑网卡，除非提前留好恢复路径并获得明确同意。
 
-1. Fork 本仓库
-2. 创建功能分支: git checkout -b feature/your-feature
-3. 提交更改: git commit -m 'Add some feature'
-4. 推送分支: git push origin feature/your-feature
-5. 提交 Pull Request
+## 10. 首要阅读文档
 
-## 许可证
-
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
-
-## 联系方式
-
-- 项目主页: https://github.com/yourusername/iot-home
-- 问题反馈: https://github.com/yourusername/iot-home/issues
+1. `docs/HANDOFF/README.md`
+2. 最新 `docs/HANDOFF/_YYYY-MM-DD.md`
+3. 对应完整交接
+4. `docs/CURRENT_DEVELOPMENT_PLAN.md`
+5. `docs/FIRMWARE_FULL_CHAIN_WALKTHROUGH.md`

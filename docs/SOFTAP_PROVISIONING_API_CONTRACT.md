@@ -158,7 +158,7 @@ Content-Type: application/json
 
 设备应只在此时将 RAM 中已通过测试的配置快照写入 NVS。失败的测试、过期的 `test_id` 不得触发写入。
 
-现有 `save_wifi()` 与 `save_mqtt()` 是两次独立提交，不能直接暴露给 HTTP `/commit`。固件实施前应增加统一的 `iot_product_config_save_bundle()`：优先在同一 NVS handle 中设置全部键并一次 commit；同时增加版本/事务标记和启动恢复，掉电导致不完整时丢弃半成品，避免只写入 Wi‑Fi 而 MQTT 缺失。
+现有 `save_wifi()` 与 `save_mqtt()` 是两次独立提交，不能直接暴露给 HTTP `/commit`。也不能把“同一 NVS handle + 一次 `nvs_commit()`”当作多键事务：ESP-IDF 普通 NVS 中的 `nvs_set_str()` 可能已经持久化部分键，`commit()` 不负责多键回滚。固件实施前应改为单一完整 bundle blob，或 staging + durable marker/启动恢复；掉电或运行时错误导致不完整时必须丢弃半成品，避免只写入 Wi‑Fi 而 MQTT 缺失。
 
 写入完成后，网页应提示用户重启或等待设备自动切换。是否自动重启需在实现阶段确认；建议第一版由用户点击确认，避免突然断连。
 
@@ -266,8 +266,8 @@ IPv6 地址、CA 证书和每设备证书不在第一版范围内。
 2. 先实现输入校验与 `/status`，不写 NVS；
 3. 实现 `/test` 的 Wi‑Fi 临时连接；
 4. 再加入 MQTT 连接测试；
-5. 增加统一 bundle 保存与启动恢复，不能直接串联两次独立 NVS commit；
-6. 最后实现 `/commit` 调用统一 bundle 保存接口；
+5. 确定单一 bundle blob 或 staging marker 事务方案，不能直接串联两次独立 NVS commit，也不能依赖普通 `nvs_commit()` 做多键回滚；
+6. 最后实现 `/commit` 调用具备恢复语义的持久化接口；
 7. 硬件在线时验证失败路径、测试通过路径、重启后读取 NVS；
 8. 通过后再决定是否加入 SoftAP 超时、本地 PIN 和恢复出厂入口。
 

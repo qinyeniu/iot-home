@@ -44,6 +44,7 @@
 #include "esp_ieee802154.h"
 #include "wifi_secrets.h"
 #include "mqtt_secrets.h"
+#include "iot_product_config.h"
 #include "cJSON.h"
 #include "zcl/esp_zigbee_zcl_on_off.h"
 
@@ -131,6 +132,104 @@ static volatile bool s_wifi_ever_connected = false;
 static esp_mqtt_client_handle_t s_mqtt = NULL;
 static bool s_wifi_ok = false;
 static bool s_mqtt_ok = false;
+
+// Product runtime configuration. The defaults come from the local lab build
+// headers; if a valid NVS product configuration exists, it takes precedence.
+// This path never writes NVS, so it does not add Flash wear.
+static iot_wifi_config_t s_product_wifi;
+static iot_mqtt_config_t s_product_mqtt;
+static bool s_product_wifi_from_nvs;
+static bool s_product_mqtt_from_nvs;
+
+static void product_runtime_config_init(void)
+{
+    iot_wifi_config_t wifi_cfg;
+    iot_mqtt_config_t mqtt_cfg;
+    esp_err_t wifi_err;
+    esp_err_t mqtt_err;
+
+    strlcpy(s_product_wifi.ssid, WIFI_SSID, sizeof(s_product_wifi.ssid));
+    strlcpy(s_product_wifi.password, WIFI_PASSWORD,
+            sizeof(s_product_wifi.password));
+    strlcpy(s_product_mqtt.uri, MQTT_BROKER_URI,
+            sizeof(s_product_mqtt.uri));
+    strlcpy(s_product_mqtt.username, MQTT_USERNAME,
+            sizeof(s_product_mqtt.username));
+    strlcpy(s_product_mqtt.password, MQTT_PASSWORD,
+            sizeof(s_product_mqtt.password));
+    s_product_mqtt.client_id[0] = '\0';
+
+    wifi_err = iot_product_config_load_wifi(&wifi_cfg);
+    s_product_wifi_from_nvs = wifi_err == ESP_OK;
+    if (s_product_wifi_from_nvs) {
+        s_product_wifi = wifi_cfg;
+    } else if (wifi_err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Product Wi-Fi config unavailable: %s; using build default",
+                 esp_err_to_name(wifi_err));
+    }
+
+    mqtt_err = iot_product_config_load_mqtt(&mqtt_cfg);
+    s_product_mqtt_from_nvs = mqtt_err == ESP_OK;
+    if (s_product_mqtt_from_nvs) {
+        s_product_mqtt = mqtt_cfg;
+    } else if (mqtt_err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Product MQTT config unavailable: %s; using build default",
+                 esp_err_to_name(mqtt_err));
+    }
+
+    ESP_LOGI(TAG, "Runtime config: wifi=%s mqtt=%s",
+             s_product_wifi_from_nvs ? "NVS" : "build",
+             s_product_mqtt_from_nvs ? "NVS" : "build");
+}
+
+static const char *product_wifi_ssid(void)
+{
+    return s_product_wifi.ssid;
+}
+
+static const char *product_wifi_password(void)
+{
+    return s_product_wifi.password;
+}
+
+static const char *product_mqtt_uri(void)
+{
+    return s_product_mqtt.uri;
+}
+
+static const char *product_mqtt_username(void)
+{
+    return s_product_mqtt.username;
+}
+
+static const char *product_mqtt_password(void)
+{
+    return s_product_mqtt.password;
+}
+
+static const char *product_mqtt_client_id(void)
+{
+    return s_product_mqtt.client_id[0] != '\0'
+         ? s_product_mqtt.client_id : NULL;
+}
+
+static const char *product_mqtt_log_uri(char *buf, size_t buf_size)
+{
+    const char *uri = product_mqtt_uri();
+    const char *scheme_end = strstr(uri, "://");
+    const char *at = strchr(uri, '@');
+
+    if (buf_size == 0U) {
+        return NULL;
+    }
+    if (scheme_end == NULL || at == NULL || at < scheme_end + 3) {
+        strlcpy(buf, uri, buf_size);
+        return buf;
+    }
+    snprintf(buf, buf_size, "%.*s***@%s",
+             (int)(scheme_end + 3 - uri), uri, at + 1);
+    return buf;
+}
 
 // Outage buffer for non-retained telemetry (definition of storage and
 // helpers follows below, after mqtt_start()).
@@ -2194,7 +2293,7 @@ static bool wifi_rf_health_scan(void)
             err = esp_wifi_scan_get_ap_records(&got, aps);
             if (err == ESP_OK) {
                 for (int i = 0; i < got; ++i) {
-                    if (strcmp((const char *)aps[i].ssid, WIFI_SSID) == 0) {
+                    if (strcmp((const char *)aps[i].ssid, product_wifi_ssid()) == 0) {
                         target_visible = true;
                     }
                 }
@@ -2347,8 +2446,6 @@ static void wifi_start(void)
     // scan. This tolerates router channel changes and transient AP restarts.
     wifi_config_t wcfg = {
         .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASSWORD,
             .scan_method = WIFI_ALL_CHANNEL_SCAN,
             .bssid_set = false,
             .channel = 0,
@@ -2360,6 +2457,13 @@ static void wifi_start(void)
             },
         },
     };
+    // Runtime values live in RAM-backed product config. Copy them into the IDF
+    // arrays after initialization because designated initializers cannot copy
+    // char arrays from pointer-returning accessors.
+    strlcpy((char *)wcfg.sta.ssid, product_wifi_ssid(),
+            sizeof(wcfg.sta.ssid));
+    strlcpy((char *)wcfg.sta.password, product_wifi_password(),
+            sizeof(wcfg.sta.password));
     esp_wifi_set_mode(WIFI_MODE_STA);
 
     // Chinese home routers may select channel 12/13. The IDF default [01]
@@ -2394,7 +2498,7 @@ static void wifi_start(void)
         ESP_LOGW(TAG, "WiFi set scan parameters failed: %s", esp_err_to_name(err));
     }
 
-    ESP_LOGI(TAG, "WiFi starting: %s", WIFI_SSID);
+    ESP_LOGI(TAG, "WiFi starting: %s", product_wifi_ssid());
 }
 
 // ==================== MQTT ====================
@@ -2577,9 +2681,10 @@ static void mqtt_start(void)
     static const char gw_lwt_payload[] =
         "{\"status\":\"offline\",\"event\":\"lwt\"}";
     esp_mqtt_client_config_t cfg = {
-        .broker.address.uri = MQTT_BROKER_URI,
-        .credentials.username = MQTT_USERNAME,
-        .credentials.authentication.password = MQTT_PASSWORD,
+        .broker.address.uri = product_mqtt_uri(),
+        .credentials.username = product_mqtt_username(),
+        .credentials.authentication.password = product_mqtt_password(),
+        .credentials.client_id = product_mqtt_client_id(),
         .session.last_will = {
             .topic = MQTT_TOPIC_PREFIX "/" MQTT_GW_STATUS_SUFFIX,
             .msg = gw_lwt_payload,
@@ -2597,7 +2702,9 @@ static void mqtt_start(void)
     s_mqtt = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_cb, NULL);
     esp_mqtt_client_start(s_mqtt);
-    ESP_LOGI(TAG, "MQTT starting: %s", MQTT_BROKER_URI);
+    char safe_uri[IOT_MQTT_URI_MAX_LEN + 1];
+    ESP_LOGI(TAG, "MQTT starting: %s",
+             product_mqtt_log_uri(safe_uri, sizeof(safe_uri)));
 }
 
 // Outage buffer: while Wi-Fi/MQTT is down, telemetry used to be dropped
@@ -3456,6 +3563,10 @@ void app_main(void)
     }
 
     
+#if !ZB_ONLY_RF_DIAG
+    product_runtime_config_init();
+#endif
+
 #if !ZB_ONLY_RF_DIAG && !ZB_JOIN_BEFORE_WIFI
     // WiFi
     wifi_start();

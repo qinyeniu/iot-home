@@ -43,6 +43,11 @@ static bool config_is_valid_text(const char *value, size_t max_len)
     return len <= max_len;
 }
 
+static esp_err_t config_public_error(esp_err_t err)
+{
+    return err == ESP_ERR_NVS_NOT_FOUND ? ESP_ERR_NOT_FOUND : err;
+}
+
 static esp_err_t config_get_str(nvs_handle_t handle, const char *key,
                                 char *out, size_t out_size)
 {
@@ -63,6 +68,9 @@ static esp_err_t config_ensure_schema(nvs_handle_t handle)
     esp_err_t err = nvs_get_u8(handle, KEY_VERSION, &version);
     if (err == ESP_OK && version == CONFIG_SCHEMA_VERSION) {
         return ESP_OK;
+    }
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_ERR_NOT_FOUND;
     }
     if (err != ESP_ERR_NOT_FOUND) {
         return err;
@@ -188,13 +196,13 @@ esp_err_t iot_product_config_load_wifi(iot_wifi_config_t *config)
 
     err = config_open_readonly(&handle);
     if (err != ESP_OK) {
-        return err;
+        return config_public_error(err);
     }
 
     err = config_check_schema_locked(handle);
     if (err != ESP_OK) {
         nvs_close(handle);
-        return err;
+        return config_public_error(err);
     }
 
     // SSID is mandatory; password is optional and defaults to empty.
@@ -207,8 +215,12 @@ esp_err_t iot_product_config_load_wifi(iot_wifi_config_t *config)
             err = ESP_OK;
         }
     }
+    if (err == ESP_OK &&
+        !config_is_valid_nonempty(config->ssid, IOT_WIFI_SSID_MAX_LEN)) {
+        err = ESP_ERR_INVALID_STATE;
+    }
     nvs_close(handle);
-    return err;
+    return config_public_error(err);
 }
 
 esp_err_t iot_product_config_save_wifi(const iot_wifi_config_t *config)
@@ -289,13 +301,13 @@ esp_err_t iot_product_config_load_mqtt(iot_mqtt_config_t *config)
 
     err = config_open_readonly(&handle);
     if (err != ESP_OK) {
-        return err;
+        return config_public_error(err);
     }
 
     err = config_check_schema_locked(handle);
     if (err != ESP_OK) {
         nvs_close(handle);
-        return err;
+        return config_public_error(err);
     }
 
     // URI is mandatory. Credentials and client ID are optional and default
@@ -324,8 +336,12 @@ esp_err_t iot_product_config_load_mqtt(iot_mqtt_config_t *config)
             err = ESP_OK;
         }
     }
+    if (err == ESP_OK &&
+        !config_is_valid_nonempty(config->uri, IOT_MQTT_URI_MAX_LEN)) {
+        err = ESP_ERR_INVALID_STATE;
+    }
     nvs_close(handle);
-    return err;
+    return config_public_error(err);
 }
 
 esp_err_t iot_product_config_save_mqtt(const iot_mqtt_config_t *config)

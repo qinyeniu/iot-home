@@ -22,8 +22,8 @@
 #include "aps/esp_zigbee_aps.h"
 
 #define APP_ENDPOINT              10
-#define STARTUP_TX_POWER_DBM      (-10)
-#define ED_KEEP_ALIVE_MS          60000U
+#define STARTUP_TX_POWER_DBM      CONFIG_BATT_STARTUP_TX_POWER_DBM
+#define ED_KEEP_ALIVE_MS          CONFIG_BATT_KEEP_ALIVE_MS
 #define SLEEP_THRESHOLD_MS        500U
 #define ZIGBEE_CHANNEL_MASK       (1L << 26)
 
@@ -50,9 +50,9 @@
 #define BH1750_LUX_MAX            60000.0f
 #define ZCL_ILLUMINANCE_MAX       0xFFFD
 
-#define SENSOR_INTERVAL_MS        60000
-#define REPORT_GAP_MS             200
-#define REPORT_LOCAL_ATTEMPTS     3
+#define SENSOR_INTERVAL_MS        (CONFIG_BATT_SAMPLE_INTERVAL_S * 1000)
+#define REPORT_GAP_MS             CONFIG_BATT_REPORT_GAP_MS
+#define REPORT_LOCAL_ATTEMPTS     CONFIG_BATT_REPORT_LOCAL_ATTEMPTS
 #define REPORT_RETRY_DELAY_MS     200
 #define REPORT_APS_RADIUS         10
 

@@ -1,6 +1,6 @@
 # 电池传感器 SED 实验工程
 
-状态：阶段 3，已在阶段 2 基础上加入按需 I2C 控制器初始化/释放；仅离线编译，**未烧录**。
+状态：阶段 4，在阶段 3 基础上加入 Kconfig 参数配置；仅离线编译，**未烧录**。
 
 ## 目标
 
@@ -57,6 +57,16 @@ lux = 10^(raw / 10000) - 1
 - AHT20/BH1750 任一读取失败时，会把对应本地 ZCL MeasuredValue 恢复为 invalid（温度 `0x8000`，湿度/光照 `0xFFFF`），避免网关主动 Read 时读到陈旧值；本阶段不主动发送 invalid report。
 - 本工程不做 Flash 断网缓存。
 
+## 阶段 4 参数配置
+
+`main/Kconfig` 提供以下配置，默认值不改变阶段 3 行为：
+
+- 采样和 ZCL 上报周期：默认 60 秒，可用于后续 300/900/1200 秒电池测试；
+- Zigbee keep-alive/poll：默认 60000 ms；
+- 启动发射功率：默认 -10 dBm；
+- 本地 APS 请求拒绝后的尝试次数：默认 3；
+- 三条 ZCL report 的间隔：默认 200 ms。
+
 ## 离线编译
 
 环境：ESP-IDF v5.5.4。
@@ -66,7 +76,16 @@ lux = 10^(raw / 10000) - 1
 idf.py build
 ```
 
-阶段 3 结果：
+阶段 4 结果：
+
+```text
+binary size 0x7d7a0 bytes
+app partition 0xe1000 bytes
+free 0x63860 bytes (44%)
+SHA256 58B0EB2F576EC035030C61F32F92A80E779B5EF0B8B4692A2DF516DDA68D2F5E
+```
+
+阶段 3 结果（保留作对比）：
 
 ```text
 binary size 0x7d7a0 bytes

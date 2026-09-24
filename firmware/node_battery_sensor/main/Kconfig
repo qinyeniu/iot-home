@@ -1,0 +1,43 @@
+menu "Battery sensor"
+
+config BATT_SAMPLE_INTERVAL_S
+    int "Sampling and ZCL report interval (seconds)"
+    default 60
+    range 5 3600
+    help
+        How often the SED samples AHT20/BH1750 and sends reports.
+        Use 60 seconds for bench validation, then longer intervals for
+        battery-life testing.
+
+config BATT_KEEP_ALIVE_MS
+    int "Zigbee keep-alive/poll interval (milliseconds)"
+    default 60000
+    range 5000 600000
+    help
+        Keep-alive interval advertised to the parent. Aligning it with the
+        sample interval avoids extra wakeups during bench testing.
+
+config BATT_STARTUP_TX_POWER_DBM
+    int "Startup Zigbee transmit power (dBm)"
+    default -10
+    range -24 20
+    help
+        Conservative startup transmit power. Do not restore a higher power at
+        boot solely because it was used in a previous weak-link session.
+
+config BATT_REPORT_LOCAL_ATTEMPTS
+    int "Local report submission attempts"
+    default 3
+    range 1 5
+    help
+        Retry only when the local APS request is rejected. Once a frame has
+        been accepted but later fails, wait for the next sample period.
+
+config BATT_REPORT_GAP_MS
+    int "Gap between separate ZCL reports (milliseconds)"
+    default 200
+    range 0 2000
+    help
+        Short spacing between temperature, humidity and illuminance reports.
+
+endmenu

@@ -3340,6 +3340,7 @@ static void zb_forward_pending(void)
     // MQTT messages; sleepy-end-device reports can arrive more than 10s apart.
     // A longer partial timeout still publishes incomplete/legacy sensors.
     zb_node_t snap[MAX_ZB_NODES];
+    uint8_t snap_slot[MAX_ZB_NODES];
     int n_dirty = 0;
     uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
     portENTER_CRITICAL(&s_zb_lock);
@@ -3351,14 +3352,16 @@ static void zb_forward_pending(void)
         bool complete = (node->dirty & ZB_MASK_ALL) == ZB_MASK_ALL;
         uint32_t age_ms = now_ms - node->first_dirty_ms;
         if (complete || age_ms >= ZB_REPORT_PARTIAL_DELAY_MS) {
+            snap_slot[n_dirty] = (uint8_t)i;
             snap[n_dirty++] = *node;
             node->dirty = 0;
         }
     }
     portEXIT_CRITICAL(&s_zb_lock);
 
-    for (int i = 0; i < n_dirty; i++) {
-        zb_node_t *n = &snap[i];
+    for (int msg = 0; msg < n_dirty; msg++) {
+        zb_node_t *n = &snap[msg];
+        uint8_t slot = snap_slot[msg];
         char topic_suffix[40];
         snprintf(topic_suffix, sizeof(topic_suffix), "nodes/zb-%04x/telemetry", n->addr);
 
@@ -3385,11 +3388,11 @@ static void zb_forward_pending(void)
         if (payload[pos - 1] == ',') pos--;
         snprintf(payload + pos, sizeof(payload) - pos, "}}");
 
-        uint32_t telemetry_age_ms = now_ms - s_zb_last_telemetry_ms[i];
+        uint32_t telemetry_age_ms = now_ms - s_zb_last_telemetry_ms[slot];
         bool duplicate_telemetry =
-            s_zb_last_telemetry_payload[i][0] != '\0' &&
+            s_zb_last_telemetry_payload[slot][0] != '\0' &&
             telemetry_age_ms < ZB_TELEMETRY_DEDUP_MS &&
-            strcmp(payload, s_zb_last_telemetry_payload[i]) == 0;
+            strcmp(payload, s_zb_last_telemetry_payload[slot]) == 0;
 
         if (duplicate_telemetry) {
             ESP_LOGI(TAG, "MQTT duplicate suppressed (%s, age=%lu ms): %s",
@@ -3397,9 +3400,9 @@ static void zb_forward_pending(void)
         } else {
             mqtt_pub(topic_suffix, payload);
             ESP_LOGI(TAG, "MQTT -> %s: %s", topic_suffix, payload);
-            strlcpy(s_zb_last_telemetry_payload[i], payload,
-                    sizeof(s_zb_last_telemetry_payload[i]));
-            s_zb_last_telemetry_ms[i] = now_ms;
+            strlcpy(s_zb_last_telemetry_payload[slot], payload,
+                    sizeof(s_zb_last_telemetry_payload[slot]));
+            s_zb_last_telemetry_ms[slot] = now_ms;
         }
     }
 }

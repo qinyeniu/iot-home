@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-23 23:38（Asia/Shanghai）  
+更新时间：2026-09-24 08:45（Asia/Shanghai）  
 事实来源：`docs/HANDOFF_2026-09-23.md`、`docs/HANDOFF/_2026-09-23.md`
 
 > 本文件用于取代 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 中已经过时的阶段判断。旧文档保留作历史记录，新工作以本文件和最新交接为准。
@@ -43,6 +43,11 @@
    - 最近一次完整后端回归：`73 passed / 3 skipped`；
    - MQTT 后端/网关账号分离和 ACL 配置已准备并通过复审；
    - 配置尚未部署，真实 Mosquitto 容器 ACL 实测仍待做。
+
+7. **离线长测诊断工具**
+   - 新增 `tools/analyze_serial_log.py`，可流式分析串口日志；
+   - 已用真实 478 MB 日志验证，可识别 MAC no-buffer 风暴、重启、Zigbee/MQTT/Wi‑Fi 和 RF 序列；
+   - 对应单元测试：`4 passed`。
 
 ## 2. 当前主要风险
 
@@ -91,7 +96,7 @@
 3. 先跑短序列：QUERY → SET 0 → SET -10 → AUTO；
 4. 启动 4–8 小时本地串口长测；
 5. 不主动改网卡、不切换热点；
-6. 结束后用日志分析工具统计：
+6. 结束后使用 `tools/analyze_serial_log.py` 统计：
    - 节点启动段和断言；
    - APS 成功/失败；
    - I2C/队列错误；

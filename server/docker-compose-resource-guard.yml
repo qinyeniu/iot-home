@@ -1,0 +1,58 @@
+# 资源保护覆盖文件：默认不会生效。
+#
+# 只有在维护窗口显式同时使用本文件时才生效：
+#   docker compose -f docker-compose.yml \
+#     -f docker-compose-resource-guard.yml config
+#   docker compose -f docker-compose.yml \
+#     -f docker-compose-resource-guard.yml up -d
+#
+# 建议先只在测试/维护环境验证，再到阿里云 ECS 执行。
+
+services:
+  mosquitto:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 48M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mysql:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.35"
+          memory: 320M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: 160M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  grafana:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: 160M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

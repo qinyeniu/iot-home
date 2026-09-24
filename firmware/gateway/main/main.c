@@ -108,6 +108,9 @@ _Static_assert(RF_POWER_LEVEL_IS_SUPPORTED(RF_POWER_AUTO_MAX_DBM),
 #define RF_LQI_LOWER_WINDOWS      3
 #define RF_POWER_SETTLE_MS        90000
 #define RF_POWER_RECONCILE_MS     300000
+#define RF_TX_BACKOFF_FIRST_MS   300000
+#define RF_TX_BACKOFF_SECOND_MS  600000
+#define RF_TX_BACKOFF_MAX_MS     1800000
 #define RF_HEALTH_NO_RX_RESTART_MS 180000
 #define RF_HEALTH_MAC_NOBUFFER_EVENTS 100
 #define RF_HEALTH_MAC_NOBUFFER_SPAN_MS 60000
@@ -423,6 +426,8 @@ static bool s_rf_last_report_seq_valid;
 static uint8_t s_rf_last_report_seq;
 static uint32_t s_rf_wait_started_ms;
 static uint32_t s_rf_power_confirmed_ms;
+static uint8_t s_rf_tx_fail_count;
+static uint32_t s_rf_tx_backoff_until_ms;
 static volatile uint32_t s_rf_mac_nobuffer_events;
 static volatile uint32_t s_rf_first_mac_nobuffer_ms;
 static volatile uint32_t s_rf_last_mac_nobuffer_ms;
@@ -447,6 +452,41 @@ static bool rf_power_is_monitored_cluster(uint16_t cluster_id)
            cluster_id == ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT ||
            cluster_id == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF ||
            cluster_id == RF_POWER_CLUSTER_ID;
+}
+
+static bool rf_tx_backoff_active_locked(uint32_t now)
+{
+    return s_rf_tx_backoff_until_ms != 0 &&
+           (int32_t)(now - s_rf_tx_backoff_until_ms) < 0;
+}
+
+static void rf_tx_clear_backoff_locked(void)
+{
+    s_rf_tx_fail_count = 0;
+    s_rf_tx_backoff_until_ms = 0;
+}
+
+static void rf_tx_note_result_locked(esp_err_t err, uint32_t now)
+{
+    uint32_t delay_ms;
+
+    if (err == ESP_OK) {
+        rf_tx_clear_backoff_locked();
+        return;
+    }
+
+    if (s_rf_tx_fail_count < UINT8_MAX) {
+        s_rf_tx_fail_count++;
+    }
+
+    if (s_rf_tx_fail_count == 1) {
+        delay_ms = RF_TX_BACKOFF_FIRST_MS;
+    } else if (s_rf_tx_fail_count == 2) {
+        delay_ms = RF_TX_BACKOFF_SECOND_MS;
+    } else {
+        delay_ms = RF_TX_BACKOFF_MAX_MS;
+    }
+    s_rf_tx_backoff_until_ms = now + delay_ms;
 }
 
 static bool rf_power_is_table_value(int8_t power_dbm)
@@ -593,6 +633,7 @@ static void rf_power_forget_node(uint16_t addr)
         s_rf_last_report_seq = 0;
         s_rf_wait_started_ms = 0;
         s_rf_power_confirmed_ms = 0;
+        rf_tx_clear_backoff_locked();
         s_rf_policy_apply_pending = false;
         s_rf_expected_request_id[0] = '\0';
         s_rf_expected_user_transaction = false;
@@ -627,6 +668,7 @@ static void rf_power_reset_for_announce(uint16_t addr)
     s_rf_last_report_seq = 0;
     s_rf_wait_started_ms = 0;
     s_rf_power_confirmed_ms = 0;
+    rf_tx_clear_backoff_locked();
     s_rf_policy_apply_pending = s_rf_policy_user_transaction ||
                                  (s_rf_mode == RF_MODE_MANUAL);
     s_rf_expected_user_transaction = false;
@@ -1042,11 +1084,33 @@ static esp_err_t rf_power_send_to_node(uint8_t command, int8_t power_dbm,
     ESP_LOGI(TAG, "RF power -> node=0x%04x cmd=%u power=%d mode=%s seq=%u: %s",
              (unsigned)addr, command, power_dbm, rf_power_mode_name(mode),
              seq, esp_err_to_name(err));
+
+    bool was_backoff;
+    uint8_t tx_fail_count;
+    uint32_t tx_backoff_until;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    uint32_t state_now = pdTICKS_TO_MS(xTaskGetTickCount());
+    was_backoff = rf_tx_backoff_active_locked(state_now);
+    rf_tx_note_result_locked(err, state_now);
     if (err != ESP_OK) {
-        taskENTER_CRITICAL(&s_rf_power_lock);
         s_rf_expected_request_id[0] = '\0';
-        taskEXIT_CRITICAL(&s_rf_power_lock);
     }
+    tx_fail_count = s_rf_tx_fail_count;
+    tx_backoff_until = s_rf_tx_backoff_until_ms;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (err == ESP_OK) {
+        if (was_backoff) {
+            ESP_LOGI(TAG, "RF tx backoff cleared");
+        }
+    } else {
+        ESP_LOGI(TAG,
+                 "RF tx backoff armed: failures=%u until_ms=%lu",
+                 (unsigned)tx_fail_count,
+                 (unsigned long)tx_backoff_until);
+    }
+
     if (err == ESP_OK && sent_seq != NULL) {
         *sent_seq = seq;
     }
@@ -1060,6 +1124,10 @@ static void rf_power_remote_query(const char *request_id)
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
 
     taskENTER_CRITICAL(&s_rf_power_lock);
+    // A user QUERY may take over an automatic transaction whose wait deadline
+    // has already passed. Otherwise a failed periodic retry could leave a stale
+    // waiting flag and block the user for the whole backoff window.
+    (void)rf_power_expire_waiting_if_due_locked(now);
     addr = s_rf_node_addr;
     report_waiting = s_rf_report_waiting;
     taskEXIT_CRITICAL(&s_rf_power_lock);
@@ -1251,6 +1319,10 @@ static void rf_power_controller_periodic(void)
     s_rf_last_eval_ms = now;
 
     taskENTER_CRITICAL(&s_rf_power_lock);
+    if (rf_tx_backoff_active_locked(now)) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
     addr = s_rf_node_addr;
     last_rx = s_rf_last_rx_ms;
     link_lqi = s_rf_lqi_ema;

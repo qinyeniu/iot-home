@@ -1,19 +1,61 @@
-# tools — 模拟器与调试工具
+# tools — 测试、烧录与诊断工具
 
-## 用途
+本目录用于保存开发过程中的串口采集、日志分析、MQTT 联调、部署辅助和一次性迁移脚本。运行任何会写设备的工具前，必须先确认端口和目标固件，避免把实验固件烧入现网设备。
 
-- 模拟传感器节点周期性发布温湿度 / 光照数据到 MQTT；
-- 硬件到货前即可完成"模拟设备 → MQTT → 入库 → Grafana 曲线"端到端联调。
-- 串口联调：通过 COM 口读取设备日志与测试数据（pyserial 脚本），辅助硬件验收与固件调试；
-- 烧录与验证：esptool 读取芯片 ID、烧录固件、查看 flash 信息。
+## 当前常用工具
 
-## 本机工具链现状（2026-08-17 实测）
+| 工具 | 作用 |
+| --- | --- |
+| `capture_serial.py` | 按指定时长读取串口日志 |
+| `capture_serial_stream.py` | 串口流式记录；使用前需确认是否会触发复位 |
+| `capture_serial_no_reset.py` | 尽量保持 DTR/RTS inactive 的被动串口记录 |
+| `analyze_serial_log.py` | 流式分析单份 ESP 串口日志，识别重启、panic、MAC no-buffer、Zigbee/MQTT/Wi‑Fi 等 |
+| `analyze_long_test.py` | 同时分析节点/网关双日志，输出 `PASS / DEGRADED / FAIL / INCOMPLETE` 的 Markdown 报告 |
+| `analyze_overnight_logs.py` | 旧版整夜双日志分析脚本，保留作历史兼容 |
+| `rf_power_config.py` | 通过 MQTT 执行 RF QUERY/SET/AUTO 联调 |
+| `simulator.py` | 模拟设备向 MQTT 发布数据 |
+| `deploy_server.py` / `interactive_deploy.ps1` | 服务器部署辅助；未经用户明确要求不执行 |
 
-| 工具 | 状态 | 说明 |
-|------|------|------|
-| Python | ✅ 3.14.0 | `C:\Users\HJB\AppData\Local\Python\bin\python.exe`，PATH 已配置 |
-| Node.js | ✅ v22.19.0 | — |
-| Docker | ⚠️ 已装 29.6.1 | 守护进程未启动，使用前需启动 Docker Desktop |
-| 串口 | ✅ COM1 / COM2 | 设备插入 USB 后会出现新的 COM 口 |
-| esptool / pyserial | 待安装 | 用 `python -m pip install esptool pyserial` 安装 |
-| ESP-IDF | 未安装 | 第 3 周固件开发前安装（约 5GB，需预留磁盘） |
+## 长测分析器用法
+
+```powershell
+python tools/analyze_long_test.py `
+  firmware/node_zigbee/log.long-node-*.txt `
+  firmware/gateway/log.long-gateway-*.txt `
+  --target-duration 28800
+```
+
+判定规则：
+
+- `FAIL`：assert/panic/abort、重启标志、uptime 回跳或 MAC no-buffer 风暴；
+- `DEGRADED`：APS/I2C/队列失败、观察缺口或未达风暴阈值的 MAC no-buffer；
+- `INCOMPLETE`：目标时长未满足，且未发现失败或降级线索；
+- `PASS`：达到目标时长且未发现异常。
+
+## 本机环境（2026-09-25）
+
+| 项目 | 状态 |
+| --- | --- |
+| Python | 3.14.0 |
+| ESP-IDF | v5.5.4，安装于 `C:\Espressif\v5.5.4\esp-idf` |
+| Zigbee 组件 | 现网/电池工程当前按 1.6.0 固定 |
+| pytest | 系统 Python 未全局安装；仓库 `.venv` 中已安装，`.venv` 不提交 |
+| Docker | 仅本地后端回归时按需启动 |
+
+运行新工具的定向测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tools/tests/test_analyze_long_test.py -q
+```
+
+## 安全边界
+
+- 不读取、不打印、不复制 `wifi_secrets.h`、`mqtt_secrets.h` 等密码文件；
+- 不使用 `git add -A`；
+- 不刷 bootloader/分区表、不整片擦 Flash、不擦 Zigbee NVRAM，除非用户明确授权；
+- 不自动部署或重启远程服务器；
+- 打开串口可能触发板子复位，开始长测前必须让用户知道。
+
+## 临时脚本
+
+目录中仍有较多历史补丁和迁移脚本。它们是前期开发过程的证据，后续应按 `docs/WORKSPACE_CLEANUP_INVENTORY.md` 分类后再归档或删除；当前不做批量清理。

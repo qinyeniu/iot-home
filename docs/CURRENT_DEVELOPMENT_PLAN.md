@@ -1,15 +1,15 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-24 21:15（Asia/Shanghai）
-事实来源：`docs/HANDOFF_2026-09-24.md`、`docs/HANDOFF/_2026-09-24.md`
+更新时间：2026-09-25 02:15（Asia/Shanghai；夜间长测进行中）
+事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
-> 本文件用于取代 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 中已经过时的阶段判断。旧文档保留作历史记录，新工作以本文件和最新交接为准。
+> 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
 
 ## 1. 当前真实进度
 
-系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi-Fi/MQTT → FastAPI/MySQL/Grafana。
+系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-已经完成并经过不同程度实测：
+### 1.1 已经验证的主链路
 
 1. **Zigbee 链路**
    - 网关为 coordinator，节点为 end device；
@@ -18,195 +18,142 @@
    - 节点复位后 authenticated secure rejoin 已验证。
 
 2. **传感器与远程开关**
-   - 单节点集成 AHT20 温湿度、BH1750 光照和继电器；
+   - 现网单节点集成 AHT20、BH1750、继电器和本地按键；
    - on/off/toggle 远程控制已打通；
-   - 本地按键控制继电器已打通；
    - on_off 状态可随遥测/状态回报。
 
-3. **运行时 RF 功率策略**
-   - QUERY、固定功率、恢复 AUTO 均已实测；
-   - 晚间最终硬件序列通过：QUERY → SET 0 → SET -10 → AUTO；
-   - 最终状态为 `auto / -10 dBm`；
-   - 后端 RF policy REST API 和 Grafana 功率/模式面板已完成。
+3. **RF 功率策略**
+   - 2026-09-25 短序列完成：QUERY → SET 0 → SET -10 → AUTO；
+   - AUTO 当次确认超时，但 fresh QUERY 已确认真实状态为 `auto/-10 dBm`；
+   - 后端 RF policy REST API 和 Grafana 功率/模式面板已完成，但公网后端仍未部署这部分 API。
 
 4. **事务一致性**
    - 网关命令响应与节点主动 REPORT 序号边界已分离；
-   - confirmed 必须匹配本次 request_id、模式、功率和 deadline；
+   - confirmed 必须匹配 request_id、模式、功率和 deadline；
    - 链路陈旧只终止本次请求，不清除 durable desired mode/manual power。
 
 5. **网关健康与并发**
    - 非 Zigbee callback 中的 APS/ZCL 请求已通过 ZBOSS lock 串行化；
-   - 健康重启只在“180 秒无有效子节点帧 + 当前持续 MAC no-buffer 风暴 + 事件数量/持续时间达标”时触发；
-   - 节点正常拔掉不会触发网关重启，本项已实测。
+   - 健康重启只在“长期无有效子节点帧 + 持续 MAC no-buffer 风暴 + 事件数量/持续时间达标”时触发；
+   - 2026-09-25 已再次实测：正常拔掉节点不会导致网关重启。
 
-6. **服务端与安全准备**
-   - 最近一次完整后端回归：`73 passed / 3 skipped`；
-   - MQTT 后端/网关账号分离和 ACL 配置已准备并通过复审；
-   - 配置尚未部署，真实 Mosquitto 容器 ACL 实测仍待做。
+### 1.2 夜间新增的离线能力
 
-7. **离线长测诊断工具**
-   - 新增 `tools/analyze_serial_log.py`，可流式分析串口日志；
-   - 已用真实 478 MB 日志验证，可识别 MAC no-buffer 风暴、重启、Zigbee/MQTT/Wi‑Fi 和 RF 序列；
-   - 对应单元测试：`4 passed`。
+1. **双日志长测分析器**
+   - 新增 `tools/analyze_long_test.py`；
+   - 同时读取节点/网关日志，输出 `PASS / DEGRADED / FAIL / INCOMPLETE`；
+   - 定向测试：`13 passed`。
 
-8. **SoftAP 配网准备**
-   - 已完成静态页面：`docs/provisioning/softap-prototype.html`；
-   - 已完成接口契约：`docs/SOFTAP_PROVISIONING_API_CONTRACT.md`；
-   - 页面和契约均通过审查，当前尚未接入固件、不影响设备运行；
-   - 已确认普通 NVS 多键写入不能依赖一次 `nvs_commit()` 获得事务语义。
+2. **NVS A/B 完整配置接口**
+   - 新增 `cfg_a`、`cfg_b`、`cfg_commit` 三个 NVS blob；
+   - 保存时先写非活动数据槽并提交，再切换 durable marker；
+   - 带 schema、长度和 CRC32 校验；
+   - 当前 `main.c` 尚未调用，运行时行为不变。
+
+3. **电池传感器阶段 3**
+   - 独立 `firmware/node_battery_sensor` 工程已支持 60 秒采集 AHT20/BH1750 和标准 ZCL 上报；
+   - Zigbee 入网后按需初始化 I2C，采样和 APS 请求提交后释放 I2C；
+   - 已离线构建和复审，未烧录。
+
+4. **SoftAP 配网资产**
+   - 静态页面：`docs/provisioning/softap-prototype.html`；
+   - 接口契约：`docs/SOFTAP_PROVISIONING_API_CONTRACT.md`；
+   - 当前尚未接入固件。
 
 ## 2. 当前主要风险
 
-### P0：长运行稳定性还没有重新闭环
+### P0：长运行稳定性仍在等待 8 小时结论
 
-整夜长测曾发现：
+01:01 已启动双串口被动长测。02:02 的 1 小时节点显示：
 
-- 节点出现 1 次 `vPortExitCritical` 断言；
-- 网关后续出现持续 `ZB_ESP_MAC: No buffer, handle it`；
-- 加锁修复和精确健康判断已完成，但修复后还没有完成新的整夜/长时段验证。
+- 节点/网关无重启；
+- 无 assert/panic；
+- 无观察缺口；
+- 无 MAC no-buffer；
+- 节点累计新增 6 次 APS 失败，中途结论为 `DEGRADED`。
 
-因此当前最重要的问题不是再堆新功能，而是确认修复后：
-
-- 节点不再断言重启；
-- 网关不再进入 MAC no-buffer 风暴；
-- 即使出现异常，健康自愈能否按预期工作。
+因此不能提前给稳定性 PASS。最终要等待约 09:01 的报告，并分析 APS 失败是否与 LQI/RSSI 变差、父链路恢复或 RF reconcile 时间点相关。
 
 ### P0：公网 MQTT 匿名/弱权限风险
 
-已观察到公网 MQTT 疑似允许匿名连接。ACL 配置虽已写好，但未部署前风险仍在。
-
-部署必须选择用户允许的维护窗口，避免影响游戏或当前网络。
+公网 MQTT 曾观察到匿名连接。ACL 配置虽已写好，但未部署前风险仍在。部署必须选择用户明确允许的维护窗口，避免影响游戏或当前网络。
 
 ### P1：应用分区余量紧张
 
-当前网关应用分区仅剩约 5%（约 0x11820 字节）。SoftAP/HTTP、配网页面和校验逻辑继续叠加前，必须先评估固件体积；不能在没有构建验证的情况下直接加入完整 HTTP 配网功能。
+网关应用分区仅剩约 5%（约 `0x11810` 字节）。SoftAP/HTTP、页面和校验逻辑继续叠加前必须先构建验收，不能直接加入完整 HTTP 配网功能。
 
-### P1：NVS 多键保存不是事务
+### P1：NVS A/B 接口尚未硬件验证
 
-已验证“多键写入 + 一次 `nvs_commit()`”不能作为多键事务方案。若后续键写入失败或掉电，仍可能留下半套配置。真实 SoftAP `/commit` 前必须选择单一 bundle blob 或 staging + durable marker/启动恢复方案。
+A/B bundle 已离线编译并复审通过，但尚未验证真实硬件上的 save → restart → load、写入失败、掉电恢复和 legacy 回退。当前不得直接把启动读取切换到 bundle。
 
 ### P1：仓库工作区较乱
 
-当前有约 600+ 未跟踪项，主要包括：
-
-- 串口日志；
-- 临时补丁脚本；
-- 固件备份；
-- 旧/实验工程；
-- 构建输出或临时分析文件。
-
-这些证据有一定价值，不应直接删除；需要先分类，再决定提交、归档、加入 `.gitignore` 或清理。
+当前仍有大量未跟踪串口日志、临时脚本、固件备份和实验工程。它们包含实测证据，后续应先分类再归档或删除，不做批量清理。
 
 ## 3. 下一阶段建议顺序
 
-### 阶段 A：长稳定性复测（需要硬件，优先）
+### 阶段 A：完成长稳定性复测（当前最高优先级）
 
-前置条件：用户允许接入 COM5/COM6，并明确当前网络是否保持不动。
+1. 双串口继续只记录，不烧录、不重启设备、不切换网络；
+2. 约 05:01 使用 `tools/analyze_long_test.py` 做 4 小时只读分析；
+3. 约 09:01 长测结束后做最终分析；
+4. 最终报告明确：重启、panic、MAC、观察缺口、APS 失败、遥测发布、重复抑制和缓存 report。
 
-建议测试方式：
+### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
-1. 接入 COM6 网关，必要时只抓本地串口日志；
-2. 接入 COM5 节点，确认 secure rejoin；
-3. 先跑短序列：QUERY → SET 0 → SET -10 → AUTO；
-4. 启动 4–8 小时本地串口长测；
-5. 不主动改网卡、不切换热点；
-6. 结束后使用 `tools/analyze_serial_log.py` 统计：
-   - 节点启动段和断言；
-   - APS 成功/失败；
-   - I2C/队列错误；
-   - 实际功率变化；
-   - 网关 no-buffer、重启和 MQTT 转发情况。
+1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；
+2. 测试 save → load → restart → load；
+3. 测试写入失败/取消/旧配置仍可用；
+4. 确定启动优先级：bundle > legacy keys > build default，或保留更保守的显式启用方式；
+5. 验证通过后再考虑接入 SoftAP。
 
-通过标准：
+### 阶段 C：MQTT 安全部署（需要用户在场和维护窗口）
 
-- 节点无 `vPortExitCritical`；
-- 网关无持续 MAC no-buffer 风暴；
-- 命令与遥测链路可持续工作；
-- 若发生恢复，能明确区分正常离线和真实故障。
+执行顺序：
 
-### 阶段 B：MQTT 安全部署（需要明确授权和维护窗口）
-
-顺序建议：
-
-1. 先只部署“关闭匿名 + 新旧账号迁移共存 + ACL”（执行手册：`docs/ALIYUN_MQTT_ACL_DEPLOYMENT_RUNBOOK.md`）；
-2. 保留旧账号短期回退能力；
-3. 验证后端、网关、匿名用户和跨网关访问；
+1. 先部署“关闭匿名 + 新旧账号迁移共存 + ACL”；
+2. 验证后端、网关、匿名拒绝和跨设备访问；
+3. 保留短期回退能力；
 4. 再移除旧账号；
-5. 最后补 TLS/WSS 或 VPN/Tailscale，避免明文 MQTT 长期暴露公网。
+5. TLS/WSS、证书和 VPN 后续由用户在场时教学式配置。
 
-不得在用户打游戏或未授权时修改服务器安全组、网卡、热点或 Broker 配置。
+相关手册：
 
-### 阶段 C：仓库整理与文档收敛（无需硬件，可随时做）
+- `docs/ALIYUN_MQTT_ACL_DEPLOYMENT_RUNBOOK.md`
+- `docs/ALIYUN_SERVER_MAINTENANCE_PLAN.md`
 
-已生成分类清单：`docs/WORKSPACE_CLEANUP_INVENTORY.md`。当前有 646 个未跟踪文件、合计 572.85 MiB；仍不直接删除：
+### 阶段 D：电池节点实测与硬件决策
 
-1. 串口日志：保留关键实测日志，普通重复日志归档或忽略；
-2. 临时补丁脚本：确认无用后归档/删除；
-3. 固件备份：保留关键 SHA256 对应版本，避免重复；
-4. `.gitignore`：增加构建输出、临时日志、临时脚本等规则；
-5. 更新入口文档，让新会话先读当前计划和最新交接。
+1. 使用独立实验板烧录 `node_battery_sensor`，不得替换现网 COM5 组合节点功能；
+2. 验证入网、PAN/Extended PAN ID、短地址、60 秒三项上报；
+3. 用功率分析仪或低功耗电流表记录 sleep/poll/report 电流；
+4. 区分 I2C 控制器、传感器 VCC、I2C 上拉、LED/USB 芯片等漏电；
+5. 根据实测决定是否增加负载开关、调整 keep-alive/poll 或进入 deep sleep。
 
-### 阶段 D：产品功能扩展（长稳定后再做）
+### 阶段 E：产品功能扩展
 
-可选方向：
+长稳定、凭据和电池实测之后再推进：
 
-1. **Web 控制界面**：只读静态原型已完成；产品化仍需评估认证、TLS/VPN、CORS、刷新间隔和写操作权限；
-2. **设备能力建模**：正确表达“传感器 + 开关”组合设备，而不是简单归类为单一传感器或开关；
-3. **多节点支持**：为多个节点分别维护短地址、能力、LQI、功率、命令状态；
-4. **远距离/隔墙 ATPC 实测**：验证固定功率失败和 AUTO 自动升功率的差异；
-5. **本地配网/凭据管理**：静态页面和接口契约已完成，真实接入前需确定 NVS 事务存储方案。
+1. Web 控制界面的认证、TLS/VPN、CORS 和写操作权限；
+2. “传感器 + 开关”组合设备能力模型；
+3. 多节点短地址、能力、LQI、功率和命令状态；
+4. 远距离/隔墙 ATPC 实测；
+5. PCB、外壳和量产化设计。
 
-### 阶段 E：低功耗与产品化（后续）
-
-1. 将“常供电网关/继电器节点”和“电池供电传感器节点”区分设计；
-2. 重新评估 Zigbee sleepy end device、深度睡眠和上报周期；
-3. 用仪表实测电流，而不是只按理论电流估算；
-4. 多节点稳定后再进入 PCB、外壳和量产化设计。
-
-## 4. 现在不接硬件时最适合做的事
-
-优先级从高到低：
-
-1. 整理仓库未跟踪文件，先输出分类清单；
-2. 补充 `.gitignore`，防止日志和临时产物继续污染状态；
-3. 为 MQTT TLS/ACL 部署写详细维护手册和回退步骤；
-4. ~~做一个简单 Web 控制台原型，只读展示现有 API 数据~~（已完成离线静态原型：`docs/console/read-only-console-prototype.html`，尚未部署）；
-5. 审查命令超时、设备状态和 RF policy 的边界测试；
-6. 更新历史文档索引。
-
-## 5. 操作红线
+## 4. 当前操作红线
 
 - 未经用户明确同意，不切换网卡、不开关热点、不改安全组；
-- 不 push、不部署服务器，除非用户明确要求；
+- 不 push、不部署或重启远程服务器，除非用户明确要求；
+- 不修改阿里云 DNS、证书、MQTT Broker、TLS/WSS、VPN；
 - 不整片擦 Flash、不擦 Zigbee NVRAM、不刷 bootloader/分区表；
-- 不使用 `git add -A`，只显式添加本次相关文件；
+- 不把电池实验固件烧入现网 COM5 组合节点，除非用户明确确认替换功能；
 - 不读取、不打印、不落文档任何密码文件或真实凭据；
+- 不使用 `git add -A`；
 - 打开 COM5/COM6 前要意识到可能触发热复位。
 
-## 6. 2026-09-24 夜间产品化补充
+## 5. 阿里云与后续运维备注
 
-### 6.1 已确认的新约束
-
-- 云服务器为**阿里云 ECS**；
-- MQTT 安全部署、TLS/WSS、VPN 暂不执行，后续在维护窗口内教学并共同操作；
-- 新增阿里云配置计划：`docs/ALIYUN_SERVER_MAINTENANCE_PLAN.md`；
-- 本地配网与凭据管理进入实施阶段：`docs/LOCAL_PROVISIONING_CREDENTIALS_DESIGN.md`；
-- Flash 断网缓存必须低磨损：`docs/LOW_WEAR_FLASH_SPOOL_DESIGN.md`；
-- 电池节点采用独立设备路线：`docs/BATTERY_NODE_LOW_POWER_PLAN.md`。
-
-### 6.2 当前代码风险提醒
-
-为验证新组件，网关构建目录执行过本地 fullclean/重建。当前构建使用项目清单中固定的 Zigbee 组件 1.6.0；此前工作区中曾存在较新的 1.6.4/1.6.8 管理组件。当前构建产物不能被误认为昨晚已硬件验证并烧录的版本，后续恢复硬件时应先复核组件版本、构建 SHA 和固件功能，再决定是否烧录。
-
-当前应用分区剩余约 5%，后续加入 SoftAP/HTTP 配网功能前应关注固件体积，避免功能堆叠导致分区不足。
-
-### 6.3 更新后的推荐顺序
-
-1. 保持现有 NVS 配置组件和启动回退路径，先不在运行时接入未经事务验证的保存接口；
-2. 由用户选择单一完整 bundle blob 或 staging + durable marker/启动恢复路线；
-3. 硬件在线时验证 NVS 读取、保存失败、取消、重启恢复和编译时回退；
-4. 在固件体积仍可接受的前提下，把已审查的 SoftAP 静态页面接入独立 HTTP 组件；
-5. 进行修复后的长稳定性复测；
-6. 在维护窗口进行阿里云 MQTT 账号/ACL，再教学式配置 TLS/WSS 或 VPN；
-7. 建立独立电池 SED/deep-sleep 实验工程；
-8. 后续再设计 deferred command、设备能力模型和 Grafana 电池面板。
+- 用户服务器为**阿里云 ECS**，公网 IP 在现有固件/工具配置中使用；
+- MQTT 安全部署、TLS/WSS 和 VPN 暂不自动执行；
+- 服务器资源需要保留余量，避免后端、MySQL、MQTT、Grafana 或日志占满磁盘/CPU；
+- 所有部署必须准备回退步骤，并避开用户使用网络的时间。

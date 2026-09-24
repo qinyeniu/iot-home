@@ -252,6 +252,19 @@ class RFPolicyAPITests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(resp.status_code, 504)
 
+    def test_command_history_limit_bounds(self):
+        resp = self.client.get("/api/commands?limit=0")
+        self.assertEqual(resp.status_code, 422)
+
+        resp = self.client.get("/api/commands?limit=501")
+        self.assertEqual(resp.status_code, 422)
+
+        resp = self.client.get("/api/commands?limit=20")
+        self.assertEqual(resp.status_code, 200)
+
+        resp = self.client.get("/api/commands?limit=500")
+        self.assertEqual(resp.status_code, 200)
+
     def test_publish_failure_returns_500(self):
         async def fake_publish(device_id, command, payload, request_id=None):
             return False

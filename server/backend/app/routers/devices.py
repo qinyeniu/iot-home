@@ -411,7 +411,7 @@ async def send_command(
 async def get_commands(
     device_id: Optional[str] = Query(None, description="设备ID"),
     status: Optional[str] = Query(None, description="命令状态"),
-    limit: int = Query(50, description="返回条数限制"),
+    limit: int = Query(50, ge=1, le=500, description="返回条数限制"),
     session: AsyncSession = Depends(get_session)
 ):
     """获取命令历史"""

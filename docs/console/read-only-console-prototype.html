@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IoT-Home 只读控制台原型</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #667085;
+      --border: #dde3ee;
+      --primary: #2364aa;
+      --ok: #17825d;
+      --warn: #b76e00;
+      --bad: #b42318;
+      --shadow: 0 10px 30px rgba(23, 32, 51, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    header {
+      padding: 28px clamp(18px, 4vw, 48px) 20px;
+      background: linear-gradient(135deg, #143b63, #2364aa);
+      color: #fff;
+    }
+
+    header h1 { margin: 0 0 8px; font-size: clamp(24px, 4vw, 36px); }
+    header p { margin: 0; opacity: 0.86; }
+
+    main { padding: 22px clamp(16px, 4vw, 48px) 42px; }
+
+    .toolbar, .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .toolbar {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: minmax(220px, 1fr) auto;
+      align-items: end;
+      padding: 18px;
+      margin-bottom: 18px;
+    }
+
+    label { display: grid; gap: 7px; font-weight: 700; }
+    input {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font: inherit;
+    }
+
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 11px 18px;
+      background: var(--primary);
+      color: #fff;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.55; cursor: wait; }
+
+    .hint, .meta, .empty { color: var(--muted); font-size: 14px; }
+
+    .status-line {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin: 12px 0 0;
+    }
+
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #98a2b3;
+      display: inline-block;
+    }
+    .dot.ok { background: var(--ok); }
+    .dot.warn { background: var(--warn); }
+    .dot.bad { background: var(--bad); }
+
+    .error {
+      display: none;
+      margin: 0 0 18px;
+      padding: 13px 16px;
+      border: 1px solid #fecdca;
+      border-radius: 12px;
+      background: #fef3f2;
+      color: var(--bad);
+    }
+    .error.visible { display: block; }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    .panel { padding: 18px; margin-bottom: 18px; overflow-x: auto; }
+    .panel > h2 { margin: 0 0 14px; font-size: 20px; }
+
+    .device-card {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      background: #fbfcff;
+    }
+    .device-card h3 { margin: 0 0 8px; font-size: 18px; }
+    .device-meta { display: grid; gap: 6px; color: var(--muted); font-size: 14px; }
+    .badge-row { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+    .badge {
+      display: inline-flex;
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: #eaf2ff;
+      color: #174e7a;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    table { width: 100%; border-collapse: collapse; min-width: 620px; }
+    th, td { text-align: left; padding: 10px 9px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-size: 13px; }
+
+    @media (max-width: 640px) {
+      .toolbar { grid-template-columns: 1fr; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>IoT-Home 只读控制台原型</h1>
+    <p>用于核对设备、最新遥测、RF 策略缓存和命令历史；不提供远程控制按钮。</p>
+  </header>
+
+  <main>
+    <section class="toolbar" aria-label="接口连接设置">
+      <label for="apiBase">
+        API 地址（填写到主机和端口）
+        <input id="apiBase" name="apiBase" inputmode="url" autocomplete="off" spellcheck="false">
+      </label>
+      <button id="refreshButton" type="button">手动刷新一次</button>
+      <p class="hint">页面不会自动刷新；每次点击只读取一次数据，避免给阿里云 ECS 增加持续负载。</p>
+      <div class="status-line" aria-live="polite">
+        <span id="healthDot" class="dot" aria-hidden="true"></span>
+        <strong id="healthTitle">尚未连接</strong>
+        <span id="healthText" class="meta">请填写 API 地址后手动刷新。</span>
+      </div>
+      <p id="loadedAtText" class="meta"></p>
+    </section>
+
+    <div id="errorBanner" class="error" role="alert">
+      <strong>读取失败：</strong><span id="errorText"></span>
+    </div>
+
+    <section class="panel" aria-labelledby="devicesTitle">
+      <h2 id="devicesTitle">设备 <span id="deviceCount" class="meta"></span></h2>
+      <div id="deviceList" class="grid">
+        <p class="empty">尚未读取设备数据。</p>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="metricsTitle">
+      <h2 id="metricsTitle">最新遥测 <span id="metricCount" class="meta"></span></h2>
+      <table>
+        <thead>
+          <tr><th scope="col">设备</th><th scope="col">指标</th><th scope="col">数值</th><th scope="col">时间</th></tr>
+        </thead>
+        <tbody id="metricsBody"></tbody>
+      </table>
+    </section>
+
+    <section class="panel" aria-labelledby="commandsTitle">
+      <h2 id="commandsTitle">最近命令 <span id="commandCount" class="meta"></span></h2>
+      <table>
+        <thead>
+          <tr><th scope="col">时间</th><th scope="col">设备</th><th scope="col">命令</th><th scope="col">状态</th></tr>
+        </thead>
+        <tbody id="commandsBody"></tbody>
+      </table>
+    </section>
+  </main>
+
+<script>
+(function () {
+  'use strict';
+
+  var DEFAULT_API_BASE = 'http://localhost:8000';
+  var REQUEST_TIMEOUT_MS = 10000;
+  var COMMAND_LIMIT = 20;
+
+  var activeController = null;
+  var activeTimeoutId = null;
+
+  function byId(id) {
+    return document.getElementById(id);
+  }
+
+  var nodes = {
+    apiBase: byId('apiBase'),
+    refreshButton: byId('refreshButton'),
+    healthDot: byId('healthDot'),
+    healthTitle: byId('healthTitle'),
+    healthText: byId('healthText'),
+    loadedAtText: byId('loadedAtText'),
+    errorBanner: byId('errorBanner'),
+    errorText: byId('errorText'),
+    deviceCount: byId('deviceCount'),
+    deviceList: byId('deviceList'),
+    metricCount: byId('metricCount'),
+    metricsBody: byId('metricsBody'),
+    commandCount: byId('commandCount'),
+    commandsBody: byId('commandsBody')
+  };
+
+  function normalizeApiBase(value) {
+    var url = new URL(String(value).trim());
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new Error('只支持 http 或 https 地址');
+    }
+    return url.origin;
+  }
+
+  function apiUrl(base, path) {
+    return base + path;
+  }
+
+  function setHealth(kind, title, text) {
+    nodes.healthDot.classList.remove('ok', 'warn', 'bad');
+    if (kind) {
+      nodes.healthDot.classList.add(kind);
+    }
+    nodes.healthDot.className = 'dot' + (kind ? ' ' + kind : '');
+    nodes.healthTitle.textContent = title;
+    nodes.healthText.textContent = text;
+  }
+
+  function showError(message) {
+    nodes.errorText.textContent = message;
+    nodes.errorBanner.classList.add('visible');
+  }
+
+  function clearError() {
+    nodes.errorText.textContent = '';
+    nodes.errorBanner.classList.remove('visible');
+  }
+
+  function textElement(tag, text) {
+    var element = document.createElement(tag);
+    element.textContent = text === undefined || text === null ? '—' : String(text);
+    return element;
+  }
+
+  function formatDateTime(value) {
+    if (!value) return '—';
+    var date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString('zh-CN', { hour12: false });
+  }
+
+  function metricLabel(metric) {
+    var labels = {
+      temperature: '温度',
+      humidity: '湿度',
+      illuminance: '光照',
+      on_off: '开关状态',
+      lqi: '链路质量',
+      rssi: '信号强度',
+      battery: '电量',
+      voltage: '电压'
+    };
+    return Object.prototype.hasOwnProperty.call(labels, metric) ? labels[metric] : metric;
+  }
+
+  function metricUnit(metric) {
+    var units = {
+      temperature: '°C',
+      humidity: '%',
+      illuminance: 'lx',
+      lqi: '',
+      rssi: 'dBm',
+      battery: '%',
+      voltage: 'V'
+    };
+    return Object.prototype.hasOwnProperty.call(units, metric) ? units[metric] : '';
+  }
+
+  function formatMetricValue(metric, value) {
+    if (metric === 'on_off') {
+      if (value === 1 || value === true || value === '1' || value === 'true') return '开';
+      if (value === 0 || value === false || value === '0' || value === 'false') return '关';
+    }
+    var unit = metricUnit(metric);
+    return String(value) + (unit ? ' ' + unit : '');
+  }
+
+  function renderDevices(devices, rfByDevice) {
+    nodes.deviceList.replaceChildren();
+
+    if (!devices.length) {
+      nodes.deviceList.appendChild(textElement('p', '暂无设备。'));
+      return;
+    }
+
+    devices.forEach(function (device) {
+      var card = document.createElement('article');
+      card.className = 'device-card';
+
+      card.appendChild(textElement('h3', device.name || device.id));
+
+      var meta = document.createElement('div');
+      meta.className = 'device-meta';
+      meta.appendChild(textElement('div', 'ID：' + device.id));
+      meta.appendChild(textElement('div', '类型：' + device.type));
+      meta.appendChild(textElement('div', '状态：' + device.status));
+      meta.appendChild(textElement('div', '最近在线：' + formatDateTime(device.last_seen)));
+
+      var rf = rfByDevice[device.id];
+      if (rf && rf.status !== 'unknown') {
+        var power = rf.power_dbm === null || rf.power_dbm === undefined ? '—' : rf.power_dbm + ' dBm';
+        meta.appendChild(textElement('div', 'RF：' + (rf.mode || '未知') + ' / ' + power));
+      }
+      card.appendChild(meta);
+
+      var badges = document.createElement('div');
+      badges.className = 'badge-row';
+      var capabilities = device.capabilities || {};
+      var sensors = Array.isArray(capabilities.sensors) ? capabilities.sensors : [];
+      sensors.forEach(function (sensor) {
+        var badge = textElement('span', metricLabel(sensor));
+        badge.className = 'badge';
+        badges.appendChild(badge);
+      });
+      if (capabilities.switch) {
+        var switchBadge = textElement('span', '开关');
+        switchBadge.className = 'badge';
+        badges.appendChild(switchBadge);
+      }
+      card.appendChild(badges);
+
+      nodes.deviceList.appendChild(card);
+    });
+  }
+
+  function renderMetrics(metrics) {
+    nodes.metricsBody.replaceChildren();
+    if (!metrics.length) {
+      var row = document.createElement('tr');
+      var cell = textElement('td', '暂无最新遥测。');
+      cell.colSpan = 4;
+      row.appendChild(cell);
+      nodes.metricsBody.appendChild(row);
+      return;
+    }
+
+    metrics.forEach(function (item) {
+      var row = document.createElement('tr');
+      row.appendChild(textElement('td', item.device_id));
+      row.appendChild(textElement('td', metricLabel(item.metric)));
+      row.appendChild(textElement('td', formatMetricValue(item.metric, item.value)));
+      row.appendChild(textElement('td', formatDateTime(item.ts)));
+      nodes.metricsBody.appendChild(row);
+    });
+  }
+
+  function renderCommands(commands) {
+    nodes.commandsBody.replaceChildren();
+    if (!commands.length) {
+      var row = document.createElement('tr');
+      var cell = textElement('td', '暂无命令记录。');
+      cell.colSpan = 4;
+      row.appendChild(cell);
+      nodes.commandsBody.appendChild(row);
+      return;
+    }
+
+    commands.forEach(function (command) {
+      var row = document.createElement('tr');
+      row.appendChild(textElement('td', formatDateTime(command.created_at)));
+      row.appendChild(textElement('td', command.device_id));
+      row.appendChild(textElement('td', command.command));
+      row.appendChild(textElement('td', command.status));
+      nodes.commandsBody.appendChild(row);
+    });
+  }
+
+  function readJson(url, signal) {
+    return fetch(url, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      cache: 'no-store',
+      signal: signal
+    }).then(function (response) {
+      if (!response.ok) {
+        throw new Error('HTTP ' + response.status + '：' + url);
+      }
+      return response.json();
+    });
+  }
+
+  function loadRfStates(base, devices, signal) {
+    var results = devices.map(function (device) {
+      var url = apiUrl(base, '/api/devices/' + encodeURIComponent(device.id) + '/rf-policy');
+      return readJson(url, signal).then(
+        function (state) { return { ok: true, state: state }; },
+        function (err) {
+          // Ordinary RF cache failures are optional, but an abort must not
+          // disappear here; timeout handling and request supersession depend
+          // on seeing the aborted request.
+          if (signal.aborted) {
+            throw err;
+          }
+          return { ok: false, state: null };
+        }
+      );
+    });
+
+    return Promise.all(results).then(function (entries) {
+      var rfByDevice = Object.create(null);
+      entries.forEach(function (entry) {
+        if (entry.ok && entry.state && entry.state.device_id) {
+          rfByDevice[entry.state.device_id] = entry.state;
+        }
+      });
+      return rfByDevice;
+    });
+  }
+
+  function finishRequest(controller) {
+    if (activeController === controller) {
+      clearTimeout(activeTimeoutId);
+      activeTimeoutId = null;
+      activeController = null;
+      nodes.refreshButton.disabled = false;
+    }
+  }
+
+  function loadData() {
+    if (activeController) {
+      activeController.abort();
+    }
+    if (activeTimeoutId !== null) {
+      clearTimeout(activeTimeoutId);
+      activeTimeoutId = null;
+    }
+
+    var controller = new AbortController();
+    activeController = controller;
+    activeTimeoutId = setTimeout(function () {
+      controller.abort();
+    }, REQUEST_TIMEOUT_MS);
+
+    nodes.refreshButton.disabled = true;
+    clearError();
+    setHealth('warn', '正在读取', '正在请求只读接口…');
+
+    var base;
+    try {
+      base = normalizeApiBase(nodes.apiBase.value || DEFAULT_API_BASE);
+    } catch (err) {
+      showError('API 地址格式不正确，请填写如 http://服务器IP:8000');
+      setHealth('bad', '地址无效', '未发起接口请求。');
+      finishRequest(controller);
+      return Promise.resolve();
+    }
+
+    var corePaths = [
+      '/api/health',
+      '/api/devices',
+      '/api/metrics/latest',
+      '/api/commands?limit=' + COMMAND_LIMIT
+    ];
+
+    return Promise.all(corePaths.map(function (path) {
+      return readJson(apiUrl(base, path), controller.signal);
+    })).then(function (results) {
+      var health = results[0];
+      var devices = results[1];
+      var metrics = results[2];
+      var commands = results[3];
+
+      if (!health || Array.isArray(health)) throw new Error('健康检查返回格式不正确');
+      if (!Array.isArray(devices)) throw new Error('设备列表返回格式不正确');
+      if (!Array.isArray(metrics)) throw new Error('遥测列表返回格式不正确');
+      if (!Array.isArray(commands)) throw new Error('命令历史返回格式不正确');
+
+      return loadRfStates(base, devices, controller.signal).then(function (rfByDevice) {
+        // A newer manual refresh may have superseded this request while RF
+        // state was being read. Do not let stale data overwrite the new view.
+        if (controller.signal.aborted || activeController !== controller) {
+          return;
+        }
+        nodes.deviceCount.textContent = '(' + devices.length + ')';
+        nodes.metricCount.textContent = '(' + metrics.length + ')';
+        nodes.commandCount.textContent = '(' + commands.length + ')';
+
+        renderDevices(devices, rfByDevice);
+        renderMetrics(metrics);
+        renderCommands(commands);
+
+        var apiHealthy = health.status === 'healthy';
+        var mqttConnected = health.mqtt_connected === true;
+        var healthy = apiHealthy && mqttConnected;
+        setHealth(
+          healthy ? 'ok' : 'warn',
+          apiHealthy ? (mqttConnected ? '连接正常' : 'MQTT 未连接') : '服务异常',
+          apiHealthy
+            ? (mqttConnected ? 'MQTT 已连接' : 'API 可访问，但消息链路异常')
+            : '后端健康检查未通过'
+        );
+        nodes.loadedAtText.textContent = '本次读取时间：' +
+          new Date().toLocaleString('zh-CN', { hour12: false });
+      });
+    }).catch(function (err) {
+      if (controller.signal.aborted && activeController === controller) {
+        showError('请求超时或已被取消（' + REQUEST_TIMEOUT_MS / 1000 + ' 秒）。');
+        setHealth('bad', '读取失败', '请求未完成。');
+      } else if (!controller.signal.aborted) {
+        showError(err && err.message ? err.message : String(err));
+        setHealth('bad', '读取失败', '请检查 API 地址、CORS、安全组或后端服务。');
+      }
+    }).then(function () {
+      finishRequest(controller);
+    });
+  }
+
+  nodes.apiBase.value = DEFAULT_API_BASE;
+  nodes.refreshButton.addEventListener('click', function () {
+    loadData();
+  });
+}());
+</script>
+</body>
+</html>
+
+
+

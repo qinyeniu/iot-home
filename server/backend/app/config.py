@@ -5,7 +5,7 @@
 
 import os
 from typing import Optional
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -95,9 +95,10 @@ class Settings(BaseSettings):
         """射频功率策略主题"""
         return f"{self.MQTT_TOPIC_PREFIX}/+/nodes/+/rf_policy"
     
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = ConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
 
 # 全局配置实例

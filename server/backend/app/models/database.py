@@ -6,7 +6,7 @@
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import Column, String, DateTime, Enum, BigInteger, Float, Integer, JSON, ForeignKey, Index
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
 
 Base = declarative_base()

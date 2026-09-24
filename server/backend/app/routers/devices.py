@@ -25,7 +25,7 @@ from app.services.rf_policy import (
     new_request_id,
     rf_policy_states,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal
 
 router = APIRouter(prefix="/api", tags=["设备管理"])
@@ -43,8 +43,7 @@ class DeviceResponse(BaseModel):
     # 动态能力，如 {"sensors": ["temperature", ...], "switch": true}
     capabilities: dict[str, Any] = {"sensors": [], "switch": False}
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MetricResponse(BaseModel):

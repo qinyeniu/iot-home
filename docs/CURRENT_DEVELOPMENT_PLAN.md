@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 03:47（Asia/Shanghai；网关 backoff 版本已烧录，8 小时复测进行中）
+更新时间：2026-09-25 04:15（Asia/Shanghai；网关 backoff 版本已烧录，8 小时复测进行中）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -65,6 +65,12 @@
    - 相同 `mode/mpwr` 已存在时跳过 `nvs_set/nvs_commit`；
    - 缺键、读取错误或值变化时保守写入；
    - 离线构建与复审通过，**尚未烧录**。
+
+6. **On/Off 陈旧目标保护**
+   - RF QUERY/SET/AUTO 只校验 active child；
+   - on/off/toggle 额外要求 180 秒内有 join/announce 或有效 ZCL report；
+   - 不写 NVS、不改 active 状态；离线构建通过，**尚未烧录**；
+   - MQTT negative ACK 和能力校验仍待前后端联动设计。
 
 ## 2. 当前主要风险
 

@@ -2112,7 +2112,7 @@ typedef struct {
     uint8_t  onoff_valid;   // On/Off state has been received
     uint8_t  onoff_value;   // latest On/Off state (0=off, 1=on)
     uint32_t first_dirty_ms;
-    uint32_t last_report_ms;
+    uint32_t last_seen_ms;   // last join/announce or valid ZCL report
 } zb_node_t;
 
 static zb_node_t s_zb_nodes[MAX_ZB_NODES];
@@ -2134,6 +2134,55 @@ static bool rf_power_known_active_child(uint16_t addr)
     }
     portEXIT_CRITICAL(&s_zb_lock);
     return found;
+}
+
+#define ZB_ONOFF_COMMAND_FRESH_MS 180000
+
+// Standard On/Off commands actuate a physical endpoint. A child can disappear
+// without a Zigbee leave indication, so active alone is not enough in that
+// path. The current mains node reports every 10 s and the experimental SED
+// reports every 60 s; 180 s tolerates three SED periods. This interim value
+// will become per-node capability configuration once multi-node provisioning
+// is implemented.
+static bool gateway_onoff_target_ready(uint16_t addr)
+{
+    bool found = false;
+    uint32_t last_seen_ms = 0;
+
+    portENTER_CRITICAL(&s_zb_lock);
+    for (uint8_t i = 0; i < MAX_ZB_NODES; ++i) {
+        if (s_zb_nodes[i].addr == addr && s_zb_nodes[i].active) {
+            found = true;
+            last_seen_ms = s_zb_nodes[i].last_seen_ms;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_zb_lock);
+
+    if (!found) {
+        ESP_LOGW(TAG, "CMD: node=0x%04x on/off skipped: not an active child",
+                 (unsigned)addr);
+        return false;
+    }
+
+    if (last_seen_ms == 0U) {
+        ESP_LOGW(TAG,
+                 "CMD: node=0x%04x on/off skipped: no liveness timestamp",
+                 (unsigned)addr);
+        return false;
+    }
+
+    uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+    uint32_t age_ms = now_ms - last_seen_ms;
+    if (age_ms > ZB_ONOFF_COMMAND_FRESH_MS) {
+        ESP_LOGW(TAG,
+                 "CMD: node=0x%04x on/off skipped: stale for %lu ms",
+                 (unsigned)addr,
+                 (unsigned long)age_ms);
+        return false;
+    }
+
+    return true;
 }
 
 static zb_node_t *zb_node_get_or_create(uint16_t addr)
@@ -2653,6 +2702,17 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
     uint8_t cmd_id = 0xFF;
     if (cJSON_IsString(command)) {
         const char *command_name = command->valuestring;
+        bool is_rf_command =
+            strcmp(command_name, "rf_query_power") == 0 ||
+            strcmp(command_name, "rf_set_auto") == 0 ||
+            strcmp(command_name, "rf_set_power") == 0 ||
+            strcmp(command_name, "rf_manual_power") == 0;
+        if (is_rf_command && !rf_power_known_active_child(short_addr)) {
+            ESP_LOGW(TAG, "CMD rf: node=0x%04x skipped: not an active child",
+                     (unsigned)short_addr);
+            cJSON_Delete(root);
+            return;
+        }
         if (strcmp(command_name, "rf_query_power") == 0) {
             ESP_LOGI(TAG, "CMD rf: node=0x%04x query", (unsigned)short_addr);
             rf_power_remote_query(request_id);
@@ -2689,6 +2749,10 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
     }
     if (cmd_id == 0xFF) {
         ESP_LOGW(TAG, "CMD: unsupported command for node 0x%04x", short_addr);
+        cJSON_Delete(root);
+        return;
+    }
+    if (!gateway_onoff_target_ready(short_addr)) {
         cJSON_Delete(root);
         return;
     }
@@ -3198,6 +3262,7 @@ static void zb_handle_join_event(const zb_app_event_t *event)
     zb_node_t *node;
     zb_node_t status_snap = {0};
     bool is_new_child = false;
+    uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
 
     portENTER_CRITICAL(&s_zb_lock);
     node = zb_node_get_or_create(event->addr);
@@ -3208,6 +3273,7 @@ static void zb_handle_join_event(const zb_app_event_t *event)
             s_zigbee_devices++;
         }
         memcpy(node->ieee, event->ieee, sizeof(node->ieee));
+        node->last_seen_ms = now_ms;
         status_snap = *node;
     }
     portEXIT_CRITICAL(&s_zb_lock);
@@ -3331,7 +3397,7 @@ static void zb_handle_report_event(const zb_app_event_t *event)
         if (first_dirty) {
             node->first_dirty_ms = now_ms;
         }
-        node->last_report_ms = now_ms;
+        node->last_seen_ms = now_ms;
     }
     portEXIT_CRITICAL(&s_zb_lock);
 

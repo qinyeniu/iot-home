@@ -1,7 +1,7 @@
 # 固件全链路说明：节点、网关、MQTT 与后端
 
 更新时间：2026-09-25 03:50
-状态：COM6 已运行 RF 发送失败后退避版本；仓库中的 RF policy Flash 去重版本仅离线编译，尚未烧录
+状态：COM6 已运行 RF 发送失败后退避版本；仓库中的 RF policy Flash 去重与 On/Off 陈旧目标保护均仅离线编译，尚未烧录
 适用工程：
 
 - 网关：`firmware/gateway/`
@@ -526,6 +526,17 @@ ZB_ESP_MAC: No buffer, handle it
 
 首次创建 `rfpol` namespace 时仍会产生初始化写入，这是 NVS 的正常行为。
 
+### 6.6 On/Off 陈旧目标保护（仓库已有，尚未烧录）
+
+网关在节点表中用 `last_seen_ms` 记录最近一次 join/announce 或有效 ZCL report：
+
+- RF QUERY/SET/AUTO 只要求 topic 中的短地址是 active child；
+- 标准 on/off/toggle 还要求该节点 180 秒内存活；
+- 节点拔出且没有 leave 时，超过 180 秒的开关命令会在串口记录 warning 并停止下发；
+- 该保护不写 NVS，也不会把节点 active 状态直接改成 offline。
+
+新版本 bin SHA256 为 `A4B5B26403098E3A16A0FCEF3A43F7DF382519B5685A83AAE64C94BDCBB75291`，尚未烧录。当前跳过命令还没有 MQTT negative ACK，后续需要与前后端命令状态模型一起设计。
+
 ## 7. 后端如何接全链路
 
 后端 MQTT 服务订阅：
@@ -567,8 +578,8 @@ iot-home/{gateway_id}/nodes/{node_id}/cmd
 3. **节点身份稳定性**
    短地址可能变化，不能作为长期产品 ID。建议以 IEEE address/安装阶段生成的稳定 node ID 做映射，短地址只作为当前路由地址。
 
-4. **命令目标校验**
-   on/off 命令路径当前主要按 topic 中的短地址转发，应在发送前校验该短地址属于 active child，并确认其具备 OnOff 能力，避免向不存在或非执行器地址发命令。
+4. **命令目标校验仍需硬件确认**
+   仓库已离线加入 active child 校验和 On/Off 180 秒存活保护，但尚未烧录；后续仍需确认节点具备 OnOff 能力，并设计 MQTT negative ACK/命令状态，避免向不存在、非执行器或陈旧地址发命令。
 
 5. **PAN ID 事实核对**
    代码请求值和当前计划记录的实测值不一致。硬件在线时先读取真实网络参数，再更新文档或调整代码。
@@ -600,8 +611,8 @@ iot-home/{gateway_id}/nodes/{node_id}/cmd
 
 ## 9. 本次没有做的事
 
-- 未修改固件运行逻辑；
-- 现网短序列和拔节点测试已完成；8 小时长测继续留证，但 2 小时节点已因 RF 下行持续失败判定 FAIL；
+- COM6 当前固件运行逻辑未随本次离线保护改变；
+- 现网短序列和拔节点测试已完成；烧录后 8 小时长测继续留证，烧录前 2 小时节点的 RF 下行持续失败属于历史 FAIL；
 - 电池实验工程与新 NVS 接口未烧录/未接入运行时；
 - 未修改网卡、热点、安全组或云服务器；
 - 未读取、打印或记录真实密码文件；

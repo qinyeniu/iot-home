@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -85,6 +86,29 @@ esp_err_t iot_product_config_save_mqtt(const iot_mqtt_config_t *config);
 /** Erase stored MQTT keys; missing keys are not an error. */
 esp_err_t iot_product_config_clear_mqtt(void);
 
+/**
+ * @brief Save one complete Wi-Fi + MQTT bundle through A/B NVS slots.
+ *
+ * The inactive slot is fully written and committed before the durable marker
+ * switches to it; the previously active slot remains available for rollback
+ * on write failure or power loss during data-slot programming. This API is
+ * separate from the legacy string keys and does not change current runtime
+ * behavior until the application explicitly loads the bundle.
+ */
+esp_err_t iot_product_config_save_bundle(const iot_wifi_config_t *wifi,
+                                         const iot_mqtt_config_t *mqtt);
+
+/**
+ * @brief Load the complete bundle selected by the durable commit marker.
+ *
+ * Returns ESP_ERR_NOT_FOUND if no valid bundle exists, or ESP_ERR_INVALID_STATE
+ * if the marker/data CRC/schema validation fails.
+ */
+esp_err_t iot_product_config_load_bundle(iot_wifi_config_t *wifi,
+                                         iot_mqtt_config_t *mqtt);
+
+/** Erase both A/B bundle data slots and the durable commit marker. */
+esp_err_t iot_product_config_clear_bundle(void);
 #ifdef __cplusplus
 }
 #endif

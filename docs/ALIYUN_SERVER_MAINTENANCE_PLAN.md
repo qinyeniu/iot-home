@@ -67,6 +67,7 @@
 
 目标：先解决匿名和越权发布，不改变传输地址和端口。
 
+详细可执行命令、验收和回退步骤见 `docs/ALIYUN_MQTT_ACL_DEPLOYMENT_RUNBOOK.md`。
 推荐顺序：
 
 1. 备份 Mosquitto、Docker Compose 和后端环境配置；

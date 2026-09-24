@@ -3407,6 +3407,7 @@ static void zb_forward_pending(void)
     }
 }
 
+#if !ZB_ONLY_RF_DIAG && ZB_JOIN_BEFORE_WIFI
 static bool zb_have_full_active_sample(void)
 {
     bool ready = false;
@@ -3423,6 +3424,7 @@ static bool zb_have_full_active_sample(void)
     portEXIT_CRITICAL(&s_zb_lock);
     return ready;
 }
+#endif
 
 static void zb_handle_app_event(const zb_app_event_t *event)
 {

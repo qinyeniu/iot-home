@@ -1,40 +1,43 @@
 # 工作区未跟踪文件盘点清单
 
-- 生成时间：2026-09-24T08:47:39+08:00
+- 生成时间：2026-09-24T09:35:43+08:00
 - 项目根目录：`C:\Users\HJB\Documents\iot-home`
-- 未跟踪文件：646 个
-- 合计大小：572.85 MB
-- 本清单只做分析，未删除、未移动、未修改任何文件。
+- 可读取的未跟踪文件：644 个
+- 合计大小：572.84 MiB
+- 无法读取：0 个
+- 异常路径：0 个
+- 除本输出文件及必要父目录外，未删除、未移动、未修改其他文件。
 
 ## 分类汇总
 
-| 分类 | 文件数 | 大小 MB | 建议 |
-|---|---:|---:|---|
-| 串口实测日志 (`serial_logs`) | 37 | 457.24 | 保留关键短日志和异常节点日志；重复/巨型日志建议压缩归档，不直接删。 |
-| 460800 目录中的构建产物 (`build_output_baud_460800`) | 461 | 63.12 | 确认无唯一证据后可清理，并补充忽略规则。 |
-| 固件二进制/ELF 备份 (`firmware_backups`) | 23 | 51.94 | 保留关键 SHA 对应版本；确认 Git/备份盘已有副本后再归档，不建议直接删除。 |
-| 源码快照 (`source_snapshots`) | 2 | 0.18 | 仅在确认 Git 历史包含对应版本后归档。 |
-| 临时补丁脚本 (`temporary_scripts`) | 61 | 0.12 | 先在清单中标注无用项；经用户确认后分批归档/删除。 |
-| 其他固件文件 (`firmware_misc`) | 14 | 0.06 | 需要确认是否属于当前工程或实验工程。 |
-| 临时备份目录 (`temporary_backup_dirs`) | 1 | 0.03 | 需要用户确认；优先归档而不是直接删除。 |
-| 未跟踪的工具源码 (`tool_source`) | 11 | 0.02 | 逐个确认功能；仍在使用的工具应显式纳入 Git。 |
-| 补丁文件备份 (`patch_artifacts`) | 2 | 0.02 | 已合入的补丁可归档；清理前与最终代码抽查比对。 |
-| 候选规划文档 (`planning_docs`) | 4 | 0.02 | 审查内容是否重复；有长期价值的改名并在 HANDOFF 索引。 |
-| node_combined 实验工程 (`experimental_node_combined`) | 7 | 0.02 | 先判断是否为当前组合节点路线；需要用户确认后再收敛或归档。 |
-| node_sensor 实验工程 (`experimental_node_sensor`) | 7 | 0.02 | 电池传感器路线可能复用；先保留并在低功耗阶段复核。 |
-| node_switch 实验工程 (`experimental_node_switch`) | 6 | 0.02 | 小工程，待确认是否仍有参考价值。 |
-| 工具输出笔记 (`tool_notes`) | 1 | 0.02 | 若交接文档已记录结论，可归档。 |
-| 夜间阶段性分析产物 (`partial_reports`) | 4 | 0.01 | 若交接文档已吸收结论，可归档；否则先保留。 |
-| 工具命令样例 (`tool_payloads`) | 4 | 0.00 | 若仍用于硬件测试可移动到 fixtures；否则归档。 |
-| 工具图片/静态素材 (`tool_assets`) | 1 | 0.00 | 被文档或工具引用则保留，否则归档。 |
+| 分类 | 可读取文件数 | 大小 MiB | 无法读取 | 建议 |
+|---|---:|---:|---:|---|
+| 串口实测日志 (`serial_logs`) | 37 | 457.24 | 0 | 保留关键短日志和异常节点日志；重复/巨型日志建议压缩归档，不直接删。 |
+| 460800 目录中的构建产物 (`build_output_baud_460800`) | 461 | 63.12 | 0 | 确认无唯一证据后可清理，并补充忽略规则。 |
+| 固件二进制/ELF 备份 (`firmware_backups`) | 23 | 51.94 | 0 | 保留关键 SHA 对应版本；确认 Git/备份盘已有副本后再归档，不建议直接删除。 |
+| 源码快照 (`source_snapshots`) | 2 | 0.18 | 0 | 仅在确认 Git 历史包含对应版本后归档。 |
+| 临时补丁脚本 (`temporary_scripts`) | 61 | 0.12 | 0 | 先在清单中标注无用项；经用户确认后分批归档/删除。 |
+| 其他固件文件 (`firmware_misc`) | 14 | 0.06 | 0 | 需要确认是否属于当前工程或实验工程。 |
+| 临时备份文件/目录 (`temporary_backup_dirs`) | 1 | 0.03 | 0 | 需要用户确认；优先归档而不是直接删除。 |
+| 补丁文件备份 (`patch_artifacts`) | 2 | 0.02 | 0 | 已合入的补丁可归档；清理前与最终代码抽查比对。 |
+| 候选规划文档 (`planning_docs`) | 4 | 0.02 | 0 | 审查内容是否重复；有长期价值的改名并在 HANDOFF 索引。 |
+| node_combined 实验工程 (`experimental_node_combined`) | 7 | 0.02 | 0 | 先判断是否为当前组合节点路线；需要用户确认后再收敛或归档。 |
+| node_sensor 实验工程 (`experimental_node_sensor`) | 7 | 0.02 | 0 | 电池传感器路线可能复用；先保留并在低功耗阶段复核。 |
+| node_switch 实验工程 (`experimental_node_switch`) | 6 | 0.02 | 0 | 小工程，待确认是否仍有参考价值。 |
+| 工具输出笔记 (`tool_notes`) | 1 | 0.02 | 0 | 若交接文档已记录结论，可归档。 |
+| 夜间阶段性分析产物 (`partial_reports`) | 4 | 0.01 | 0 | 若交接文档已吸收结论，可归档；否则先保留。 |
+| 未跟踪的工具源码 (`tool_source`) | 7 | 0.01 | 0 | 逐个确认功能；仍在使用的工具应显式纳入 Git。 |
+| 其他未分类 (`other`) | 2 | 0.01 | 0 | 需要人工查看，不自动处理。 |
+| 工具命令样例 (`tool_payloads`) | 4 | 0.00 | 0 | 若仍用于硬件测试可移动到 fixtures；否则归档。 |
+| 工具图片/静态素材 (`tool_assets`) | 1 | 0.00 | 0 | 被文档或工具引用则保留，否则归档。 |
 
 ## 扩展名汇总（前 20 项）
 
-| 扩展名 | 文件数 | 大小 MB |
+| 扩展名 | 文件数 | 大小 MiB |
 |---|---:|---:|
 | `.obj` | 227 | 24.78 |
 | `.cmake` | 132 | 0.32 |
-| `.py` | 71 | 0.16 |
+| `.py` | 69 | 0.15 |
 | `.txt` | 55 | 457.48 |
 | `[no extension]` | 26 | 0.29 |
 | `.a` | 26 | 22.94 |
@@ -55,7 +58,7 @@
 
 ## 最大的 25 个未跟踪文件
 
-| 大小 MB | 分类 | 路径 |
+| 大小 MiB | 分类 | 路径 |
 |---:|---|---|
 | 456.09 | `serial_logs` | `firmware/gateway/log.overnight-gw-20260923-034906.txt` |
 | 11.30 | `firmware_backups` | `backups/firmware/2026-09-23-lock-health-hardening/iot-home-gateway.elf` |
@@ -69,19 +72,19 @@
 | 2.32 | `build_output_baud_460800` | `firmware/node_zigbee/460800/config/kconfig_menus.json` |
 | 1.43 | `build_output_baud_460800` | `firmware/node_zigbee/460800/esp-idf/esp_driver_mcpwm/libesp_driver_mcpwm.a` |
 | 1.37 | `firmware_backups` | `backups/firmware/2026-09-23-lock-health-hardening/iot-home-gateway.bin` |
-| 1.37 | `firmware_backups` | `backups/firmware/2026-09-23-pre-assert-debug/iot-home-gateway.bin` |
 | 1.37 | `firmware_backups` | `backups/firmware/2026-09-23-strict-rf-transaction/iot-home-gateway.bin` |
+| 1.37 | `firmware_backups` | `backups/firmware/2026-09-23-pre-assert-debug/iot-home-gateway.bin` |
 | 1.37 | `firmware_backups` | `backups/firmware/2026-09-23-runtime-rf-policy/iot-home-gateway.bin` |
 | 1.36 | `firmware_backups` | `backups/firmware/2026-09-23-configurable-atpc-bounds/iot-home-gateway.bin` |
 | 1.36 | `firmware_backups` | `backups/firmware/2026-09-23-failure-driven-atpc/iot-home-gateway.bin` |
-| 1.35 | `firmware_backups` | `backups/firmware/2026-09-22-low-tx-power/iot-home-gateway.bin` |
 | 1.35 | `firmware_backups` | `backups/firmware/2026-09-22-pre-rf-cli/iot-home-gateway.bin` |
+| 1.35 | `firmware_backups` | `backups/firmware/2026-09-22-low-tx-power/iot-home-gateway.bin` |
 | 1.15 | `build_output_baud_460800` | `firmware/node_zigbee/460800/esp-idf/esp_driver_i2s/libesp_driver_i2s.a` |
 | 1.03 | `build_output_baud_460800` | `firmware/node_zigbee/460800/esp-idf/esp_driver_spi/libesp_driver_spi.a` |
 | 0.86 | `firmware_backups` | `backups/firmware/2026-09-23-lock-health-hardening/iot-home-zigbee-node.bin` |
-| 0.86 | `firmware_backups` | `backups/firmware/2026-09-23-pre-assert-debug/iot-home-zigbee-node.bin` |
-| 0.86 | `firmware_backups` | `backups/firmware/2026-09-23-runtime-rf-policy/iot-home-zigbee-node.bin` |
 | 0.86 | `firmware_backups` | `backups/firmware/2026-09-23-strict-rf-transaction/iot-home-zigbee-node.bin` |
+| 0.86 | `firmware_backups` | `backups/firmware/2026-09-23-runtime-rf-policy/iot-home-zigbee-node.bin` |
+| 0.86 | `firmware_backups` | `backups/firmware/2026-09-23-pre-assert-debug/iot-home-zigbee-node.bin` |
 
 ## 建议的安全整理顺序
 

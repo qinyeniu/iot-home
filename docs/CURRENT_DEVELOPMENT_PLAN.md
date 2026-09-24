@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 06:30（Asia/Shanghai；恢复后 1 小时 DEGRADED，新事务防护离线就绪）
+更新时间：2026-09-25 06:42（Asia/Shanghai；generation guard 已烧录，短序列 PASS）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 06:30 状态：恢复后 1 小时覆盖 3627.6 秒，业务连续且无重启/黑障；节点出现 1 次 APS fail，故判 DEGRADED。最终 QUERY 为 `auto/-10 dBm`。
+> 06:42 状态：COM6 已运行 generation guard；QUERY → SET 0 → SET -10 → AUTO 与 fresh QUERY 全部通过，最终为 `auto/-10 dBm`。4–8 小时长测和新固件物理拔节点仍待复测。
 
 ### 1.1 已经验证的主链路
 
@@ -27,7 +27,8 @@
 3. **RF 功率策略**
    - 00:36 旧短序列中 AUTO 当次确认超时，fresh QUERY 确认真实状态为 `auto/-10 dBm`；
    - 03:33 已只烧录 RF 发送失败后退避网关，03:36 新短序列 QUERY → SET 0 → SET -10 → AUTO 全部匹配确认；
-   - 当前设备短序列最终状态为 `auto/-10 dBm`，长时间稳定性仍待 8 小时复测；
+   - 06:38 已只烧录 generation guard 网关应用区；06:40 短序列 QUERY → SET 0 → SET -10 → AUTO 全部匹配确认，fresh QUERY 同样为 `auto/-10 dBm`；
+   - 新固件 4–8 小时长测仍待执行；
    - 后端 RF policy REST API 和 Grafana 功率/模式面板已完成，但公网后端仍未部署这部分 API。
 
 4. **事务一致性**
@@ -73,7 +74,7 @@
    - 周期节流检查、占用和策略版本快照在同一把 RF 状态锁内完成；
    - 用户 QUERY/SET/AUTO 会更新 policy generation；
    - 周期快照若在预留 Zigbee 序号前被用户命令 overtaken，会跳过旧发送，不再占用第二个有效序号；
-   - 网关 bin `0x15f540`，SHA256 `D748CE3C635F9E2A7AFCD05BB9FCF4047AE3DCC6A200FCD2059C037D1320DFBB`，复审 **Approve**，尚未烧录。
+   - 网关 bin `0x15f540`，SHA256 `D748CE3C635F9E2A7AFCD05BB9FCF4047AE3DCC6A200FCD2059C037D1320DFBB`，复审 **Approve**；06:38 已只烧录网关应用区，短序列 **PASS**。
 
 7. **节点诊断 NVS 低磨损保存**
    - `rfctl/txp2` 已保存相同值时跳过 Flash 写入；
@@ -121,7 +122,7 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 
 ### P1：RF 发送仍应收敛到单命令队列
 
-当前 generation guard 已关闭“周期任务锁外节流”和“预留序号前被插队”的竞态；复审仍指出一个更窄窗口：周期任务预留序号后、实际调用 ZBOSS API 前，如果远程命令插入，旧周期请求仍可能被提交。该问题不阻塞当前离线补丁，但后续应将所有 RF 私有命令收敛为单一队列：远程/周期任务只提交意图，一个消费者负责预留序号、发送和安装等待事务。
+当前 generation guard 已在 COM6 运行，06:40 短序列中未见重复帧或旧事务重放。复审仍指出一个更窄窗口：周期任务预留序号后、实际调用 ZBOSS API 前，如果远程命令插入，旧周期请求仍可能被提交。因此后续仍需将所有 RF 私有命令收敛为单一队列：远程/周期任务只提交意图，一个消费者负责预留序号、发送和安装等待事务。
 
 ### P1：仓库工作区较乱
 
@@ -129,15 +130,14 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 
 ## 3. 下一阶段建议顺序
 
-### 阶段 A：完成烧录后 8 小时复测（当前最高优先级）
+### 阶段 A：新 generation guard 长测（当前最高优先级）
 
-1. 当前 COM6 运行提交 `f7231ae` 的网关应用，bin SHA256 `E5B9BFC2B353F58BE0E6BACE743B782DE331250DB89E458808F10EDD639BD14F`；
-2. 03:38 双串口只读长测进行中：网关 PID `19432`、节点 PID `24896`；
-3. 检查点 PID `23268` 将在 04:38、05:38、07:38、09:38、11:38 生成报告；
-4. 长测期间不烧录、不重启、不切换网卡、不部署云服务器；
-5. 若新长测再次出现连续 RF 下发失败，继续定位 ZBOSS APS 资源路径，不直接升级协议栈；
-6. 若 8 小时通过，再把 RF policy Flash 去重版本安排为下一次应用区维护更新。
-
+1. COM6 当前运行提交 `67f7df6` 的网关应用，bin SHA256 `D748CE3C635F9E2A7AFCD05BB9FCF4047AE3DCC6A200FCD2059C037D1320DFBB`；
+2. 06:40 已完成短序列和 fresh QUERY，结论 **PASS**；
+3. 下一步启动 4–8 小时双串口只读观察，期间不烧录、不重启、不切换网卡、不部署云服务器；
+4. 白天请用户物理拔掉一次 COM5，确认新网关固件不会重启；
+5. 若长测再次出现连续 RF 下发失败，继续定位 ZBOSS APS 资源路径，不直接升级协议栈；
+6. 节点 NVS 低磨损固件暂不烧录，等待下一次明确维护窗口。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；

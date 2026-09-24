@@ -59,6 +59,7 @@
 4. **SoftAP 配网资产**
    - 静态页面：`docs/provisioning/softap-prototype.html`；
    - 接口契约：`docs/SOFTAP_PROVISIONING_API_CONTRACT.md`；
+   - 页面 gzip 后约 5.7 KB；网关应用分区剩余约 67 KB，只能按最小 HTTP/SoftAP 分阶段接入；
    - 当前尚未接入固件。
 
 5. **RF policy Flash 去重**

@@ -1,6 +1,6 @@
 # SoftAP 本地配网接口契约
 
-更新时间：2026-09-24  
+更新时间：2026-09-25  
 状态：接口契约与静态原型；**尚未接入网关固件**  
 对应页面：`docs/provisioning/softap-prototype.html`
 
@@ -262,14 +262,24 @@ IPv6 地址、CA 证书和每设备证书不在第一版范围内。
 
 ## 9. 固件实施顺序
 
-1. 在独立分支或独立组件中实现 HTTP 路由和 JSON 解析；
-2. 先实现输入校验与 `/status`，不写 NVS；
-3. 实现 `/test` 的 Wi‑Fi 临时连接；
-4. 再加入 MQTT 连接测试；
-5. 确定单一 bundle blob 或 staging marker 事务方案，不能直接串联两次独立 NVS commit，也不能依赖普通 `nvs_commit()` 做多键回滚；
-6. 最后实现 `/commit` 调用具备恢复语义的持久化接口；
-7. 硬件在线时验证失败路径、测试通过路径、重启后读取 NVS；
-8. 通过后再决定是否加入 SoftAP 超时、本地 PIN 和恢复出厂入口。
+### 9.1 当前空间评估
+
+本地静态页面大小：
+
+- 未压缩：19,410 字节；
+- gzip：5,758 字节。
+
+当前离线网关二进制（已含 RF policy Flash 去重、On/Off 陈旧保护和 A/B bundle 启动路径）应用分区剩余约 `0x10c90` 字节（约 67 KB）。因此只能实施最小 HTTP/SoftAP，不能把复杂页面、扫描动画、完整校验和多状态机一次性加入；每次接入后必须重新检查应用分区余量。
+
+### 9.2 分阶段实施
+
+1. S1：在独立组件中实现最小 HTTP 路由、输入校验、`/status` 和 `/cancel`，并嵌入 gzip 页面；不写 NVS，不切换 STA；
+2. S2：实现 `/test` 的 Wi‑Fi 临时连接和失败回退，不保存密码；
+3. S3：加入 MQTT 连接测试；TLS 未配置时继续返回 `TLS_NOT_CONFIGURED`；
+4. S4：确认 A/B bundle 已通过 save/load/restart、异常 marker 和掉电测试；
+5. S5：最后实现 `/commit` 调用 `iot_product_config_save_bundle()`；
+6. S6：硬件在线时验证失败路径、测试通过路径、重启后读取 NVS；
+7. 通过后再决定是否加入 SoftAP 超时、本地 PIN 和恢复出厂入口。
 
 不得在静态原型验收前直接替换网关主状态机，也不得在未确认组件版本和构建 SHA 时烧录固件。
 

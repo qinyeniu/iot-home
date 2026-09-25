@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 13:36（Asia/Shanghai；凭据/Flash/电池低功耗离线推进，等待硬件短测窗口）
+更新时间：2026-09-25 13:41（Asia/Shanghai；CQ-2a 复审通过，准备 CQ-2b 离线开发）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 13:08 状态：凭据输入、MQTT URI 格式和 Flash 写入节流策略已离线完成；凭据阶段复审 Approve，spool policy 复审 Approve。07:25 长测仍为 DEGRADED，CQ-2a 硬件短测前仍需重新复审。
+> 13:41 状态：凭据输入、MQTT URI 格式和 Flash 写入节流策略已离线完成；CQ-2a 已取得独立复审 Approve，可进入 CQ-2b；07:25 长测仍为 DEGRADED。
 
 ### 1.1 已经验证的主链路
 
@@ -164,7 +164,7 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 
 当前 generation guard 已在 COM6 运行，06:40 短序列未见重复帧或旧事务重放；正常物理拔节点也已通过。CQ-2a 已让实验 ON 路径中的用户命令通过队列消费者派发，但消费者暂时复用旧函数，周期/自动路径也尚未入队。后续仍需将远程、周期、自动任务接入同一消费者，由它负责预留序号、发送和安装等待事务。
 
-CQ-2a 尚未取得有效独立 Approve；硬件烧录实验 ON 固件前必须重新复审。
+CQ-2a 已取得有效独立 Approve；CQ-2b 可离线开发，但 CQ-2b 固件烧录前仍需重新复审。
 
 ### P1：仓库工作区较乱
 
@@ -182,14 +182,14 @@ CQ-2a 尚未取得有效独立 Approve；硬件烧录实验 ON 固件前必须�
 6. 后续硬件窗口重点观察失败前后 ZBOSS signal、APS repair、rejoin 与周期 QUERY 的关系；
 7. 节点 NVS 低磨损固件暂不烧录，等待明确维护窗口。
 
-### 阶段 A2：CQ-2a 已离线完成，下一步等待硬件短测
+### 阶段 A2：CQ-2a 复审通过，下一步开发 CQ-2b
 
 1. CQ-2a 已让实验 ON 路径中的用户 QUERY/SET/AUTO 先入队，再由 `rf-dispatch` 消费者派发；
 2. 默认 OFF 现网路径不变；默认 bin `0x15f540`；
 3. CQ-2b 再让消费者直接承担序号预留、Zigbee 发送和等待事务安装；
 4. CQ-3 最后将周期/自动命令改为入队并停止旧直接发送路径；
 5. 硬件短测按 `docs/RF_CQ_SHORT_TEST_RUNBOOK.md` 执行，判读使用 `tools/analyze_rf_cq_short_test.py`；
-6. CQ-2a 未取得独立 Approve；硬件烧录或进入 CQ-2b 前必须重新复审；
+6. CQ-2a 已取得独立 Approve；CQ-2b 代码完成并复审后，才能硬件烧录；
 7. 每一步单独构建、主机测试、提交；不得与 SoftAP/NVS A/B 运行时接入混做。
 
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）

@@ -72,6 +72,71 @@ static void set_send_set(rf_dispatch_plan_t *plan, uint16_t node_addr,
     plan->expected_report_mode = mode;
 }
 
+bool rf_dispatch_after_report_create(
+    const rf_dispatch_after_report_state_t *state,
+    rf_dispatch_after_report_result_t *result)
+{
+    bool target_supported;
+    bool reported_supported;
+    bool satisfied;
+    bool authoritative;
+
+    if (state == NULL || result == NULL) {
+        return false;
+    }
+
+    *result = RF_DISPATCH_AFTER_REPORT_NONE;
+
+    if (state->intent_command != RF_DISPATCH_COMMAND_QUERY &&
+        state->intent_command != RF_DISPATCH_COMMAND_SET) {
+        return true;
+    }
+    if (state->desired_mode != RF_DISPATCH_MODE_AUTO &&
+        state->desired_mode != RF_DISPATCH_MODE_MANUAL) {
+        return true;
+    }
+
+    target_supported = supported_power(state->target_power_dbm);
+    reported_supported = supported_power(state->reported_power_dbm);
+    if (!target_supported || !reported_supported) {
+        return true;
+    }
+
+    if (state->intent_command == RF_DISPATCH_COMMAND_QUERY) {
+        if (state->matched_transaction) {
+            *result = RF_DISPATCH_AFTER_REPORT_COMPLETE;
+        }
+        return true;
+    }
+
+    if (!state->policy_apply_pending) {
+        return true;
+    }
+
+    satisfied =
+        (state->desired_mode == RF_DISPATCH_MODE_MANUAL &&
+         state->reported_mode == RF_DISPATCH_MODE_MANUAL &&
+         state->reported_power_dbm == state->target_power_dbm) ||
+        (state->desired_mode == RF_DISPATCH_MODE_AUTO &&
+         state->reported_mode == RF_DISPATCH_MODE_AUTO);
+    authoritative =
+        state->matched_transaction || state->node_initiated_report;
+
+    // A stale private reply from an overtaken command is neither completion
+    // evidence nor a reason to retry the current transaction.
+    if (!authoritative) {
+        return true;
+    }
+    if (satisfied) {
+        *result = RF_DISPATCH_AFTER_REPORT_COMPLETE;
+    } else if (state->matched_transaction) {
+        // Only the current gateway transaction can directly request another
+        // attempt. An unrelated node report does not drive an immediate retry.
+        *result = RF_DISPATCH_AFTER_REPORT_RETRY;
+    }
+    return true;
+}
+
 bool rf_dispatch_plan_create(const rf_dispatch_cmd_t *cmd,
                              const rf_dispatch_plan_state_t *state,
                              rf_dispatch_plan_t *plan)

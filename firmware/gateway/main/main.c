@@ -32,6 +32,7 @@
 #include "esp_timer.h"
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
 #include "rf_command_queue.h"
+#include "rf_dispatch_plan.h"
 #endif
 
 #include "esp_sleep.h"
@@ -456,6 +457,16 @@ static vprintf_like_t s_original_log_vprintf;
 static uint8_t s_rf_mode;
 static int8_t s_rf_manual_power_dbm;
 static bool s_rf_policy_apply_pending;
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+static bool s_rf_report_submitting;
+static rf_dispatch_cmd_t s_rf_user_intent;
+static bool s_rf_user_intent_pending;
+static bool s_rf_user_intent_queued;
+static bool s_rf_dispatch_active;
+static uint32_t s_rf_user_intent_generation;
+static uint32_t s_rf_user_intent_started_ms;
+static uint32_t s_rf_user_intent_retry_after_ms;
+#endif
 static char s_rf_expected_request_id[17];
 static bool s_rf_expected_user_transaction;
 static bool s_rf_policy_user_transaction;
@@ -465,6 +476,11 @@ static portMUX_TYPE s_rf_power_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool rf_power_known_active_child(uint16_t addr);
 static bool rf_power_is_table_value(int8_t power_dbm);
 static bool rf_power_request_id_valid(const char *request_id);
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+static void rf_power_reconcile_pending_intent(void);
+static void rf_power_handle_accepted_report_locked(uint32_t now,
+    bool matched_transaction);
+#endif
 
 static bool rf_power_is_monitored_cluster(uint16_t cluster_id)
 {
@@ -649,6 +665,16 @@ static void rf_power_policy_init(void)
     s_rf_policy_apply_pending = false;
     s_rf_policy_user_transaction = false;
     s_rf_policy_request_id[0] = '\0';
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    memset(&s_rf_user_intent, 0, sizeof(s_rf_user_intent));
+    s_rf_user_intent_pending = false;
+    s_rf_user_intent_queued = false;
+    s_rf_dispatch_active = false;
+    s_rf_user_intent_generation = 0U;
+    s_rf_user_intent_started_ms = 0U;
+    s_rf_user_intent_retry_after_ms = 0U;
+    s_rf_report_submitting = false;
+#endif
     ESP_LOGI(TAG, "RF power policy: mode=%s manual=%d dBm",
              rf_power_mode_name(mode), (int)manual_power_dbm);
 }
@@ -679,6 +705,16 @@ static void rf_power_forget_node(uint16_t addr)
         s_rf_expected_user_transaction = false;
         s_rf_policy_user_transaction = false;
         s_rf_policy_request_id[0] = '\0';
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+        s_rf_report_submitting = false;
+        memset(&s_rf_user_intent, 0, sizeof(s_rf_user_intent));
+        s_rf_user_intent_pending = false;
+        s_rf_user_intent_queued = false;
+        s_rf_dispatch_active = false;
+        s_rf_user_intent_generation = 0U;
+        s_rf_user_intent_started_ms = 0U;
+        s_rf_user_intent_retry_after_ms = 0U;
+#endif
     }
     taskEXIT_CRITICAL(&s_rf_power_lock);
 }
@@ -716,6 +752,14 @@ static void rf_power_reset_for_announce(uint16_t addr)
     if (!s_rf_policy_user_transaction) {
         s_rf_policy_request_id[0] = '\0';
     }
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    s_rf_report_submitting = false;
+    s_rf_dispatch_active = false;
+    s_rf_user_intent_queued = false;
+    if (s_rf_user_intent_pending) {
+        s_rf_user_intent_retry_after_ms = 0U;
+    }
+#endif
     s_rf_last_eval_ms = 0;
     taskEXIT_CRITICAL(&s_rf_power_lock);
 }
@@ -839,6 +883,9 @@ static void rf_power_clear_waiting_locked(void)
     s_rf_expected_user_transaction = false;
     s_rf_expected_request_id[0] = '\0';
     s_rf_wait_started_ms = 0;
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    s_rf_report_submitting = false;
+#endif
 }
 
 // Called while s_rf_power_lock is held. Once the deadline passes, a late,
@@ -851,8 +898,40 @@ static bool rf_power_expire_waiting_if_due_locked(uint32_t now)
     }
 
     rf_power_clear_waiting_locked();
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    if (s_rf_user_intent_pending) {
+        s_rf_user_intent_queued = false;
+        s_rf_user_intent_retry_after_ms = 0;
+    }
+#endif
     return true;
 }
+
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+static void rf_power_clear_user_intent_locked(void)
+{
+    memset(&s_rf_user_intent, 0, sizeof(s_rf_user_intent));
+    s_rf_user_intent_pending = false;
+    s_rf_user_intent_queued = false;
+    s_rf_user_intent_generation = 0U;
+    s_rf_user_intent_started_ms = 0U;
+    s_rf_user_intent_retry_after_ms = 0U;
+    s_rf_report_submitting = false;
+}
+
+static void rf_power_arm_user_intent_locked(
+    const rf_dispatch_cmd_t *cmd, uint32_t now)
+{
+    s_rf_user_intent = *cmd;
+    s_rf_user_intent_pending = true;
+    s_rf_user_intent_queued = false;
+    s_rf_dispatch_active = false;
+    s_rf_user_intent_generation = s_rf_policy_generation;
+    s_rf_user_intent_started_ms = now;
+    s_rf_user_intent_retry_after_ms = 0U;
+    s_rf_report_submitting = false;
+}
+#endif
 
 static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
 {
@@ -999,6 +1078,9 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
         s_rf_lqi_samples = 1;
         s_rf_lqi_low_windows = 0;
         s_rf_lqi_high_windows = 0;
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+        rf_power_handle_accepted_report_locked(now, matched_transaction);
+#endif
     } else if (!is_private && active_child && frame_lqi >= 0) {
         if (s_rf_lqi_ema < 0) {
             s_rf_lqi_ema = frame_lqi;
@@ -1055,7 +1137,6 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
                  "RF power: reject duplicate/old report seq=%u last=%u",
                  report_seq, last_seq);
     }
-
     return is_private;
 }
 
@@ -1169,6 +1250,8 @@ static esp_err_t rf_power_send_to_node(uint8_t command, int8_t power_dbm,
     }
     return err;
 }
+
+#if !defined(RF_COMMAND_QUEUE_ENABLED) || !RF_COMMAND_QUEUE_ENABLED
 
 static void rf_power_remote_query(const char *request_id)
 {
@@ -1361,100 +1444,597 @@ static void rf_power_remote_set_auto(const char *request_id)
     }
 }
 
+#endif
+
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+
+// Bounds one user-facing SET attempt. The desired MANUAL/AUTO policy remains
+// persisted after this timeout; later CQ-3 background dispatch can take it over.
+#define RF_DISPATCH_SET_INTENT_TTL_MS 1800000
+
 static uint32_t rf_power_new_command_id(void)
 {
-    uint32_t id = 0;
+    uint32_t id = 0U;
 
     do {
         id = esp_random();
-    } while (id == 0);
+    } while (id == 0U);
     return id;
+}
+
+static void rf_power_generate_cq_request_id(char *buffer)
+{
+    static const char hex[] = "0123456789abcdef";
+    uint64_t value = ((uint64_t)esp_random() << 32) |
+                     (uint64_t)esp_random();
+    int i;
+
+    for (i = RF_CQ_REQUEST_ID_LEN - 1; i >= 0; --i) {
+        buffer[i] = hex[value & 0xfU];
+        value >>= 4;
+    }
+    buffer[RF_CQ_REQUEST_ID_LEN] = '\0';
+}
+
+static const char *rf_power_normalize_cq_request_id(
+    char *buffer, const char *request_id)
+{
+    if (rf_cq_request_id_valid(request_id)) {
+        return request_id;
+    }
+
+    rf_power_generate_cq_request_id(buffer);
+    return buffer;
+}
+
+static esp_err_t rf_power_execute_plan(const rf_dispatch_plan_t *plan)
+{
+    uint8_t asdu[RF_PACKET_LEN] = {
+        RF_PACKET_MAGIC0,
+        RF_PACKET_MAGIC1,
+        RF_PACKET_VERSION,
+        plan->command,
+        plan->seq,
+        (uint8_t)plan->power_dbm,
+        plan->mode,
+        0,
+    };
+    esp_zb_apsde_data_req_t req = {
+        .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .dst_addr.addr_short = plan->node_addr,
+        .dst_endpoint = RF_ZB_ENDPOINT,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .cluster_id = RF_POWER_CLUSTER_ID,
+        .src_endpoint = RF_ZB_ENDPOINT,
+        .asdu_length = sizeof(asdu),
+        .asdu = asdu,
+        .tx_options = ESP_ZB_APSDE_TX_OPT_SECURITY_ENABLED |
+                       ESP_ZB_APSDE_TX_OPT_ACK_TX,
+        .use_alias = false,
+        .alias_src_addr = 0,
+        .alias_seq_num = 0,
+        .radius = 10,
+    };
+    esp_err_t err;
+
+    if (!esp_zb_is_started()) {
+        ESP_LOGW(TAG, "RF power -> node=0x%04x seq=%u skipped: stack not started",
+                 (unsigned)plan->node_addr, plan->seq);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!esp_zb_lock_acquire(portMAX_DELAY)) {
+        ESP_LOGW(TAG, "RF power -> node=0x%04x seq=%u skipped: lock unavailable",
+                 (unsigned)plan->node_addr, plan->seq);
+        return ESP_ERR_INVALID_STATE;
+    }
+    err = esp_zb_aps_data_request(&req);
+    esp_zb_lock_release();
+
+    ESP_LOGI(TAG, "RF power -> node=0x%04x cmd=%u power=%d mode=%s seq=%u: %s",
+             (unsigned)plan->node_addr, plan->command, plan->power_dbm,
+             rf_power_mode_name(plan->mode), plan->seq, esp_err_to_name(err));
+    return err;
+}
+
+static void rf_power_prepare_manual_policy_locked(
+    int8_t target_power_dbm, const char *request_id, uint32_t now)
+{
+    rf_power_clear_waiting_locked();
+    s_rf_mode = RF_MODE_MANUAL;
+    s_rf_manual_power_dbm = target_power_dbm;
+    s_rf_policy_apply_pending = true;
+    s_rf_last_eval_ms = now;
+    s_rf_policy_user_transaction = true;
+    rf_set_policy_request_id_locked(request_id);
+    rf_policy_bump_generation_locked();
+}
+
+static void rf_power_prepare_auto_policy_locked(
+    const char *request_id, uint32_t now)
+{
+    rf_power_clear_waiting_locked();
+    s_rf_mode = RF_MODE_AUTO;
+    s_rf_policy_apply_pending = true;
+    s_rf_last_eval_ms = now;
+    s_rf_policy_user_transaction = true;
+    rf_set_policy_request_id_locked(request_id);
+    rf_policy_bump_generation_locked();
+}
+
+static void rf_power_preinstall_plan_waiting_locked(
+    const rf_dispatch_cmd_t *cmd, const rf_dispatch_plan_t *plan, uint32_t now)
+{
+    bool proxy_query = cmd->command == RF_CQ_COMMAND_SET &&
+                       plan->command == RF_DISPATCH_COMMAND_QUERY;
+
+    s_rf_report_waiting = true;
+    s_rf_report_submitting = true;
+    s_rf_expected_report_seq = plan->seq;
+    s_rf_expected_report_power = plan->expected_report_power_dbm;
+    s_rf_expected_report_mode = plan->expected_report_mode;
+    s_rf_wait_started_ms = now;
+
+    if (proxy_query) {
+        s_rf_expected_user_transaction = false;
+        s_rf_expected_request_id[0] = '\0';
+    } else {
+        s_rf_expected_user_transaction = true;
+        rf_power_set_request_id_locked(cmd->request_id);
+    }
+}
+
+static void rf_power_handle_accepted_report_locked(
+    uint32_t now, bool matched_transaction)
+{
+    rf_dispatch_after_report_state_t after_state;
+    rf_dispatch_after_report_result_t after_result =
+        RF_DISPATCH_AFTER_REPORT_NONE;
+
+    (void)now;
+    if (!s_rf_user_intent_pending) {
+        return;
+    }
+
+    after_state.intent_command = s_rf_user_intent.command;
+    if (s_rf_user_intent.command == RF_CQ_COMMAND_SET) {
+        after_state.desired_mode = s_rf_user_intent.desired_mode;
+        after_state.target_power_dbm = s_rf_user_intent.desired_power_dbm;
+    } else {
+        after_state.desired_mode = RF_DISPATCH_MODE_AUTO;
+        after_state.target_power_dbm = 0;
+    }
+    after_state.policy_apply_pending = s_rf_policy_apply_pending;
+    after_state.reported_power_dbm = s_rf_node_power_dbm;
+    after_state.reported_mode = s_rf_node_mode;
+    after_state.matched_transaction = matched_transaction;
+    after_state.node_initiated_report =
+        s_rf_last_report_seq >= 0x80;
+
+    if (!rf_dispatch_after_report_create(&after_state, &after_result)) {
+        return;
+    }
+
+    if (after_result == RF_DISPATCH_AFTER_REPORT_COMPLETE) {
+        if (s_rf_user_intent.command == RF_CQ_COMMAND_SET) {
+            s_rf_policy_apply_pending = false;
+            s_rf_policy_user_transaction = false;
+            s_rf_policy_request_id[0] = '\0';
+        }
+        rf_power_clear_user_intent_locked();
+    } else if (after_result == RF_DISPATCH_AFTER_REPORT_RETRY) {
+        s_rf_user_intent_queued = false;
+        s_rf_user_intent_retry_after_ms = 0U;
+    }
+}
+
+static void rf_power_send_intent_command(const rf_dispatch_cmd_t *cmd)
+{
+    rf_dispatch_plan_state_t state;
+    rf_dispatch_plan_t plan;
+    uint32_t now;
+    bool created = false;
+    bool intent_still_matches = false;
+    esp_err_t err;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    (void)rf_power_expire_waiting_if_due_locked(now);
+
+    if (!s_rf_user_intent_pending ||
+        s_rf_user_intent.id != cmd->id ||
+        s_rf_user_intent_generation != s_rf_policy_generation) {
+        s_rf_dispatch_active = false;
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+
+    state.now_ms = now;
+    state.node_addr = s_rf_node_addr;
+    state.node_power_dbm = s_rf_node_power_dbm;
+    state.report_waiting = s_rf_report_waiting;
+    state.wait_deadline_ms =
+        s_rf_wait_started_ms == 0U
+            ? 0U
+            : s_rf_wait_started_ms + RF_POWER_SETTLE_MS;
+    state.packet_sequence = s_rf_packet_sequence;
+    created = rf_dispatch_plan_create(cmd, &state, &plan);
+
+    if (!created) {
+        s_rf_dispatch_active = false;
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+
+    if (plan.status != RF_DISPATCH_PLAN_SEND) {
+        s_rf_dispatch_active = false;
+        if (plan.status == RF_DISPATCH_PLAN_NO_SEND_POLICY_SAVED ||
+            plan.status == RF_DISPATCH_PLAN_ERR_INACTIVE) {
+            s_rf_user_intent_retry_after_ms = now + RF_POWER_EVAL_MS;
+        } else if (plan.status == RF_DISPATCH_PLAN_ERR_WAITING) {
+            s_rf_user_intent_retry_after_ms = state.wait_deadline_ms;
+        } else {
+            rf_power_clear_user_intent_locked();
+        }
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+
+    s_rf_packet_sequence = plan.seq;
+    rf_power_preinstall_plan_waiting_locked(cmd, &plan, now);
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    err = rf_power_execute_plan(&plan);
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    rf_tx_note_result_locked(err, now);
+    intent_still_matches =
+        s_rf_user_intent_pending &&
+        s_rf_user_intent.id == cmd->id &&
+        s_rf_user_intent_generation == s_rf_policy_generation;
+
+    // A newer user command can overwrite the intent while the previous APS
+    // request is outside the state lock. Completion/failure of that old request
+    // must not clear the newer command's queue state or inherit its backoff.
+    if (intent_still_matches) {
+        if (err != ESP_OK) {
+            if (s_rf_report_waiting && s_rf_report_submitting) {
+                rf_power_clear_waiting_locked();
+            }
+            s_rf_report_submitting = false;
+            s_rf_user_intent_queued = false;
+            s_rf_user_intent_retry_after_ms = s_rf_tx_backoff_until_ms;
+        } else if (s_rf_report_submitting) {
+            s_rf_report_submitting = false;
+            if (!s_rf_report_waiting) {
+                s_rf_user_intent_retry_after_ms = 0U;
+            }
+        }
+    }
+    s_rf_dispatch_active = false;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
 }
 
 static void rf_power_dispatch_from_queue(const rf_dispatch_cmd_t *cmd)
 {
-    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+    uint32_t now;
+    bool matched = false;
+    bool expired = false;
 
-    if (cmd->source != RF_CQ_SOURCE_USER) {
-        ESP_LOGW(TAG, "RF power queue: non-user command is not integrated");
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    matched = s_rf_user_intent_pending &&
+              s_rf_user_intent.id == cmd->id &&
+              s_rf_user_intent_generation == s_rf_policy_generation;
+
+    if (!matched) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
         return;
     }
-    if (rf_cq_time_reached(now, cmd->deadline_ms)) {
-        ESP_LOGW(TAG, "RF power queue: drop expired command id=%lu",
-                 (unsigned long)cmd->id);
+
+    expired = rf_cq_time_reached(now, cmd->deadline_ms);
+    if (expired && cmd->command == RF_CQ_COMMAND_QUERY) {
+        rf_power_clear_user_intent_locked();
+        taskEXIT_CRITICAL(&s_rf_power_lock);
         return;
     }
 
-    if (cmd->command == RF_CQ_COMMAND_QUERY) {
-        rf_power_remote_query(cmd->request_id);
-    } else if (cmd->command == RF_CQ_COMMAND_SET &&
-               cmd->desired_mode == RF_CQ_MODE_MANUAL) {
-        rf_power_remote_set_manual(cmd->desired_power_dbm, cmd->request_id);
-    } else if (cmd->command == RF_CQ_COMMAND_SET) {
-        // The queue object needs a supported power to validate. AUTO derives
-        // the actual current power inside the existing mature handler.
-        rf_power_remote_set_auto(cmd->request_id);
+    s_rf_user_intent_queued = false;
+    s_rf_dispatch_active = true;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (expired) {
+        taskENTER_CRITICAL(&s_rf_power_lock);
+        s_rf_dispatch_active = false;
+        if (s_rf_user_intent_pending &&
+            s_rf_user_intent_generation == s_rf_policy_generation) {
+            s_rf_user_intent_retry_after_ms = 0U;
+        }
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        rf_power_reconcile_pending_intent();
+        return;
     }
+
+    rf_power_send_intent_command(cmd);
+}
+
+static void rf_power_submit_new_intent(const rf_dispatch_cmd_t *cmd)
+{
+    esp_err_t err = rf_cq_submit(cmd);
+    uint32_t now;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    if (err == ESP_OK &&
+        s_rf_user_intent_pending &&
+        s_rf_user_intent.id == cmd->id &&
+        s_rf_user_intent_generation == s_rf_policy_generation) {
+        s_rf_user_intent = *cmd;
+        s_rf_user_intent_queued = true;
+    } else {
+        s_rf_user_intent_queued = false;
+        s_rf_user_intent_retry_after_ms = now + 100U;
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
 }
 
 static void rf_power_queued_query(const char *request_id)
 {
     rf_dispatch_cmd_t cmd;
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+    uint32_t generation;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    generation = s_rf_policy_generation;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
 
     if (rf_cq_build_user_query(rf_power_new_command_id(), request_id, now,
                                &cmd) != RF_CQ_OK) {
         ESP_LOGW(TAG, "RF power: reject queued QUERY");
         return;
     }
-    if (rf_cq_submit(&cmd) != ESP_OK) {
-        ESP_LOGW(TAG, "RF power: QUERY queue submission failed");
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    if (generation != s_rf_policy_generation) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
     }
+    // A new QUERY may take over only after the previous waiting transaction is
+    // actually due. Otherwise the old command's REPORT could be misattributed
+    // to this not-yet-sent QUERY.
+    if (s_rf_report_waiting &&
+        !rf_power_expire_waiting_if_due_locked(now)) {
+        ESP_LOGW(TAG, "RF power: QUERY ignored while another report is pending");
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+    rf_power_arm_user_intent_locked(&cmd, now);
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    rf_power_submit_new_intent(&cmd);
 }
 
-static void rf_power_queued_set_manual(int8_t target_power_dbm,
-                                       const char *request_id)
+static void rf_power_queued_set_manual(
+    int8_t target_power_dbm, const char *request_id)
 {
     rf_dispatch_cmd_t cmd;
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+    uint32_t generation;
 
+    if (!rf_power_is_allowed_value(target_power_dbm)) {
+        ESP_LOGW(TAG, "RF power: reject queued target=%d dBm",
+                 (int)target_power_dbm);
+        return;
+    }
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    rf_power_prepare_manual_policy_locked(target_power_dbm, request_id, now);
+    generation = s_rf_policy_generation;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    rf_power_policy_persist(RF_MODE_MANUAL, target_power_dbm);
+
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
     if (rf_cq_build_user_manual_set(rf_power_new_command_id(),
-                                    target_power_dbm, request_id, now,
-                                    &cmd) != RF_CQ_OK) {
+                                   target_power_dbm, request_id, now,
+                                   &cmd) != RF_CQ_OK) {
         ESP_LOGW(TAG, "RF power: reject queued MANUAL SET");
         return;
     }
-    if (rf_cq_submit(&cmd) != ESP_OK) {
-        ESP_LOGW(TAG, "RF power: MANUAL SET queue submission failed");
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    if (generation != s_rf_policy_generation) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
     }
+    rf_power_arm_user_intent_locked(&cmd, now);
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    rf_power_submit_new_intent(&cmd);
+}
+
+static void rf_power_reconcile_pending_intent(void)
+{
+    rf_dispatch_cmd_t intent_copy;
+    rf_dispatch_cmd_t rebuilt;
+    rf_dispatch_plan_state_t state;
+    rf_dispatch_plan_t plan;
+    uint32_t now;
+    uint32_t generation;
+    uint32_t started;
+    bool created = false;
+    bool should_submit = false;
+    rf_cq_result_t build_result;
+    esp_err_t submit_err;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    (void)rf_power_expire_waiting_if_due_locked(now);
+
+    if (!s_rf_user_intent_pending ||
+        s_rf_user_intent_queued ||
+        s_rf_report_waiting ||
+        s_rf_report_submitting ||
+        s_rf_dispatch_active) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+    if (s_rf_user_intent_generation != s_rf_policy_generation) {
+        rf_power_clear_user_intent_locked();
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+    if ((int32_t)(now - s_rf_user_intent_retry_after_ms) < 0) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+    if (s_rf_user_intent.command == RF_CQ_COMMAND_QUERY &&
+        now - s_rf_user_intent_started_ms >= RF_CQ_USER_TTL_MS) {
+        rf_power_clear_user_intent_locked();
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+    if (s_rf_user_intent.command == RF_CQ_COMMAND_SET &&
+        now - s_rf_user_intent_started_ms >= RF_DISPATCH_SET_INTENT_TTL_MS) {
+        ESP_LOGW(TAG,
+                 "RF power queue: SET user intent timeout after %lu ms; policy remains saved",
+                 (unsigned long)RF_DISPATCH_SET_INTENT_TTL_MS);
+        s_rf_policy_user_transaction = false;
+        s_rf_policy_request_id[0] = '\0';
+        rf_power_clear_user_intent_locked();
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+
+    intent_copy = s_rf_user_intent;
+    generation = s_rf_user_intent_generation;
+    started = s_rf_user_intent_started_ms;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (intent_copy.command == RF_CQ_COMMAND_QUERY) {
+        build_result = rf_cq_build_user_query(
+            rf_power_new_command_id(), intent_copy.request_id, now, &rebuilt);
+    } else if (intent_copy.desired_mode == RF_CQ_MODE_MANUAL) {
+        build_result = rf_cq_build_user_manual_set(
+            rf_power_new_command_id(), intent_copy.desired_power_dbm,
+            intent_copy.request_id, now, &rebuilt);
+    } else {
+        build_result = rf_cq_build_user_auto_set(
+            rf_power_new_command_id(), intent_copy.desired_power_dbm,
+            intent_copy.request_id, now, &rebuilt);
+    }
+
+    if (build_result != RF_CQ_OK) {
+        ESP_LOGW(TAG, "RF power queue: retry build failed");
+        return;
+    }
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    if (!s_rf_user_intent_pending ||
+        s_rf_user_intent_queued ||
+        s_rf_report_waiting ||
+        s_rf_report_submitting ||
+        s_rf_dispatch_active ||
+        s_rf_user_intent_generation != s_rf_policy_generation ||
+        generation != s_rf_policy_generation) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+
+    state.now_ms = now;
+    state.node_addr = s_rf_node_addr;
+    state.node_power_dbm = s_rf_node_power_dbm;
+    state.report_waiting = s_rf_report_waiting;
+    state.wait_deadline_ms =
+        s_rf_wait_started_ms == 0U
+            ? 0U
+            : s_rf_wait_started_ms + RF_POWER_SETTLE_MS;
+    state.packet_sequence = s_rf_packet_sequence;
+    created = rf_dispatch_plan_create(&rebuilt, &state, &plan);
+
+    if (!created) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+
+    if (plan.status == RF_DISPATCH_PLAN_SEND) {
+        should_submit = true;
+    } else if (plan.status == RF_DISPATCH_PLAN_NO_SEND_POLICY_SAVED ||
+               plan.status == RF_DISPATCH_PLAN_ERR_INACTIVE) {
+        s_rf_user_intent_retry_after_ms = now + RF_POWER_EVAL_MS;
+    } else if (plan.status == RF_DISPATCH_PLAN_ERR_WAITING) {
+        s_rf_user_intent_retry_after_ms = state.wait_deadline_ms;
+    } else {
+        rf_power_clear_user_intent_locked();
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (!should_submit) {
+        return;
+    }
+
+    submit_err = rf_cq_submit(&rebuilt);
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    if (submit_err == ESP_OK &&
+        s_rf_user_intent_pending &&
+        s_rf_user_intent_generation == s_rf_policy_generation) {
+        s_rf_user_intent = rebuilt;
+        s_rf_user_intent_queued = true;
+        s_rf_user_intent_started_ms = started;
+    } else if (s_rf_user_intent_generation == s_rf_policy_generation) {
+        s_rf_user_intent_queued = false;
+        s_rf_user_intent_retry_after_ms = now + 100U;
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
 }
 
 static void rf_power_queued_set_auto(const char *request_id)
 {
     rf_dispatch_cmd_t cmd;
+    int8_t manual_power_dbm = RF_POWER_AUTO_MIN_DBM;
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
-    int8_t placeholder_power;
+    uint32_t generation;
 
     taskENTER_CRITICAL(&s_rf_power_lock);
-    placeholder_power = s_rf_manual_power_dbm;
+    manual_power_dbm = s_rf_manual_power_dbm;
+    rf_power_prepare_auto_policy_locked(request_id, now);
+    generation = s_rf_policy_generation;
     taskEXIT_CRITICAL(&s_rf_power_lock);
 
+    rf_power_policy_persist(RF_MODE_AUTO, manual_power_dbm);
+
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
     if (rf_cq_build_user_auto_set(rf_power_new_command_id(),
-                                  placeholder_power, request_id, now,
-                                  &cmd) != RF_CQ_OK) {
+                                 manual_power_dbm, request_id, now,
+                                 &cmd) != RF_CQ_OK) {
         ESP_LOGW(TAG, "RF power: reject queued AUTO SET");
         return;
     }
-    if (rf_cq_submit(&cmd) != ESP_OK) {
-        ESP_LOGW(TAG, "RF power: AUTO SET queue submission failed");
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    if (generation != s_rf_policy_generation) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
     }
+    rf_power_arm_user_intent_locked(&cmd, now);
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    rf_power_submit_new_intent(&cmd);
 }
+
 #endif
 
 static void rf_power_controller_periodic(void)
 {
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    rf_power_reconcile_pending_intent();
+    return;
+#endif
     uint16_t addr = 0;
     uint32_t last_rx = 0;
     int link_lqi = -1;
@@ -2848,6 +3428,11 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
     cJSON *request_id_item = cJSON_GetObjectItem(root, "request_id");
     const char *request_id = cJSON_IsString(request_id_item)
                            ? request_id_item->valuestring : NULL;
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    char normalized_request_id[RF_CQ_REQUEST_ID_SIZE] = {0};
+    request_id = rf_power_normalize_cq_request_id(normalized_request_id,
+                                                  request_id);
+#endif
     uint8_t cmd_id = 0xFF;
     if (cJSON_IsString(command)) {
         const char *command_name = command->valuestring;

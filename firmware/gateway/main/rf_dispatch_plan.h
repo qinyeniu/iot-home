@@ -44,6 +44,23 @@ typedef struct {
     uint8_t expected_report_mode;
 } rf_dispatch_plan_t;
 
+typedef struct {
+    uint8_t intent_command;
+    uint8_t desired_mode;
+    int8_t target_power_dbm;
+    bool policy_apply_pending;
+    int8_t reported_power_dbm;
+    uint8_t reported_mode;
+    bool matched_transaction;
+    bool node_initiated_report;
+} rf_dispatch_after_report_state_t;
+
+typedef enum {
+    RF_DISPATCH_AFTER_REPORT_NONE = 0,
+    RF_DISPATCH_AFTER_REPORT_COMPLETE,
+    RF_DISPATCH_AFTER_REPORT_RETRY,
+} rf_dispatch_after_report_result_t;
+
 /*
  * Creates the consumer's pre-send plan without calling FreeRTOS, ZBOSS, NVS or
  * network APIs. The caller must hold the RF state lock while reading state and
@@ -60,3 +77,13 @@ typedef struct {
 bool rf_dispatch_plan_create(const rf_dispatch_cmd_t *cmd,
                              const rf_dispatch_plan_state_t *state,
                              rf_dispatch_plan_t *plan);
+
+/*
+ * Decides whether an accepted report completes the user intent or requires
+ * another RF attempt. A gateway-bound old private reply is authoritative only
+ * when matched_transaction is true; a fresh node-initiated report may complete a
+ * SET if its value already satisfies the desired policy.
+ */
+bool rf_dispatch_after_report_create(
+    const rf_dispatch_after_report_state_t *state,
+    rf_dispatch_after_report_result_t *result);

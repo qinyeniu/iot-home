@@ -253,6 +253,87 @@ static void test_auto_special_states(void)
     CHECK(plan.clear_waiting);
 }
 
+static rf_dispatch_after_report_state_t base_after_report_state(void)
+{
+    rf_dispatch_after_report_state_t state = {
+        .intent_command = RF_DISPATCH_COMMAND_SET,
+        .desired_mode = RF_DISPATCH_MODE_MANUAL,
+        .target_power_dbm = 0,
+        .policy_apply_pending = true,
+        .reported_power_dbm = -10,
+        .reported_mode = RF_DISPATCH_MODE_MANUAL,
+        .matched_transaction = false,
+        .node_initiated_report = false,
+    };
+    return state;
+}
+
+static void test_after_report_policy(void)
+{
+    rf_dispatch_after_report_state_t state = base_after_report_state();
+    rf_dispatch_after_report_result_t result;
+
+    CHECK(!rf_dispatch_after_report_create(NULL, &result));
+    CHECK(!rf_dispatch_after_report_create(&state, NULL));
+
+    state.intent_command = RF_DISPATCH_COMMAND_QUERY;
+    state.matched_transaction = true;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_COMPLETE);
+
+    state.matched_transaction = false;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_NONE);
+
+    state = base_after_report_state();
+    state.matched_transaction = true;
+    state.reported_power_dbm = 0;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_COMPLETE);
+
+    state = base_after_report_state();
+    state.matched_transaction = true;
+    state.desired_mode = RF_DISPATCH_MODE_AUTO;
+    state.reported_mode = RF_DISPATCH_MODE_AUTO;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_COMPLETE);
+
+    state = base_after_report_state();
+    state.matched_transaction = true;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_RETRY);
+
+    state = base_after_report_state();
+    state.matched_transaction = false;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_NONE);
+
+    state.node_initiated_report = true;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_NONE);
+
+    state.reported_power_dbm = 0;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_COMPLETE);
+
+    state = base_after_report_state();
+    state.node_initiated_report = true;
+    state.desired_mode = RF_DISPATCH_MODE_AUTO;
+    state.reported_mode = RF_DISPATCH_MODE_AUTO;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_COMPLETE);
+
+    state = base_after_report_state();
+    state.reported_power_dbm = RF_DISPATCH_POWER_UNKNOWN_DBM;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_NONE);
+
+    state = base_after_report_state();
+    state.policy_apply_pending = false;
+    CHECK(rf_dispatch_after_report_create(&state, &result));
+    CHECK(result == RF_DISPATCH_AFTER_REPORT_NONE);
+}
+
 int main(void)
 {
     test_invalid_arguments();
@@ -264,6 +345,7 @@ int main(void)
     test_manual_special_states();
     test_auto_plan_uses_current_power();
     test_auto_special_states();
+    test_after_report_policy();
 
     if (s_failures != 0) {
         printf("rf_dispatch_plan host tests: FAIL (%d)\n", s_failures);

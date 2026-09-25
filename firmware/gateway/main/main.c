@@ -471,6 +471,10 @@ static uint32_t s_rf_user_intent_started_ms;
 static uint32_t s_rf_user_intent_retry_after_ms;
 static bool s_rf_background_active;
 static rf_dispatch_cmd_t s_rf_background_command;
+static uint32_t s_rf_last_negative_notice_ms;
+static bool s_rf_terminal_notice_pending;
+static uint16_t s_rf_terminal_notice_addr;
+static rf_background_publish_status_t s_rf_terminal_notice_status;
 #endif
 static char s_rf_expected_request_id[17];
 static bool s_rf_expected_user_transaction;
@@ -901,6 +905,12 @@ static void rf_power_clear_waiting_locked(void)
 #endif
 }
 
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+static bool rf_power_close_background_timeout_if_due_locked(
+    uint32_t now, bool *should_publish,
+    rf_background_publish_status_t *publish_status);
+#endif
+
 // Called while s_rf_power_lock is held. Once the deadline passes, a late,
 // otherwise exact REPORT must no longer confirm the original user transaction.
 static bool rf_power_expire_waiting_if_due_locked(uint32_t now)
@@ -909,6 +919,25 @@ static bool rf_power_expire_waiting_if_due_locked(uint32_t now)
         now - s_rf_wait_started_ms < RF_POWER_SETTLE_MS) {
         return false;
     }
+
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    {
+        bool background_timeout_publish = false;
+        rf_background_publish_status_t background_timeout_status =
+            RF_BG_STATUS_PUBLISH_TIMEOUT;
+
+        if (rf_power_close_background_timeout_if_due_locked(
+                now, &background_timeout_publish,
+                &background_timeout_status)) {
+            if (background_timeout_publish) {
+                s_rf_terminal_notice_pending = true;
+                s_rf_terminal_notice_addr = s_rf_node_addr;
+                s_rf_terminal_notice_status = background_timeout_status;
+            }
+            return true;
+        }
+    }
+#endif
 
     rf_power_clear_waiting_locked();
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
@@ -980,6 +1009,127 @@ static bool rf_power_handle_background_report_locked(
     // NO_ACTION: keep active transaction and do not publish.
     // table_action is descriptive only; gateway has no command DB API.
     return true;
+}
+
+#define RF_BG_NEGATIVE_NOTICE_MIN_MS 300000u
+
+static bool rf_power_negative_notice_allowed_locked(uint32_t now)
+{
+    return s_rf_last_negative_notice_ms == 0U ||
+           now - s_rf_last_negative_notice_ms >=
+               RF_BG_NEGATIVE_NOTICE_MIN_MS;
+}
+
+static bool rf_power_handle_background_terminal_locked(
+    uint32_t now, rf_background_status_event_t event,
+    bool *should_publish,
+    rf_background_publish_status_t *publish_status)
+{
+    rf_background_status_state_t status_state;
+    rf_background_status_plan_t status_plan;
+
+    if (should_publish == NULL || publish_status == NULL) {
+        return false;
+    }
+    *should_publish = false;
+    if (!s_rf_background_active) {
+        return true;
+    }
+
+    memset(&status_state, 0, sizeof(status_state));
+    status_state.now_ms = now;
+    status_state.command = s_rf_background_command;
+    status_state.event = event;
+    status_state.reported_power_dbm = RF_POWER_UNKNOWN_DBM;
+    status_state.reported_mode = RF_MODE_UNKNOWN;
+    status_state.matched_transaction = false;
+    status_state.node_initiated_report = false;
+    status_state.policy_apply_pending = s_rf_policy_apply_pending;
+    status_state.notice_allowed =
+        rf_power_negative_notice_allowed_locked(now);
+
+    if (!rf_background_status_plan_create(&status_state, &status_plan)) {
+        return false;
+    }
+    if (status_plan.result == RF_BG_STATUS_PLAN_INVALID_ARG ||
+        status_plan.result == RF_BG_STATUS_PLAN_NO_ACTION) {
+        return true;
+    }
+
+    if (status_plan.clear_background) {
+        rf_power_clear_background_locked();
+    }
+    if (status_plan.set_policy_pending) {
+        s_rf_policy_apply_pending = status_plan.policy_pending_value;
+        if (!status_plan.policy_pending_value) {
+            s_rf_policy_request_id[0] = '\0';
+        }
+    }
+
+    if (status_plan.result == RF_BG_STATUS_PLAN_PUBLISH) {
+        s_rf_last_negative_notice_ms = now;
+        *should_publish = true;
+        *publish_status = status_plan.publish_status;
+    }
+    return true;
+}
+
+static bool rf_power_close_background_timeout_if_due_locked(
+    uint32_t now, bool *should_publish,
+    rf_background_publish_status_t *publish_status)
+{
+    if (should_publish == NULL || publish_status == NULL) {
+        return false;
+    }
+    *should_publish = false;
+    if (!s_rf_report_waiting || s_rf_wait_started_ms == 0U ||
+        now - s_rf_wait_started_ms < RF_POWER_SETTLE_MS) {
+        return false;
+    }
+    if (s_rf_expected_user_transaction) {
+        return false;
+    }
+
+    if (s_rf_background_active) {
+        if (s_rf_background_command.policy_generation !=
+                s_rf_policy_generation) {
+            rf_power_clear_background_locked();
+        } else if (!rf_power_handle_background_terminal_locked(
+                now, RF_BG_STATUS_EVENT_WAIT_TIMEOUT,
+                should_publish, publish_status)) {
+            return false;
+        } else {
+            rf_power_clear_background_locked();
+        }
+    }
+    rf_power_clear_waiting_locked();
+    return true;
+}
+
+static void rf_power_publish_background_terminal_notice(void)
+{
+    bool pending = false;
+    uint16_t addr = 0U;
+    rf_background_publish_status_t status =
+        RF_BG_STATUS_PUBLISH_TIMEOUT;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    pending = s_rf_terminal_notice_pending;
+    if (pending) {
+        addr = s_rf_terminal_notice_addr;
+        status = s_rf_terminal_notice_status;
+        s_rf_terminal_notice_pending = false;
+        s_rf_terminal_notice_addr = 0U;
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (pending) {
+        const char *status_name = status == RF_BG_STATUS_PUBLISH_FAILED
+                                      ? "failed"
+                                      : "timeout";
+        rf_power_publish_state(addr, RF_POWER_UNKNOWN_DBM,
+                               RF_MODE_UNKNOWN, status_name, NULL);
+    }
 }
 
 
@@ -1716,6 +1866,23 @@ static void rf_power_background_controller_periodic(void)
 
     taskENTER_CRITICAL(&s_rf_power_lock);
     now = pdTICKS_TO_MS(xTaskGetTickCount());
+    {
+        bool timeout_publish = false;
+        rf_background_publish_status_t timeout_status =
+            RF_BG_STATUS_PUBLISH_TIMEOUT;
+        uint16_t timeout_addr = s_rf_node_addr;
+
+        if (rf_power_close_background_timeout_if_due_locked(
+                now, &timeout_publish, &timeout_status)) {
+            taskEXIT_CRITICAL(&s_rf_power_lock);
+            if (timeout_publish) {
+                rf_power_publish_state(
+                    timeout_addr, RF_POWER_UNKNOWN_DBM,
+                    RF_MODE_UNKNOWN, "timeout", NULL);
+            }
+            return;
+        }
+    }
     if (!rf_power_map_runtime_locked(&runtime, now) ||
         !rf_background_runtime_adapter_apply(&runtime, &result) ||
         result.result == RF_BG_EXEC_INVALID_ARG ||
@@ -2033,6 +2200,10 @@ static void rf_power_send_background_command(const rf_dispatch_cmd_t *cmd)
     rf_dispatch_plan_t packet;
     uint32_t now;
     bool can_send = false;
+    bool terminal_publish = false;
+    uint16_t terminal_addr = 0U;
+    rf_background_publish_status_t terminal_status =
+        RF_BG_STATUS_PUBLISH_FAILED;
     esp_err_t err = ESP_FAIL;
 
     taskENTER_CRITICAL(&s_rf_power_lock);
@@ -2088,19 +2259,39 @@ static void rf_power_send_background_command(const rf_dispatch_cmd_t *cmd)
     rf_tx_note_result_locked(err, now);
 
     if (s_rf_background_active &&
+        s_rf_background_command.policy_generation == s_rf_policy_generation &&
         s_rf_background_command.id == cmd->id &&
         s_rf_background_command.policy_generation == cmd->policy_generation) {
         if (err != ESP_OK) {
-            if (s_rf_report_waiting && s_rf_report_submitting) {
-                rf_power_clear_waiting_locked();
+            bool should_publish_failure = false;
+            rf_background_publish_status_t failure_status =
+                RF_BG_STATUS_PUBLISH_FAILED;
+
+            if (rf_power_handle_background_terminal_locked(
+                    now, RF_BG_STATUS_EVENT_SEND_FAILED,
+                    &should_publish_failure,
+                    &failure_status)) {
+                terminal_publish = should_publish_failure;
+                terminal_status = failure_status;
+                terminal_addr = s_rf_node_addr;
             }
             rf_power_clear_background_locked();
+            rf_power_clear_waiting_locked();
         } else {
             s_rf_report_submitting = false;
         }
     }
     s_rf_dispatch_active = false;
     taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (terminal_publish) {
+        const char *status_name = terminal_status ==
+                                      RF_BG_STATUS_PUBLISH_TIMEOUT
+                                      ? "timeout"
+                                      : "failed";
+        rf_power_publish_state(terminal_addr, RF_POWER_UNKNOWN_DBM,
+                               RF_MODE_UNKNOWN, status_name, NULL);
+    }
 }
 static void rf_power_dispatch_from_queue(const rf_dispatch_cmd_t *cmd)
 {
@@ -2426,6 +2617,7 @@ static void rf_power_controller_periodic(void)
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
     rf_power_reconcile_pending_intent();
     rf_power_background_controller_periodic();
+    rf_power_publish_background_terminal_notice();
     return;
 #endif
     uint16_t addr = 0;

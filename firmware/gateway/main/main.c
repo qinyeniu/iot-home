@@ -35,6 +35,7 @@
 #include "rf_dispatch_plan.h"
 #include "rf_background_command_mapper.h"
 #include "rf_background_dispatch_plan.h"
+#include "rf_background_status_plan.h"
 #endif
 
 #include "esp_sleep.h"
@@ -925,6 +926,62 @@ static void rf_power_clear_background_locked(void)
     s_rf_background_active = false;
     memset(&s_rf_background_command, 0, sizeof(s_rf_background_command));
 }
+static bool rf_power_handle_background_report_locked(
+    uint32_t now, int8_t reported_power_dbm, uint8_t reported_mode,
+    bool matched_sequence, bool node_initiated_report,
+    bool *should_publish,
+    rf_background_publish_status_t *publish_status)
+{
+    rf_background_status_state_t status_state;
+    rf_background_status_plan_t status_plan;
+    rf_dispatch_cmd_t command;
+
+    if (should_publish == NULL || publish_status == NULL) {
+        return false;
+    }
+    *should_publish = false;
+    if (!s_rf_background_active) {
+        return true;
+    }
+
+    command = s_rf_background_command;
+    memset(&status_state, 0, sizeof(status_state));
+    status_state.now_ms = now;
+    status_state.command = command;
+    status_state.event = RF_BG_STATUS_EVENT_MATCHED_REPORT;
+    status_state.reported_power_dbm = reported_power_dbm;
+    status_state.reported_mode = reported_mode;
+    status_state.matched_transaction = matched_sequence;
+    status_state.node_initiated_report = node_initiated_report;
+    status_state.policy_apply_pending = s_rf_policy_apply_pending;
+    status_state.notice_allowed = true;
+
+    if (!rf_background_status_plan_create(&status_state, &status_plan)) {
+        return false;
+    }
+    if (status_plan.result == RF_BG_STATUS_PLAN_INVALID_ARG) {
+        return true;
+    }
+
+    if (status_plan.result == RF_BG_STATUS_PLAN_PUBLISH) {
+        if (status_plan.clear_background) {
+            rf_power_clear_background_locked();
+        }
+        if (status_plan.set_policy_pending) {
+            s_rf_policy_apply_pending = status_plan.policy_pending_value;
+            if (!status_plan.policy_pending_value) {
+                s_rf_policy_request_id[0] = '\0';
+            }
+        }
+        *should_publish = true;
+        *publish_status = status_plan.publish_status;
+    }
+
+    // NO_ACTION: keep active transaction and do not publish.
+    // table_action is descriptive only; gateway has no command DB API.
+    return true;
+}
+
 
 static void rf_power_clear_user_intent_locked(void)
 {
@@ -971,6 +1028,12 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
     bool matched_transaction = false;
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
     bool matched_background = false;
+    bool background_active = false;
+    bool background_report_handled = false;
+    bool background_publish = false;
+    bool background_spontaneous_report = false;
+    rf_background_publish_status_t background_publish_status =
+        RF_BG_STATUS_PUBLISH_REPORT_RECEIVED;
 #endif
     char response_request_id[17] = {0};
     rf_reject_reason_t reject_reason = RF_REJECT_NONE;
@@ -1050,6 +1113,41 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
         } else if (!rf_power_is_allowed_value(reported_power)) {
             reject_reason = RF_REJECT_INVALID_POWER;
         } else if (s_rf_report_waiting) {
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+            bool background_spontaneous_confirms_set = false;
+            bool spontaneous_report_is_new = false;
+
+            if (report_seq >= 0x80) {
+                spontaneous_report_is_new =
+                    rf_power_report_is_new_unsolicited_locked(report_seq);
+                background_spontaneous_confirms_set =
+                    spontaneous_report_is_new &&
+                    packet_v2 &&
+                    !expected_user &&
+                    s_rf_background_active &&
+                    s_rf_policy_apply_pending &&
+                    s_rf_background_command.policy_generation ==
+                        s_rf_policy_generation &&
+                    s_rf_background_command.command ==
+                        RF_CQ_COMMAND_SET &&
+                    ((s_rf_background_command.desired_mode ==
+                          RF_CQ_MODE_MANUAL &&
+                      reported_mode == RF_MODE_MANUAL &&
+                      reported_power ==
+                          s_rf_background_command.desired_power_dbm) ||
+                     (s_rf_background_command.desired_mode ==
+                          RF_CQ_MODE_AUTO &&
+                      reported_mode == RF_MODE_AUTO));
+            }
+#endif
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+            if (background_spontaneous_confirms_set) {
+                accept_report = true;
+                matched_transaction = false;
+                matched_background = true;
+                background_spontaneous_report = true;
+            } else
+#endif
             if (packet_v2 &&
                 report_seq == expected_seq &&
                 (expected_power == RF_POWER_UNKNOWN_DBM ||
@@ -1071,6 +1169,10 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
                 s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
                 s_rf_expected_report_mode = RF_MODE_UNKNOWN;
                 s_rf_wait_started_ms = 0;
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+            } else if (report_seq >= 0x80 && !spontaneous_report_is_new) {
+                reject_reason = RF_REJECT_OLD;
+#endif
             } else {
                 reject_reason = RF_REJECT_MISMATCH;
             }
@@ -1085,11 +1187,26 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
         s_rf_node_power_dbm = reported_power;
         s_rf_node_mode = packet_v2 ? reported_mode : RF_MODE_UNKNOWN;
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
-        if (matched_background) {
-            rf_power_clear_background_locked();
+        background_active = s_rf_background_active;
+        background_report_handled =
+            rf_power_handle_background_report_locked(
+                now, reported_power, reported_mode, matched_background,
+                report_seq >= 0x80, &background_publish,
+                &background_publish_status);
+        if (!background_report_handled) {
+            ESP_LOGW(TAG, "RF power: background report plan failed");
+        } else if (background_spontaneous_report &&
+                   background_publish &&
+                   background_publish_status ==
+                       RF_BG_STATUS_PUBLISH_CONFIRMED) {
+            rf_power_clear_waiting_locked();
         }
 #endif
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+        if (!background_active && !s_rf_policy_user_transaction && packet_v2 &&
+#else
         if (!s_rf_policy_user_transaction && packet_v2 &&
+#endif
             ((s_rf_mode == RF_MODE_MANUAL &&
               reported_mode == RF_MODE_MANUAL &&
               reported_power == s_rf_manual_power_dbm) ||
@@ -1131,17 +1248,37 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
                  (unsigned)ind.cluster_id, frame_lqi, (int)recent_rssi);
     }
     if (accept_report) {
+        const char *publish_status_name =
+            matched_transaction ? "confirmed" : "report_received";
+        const char *publish_request_id =
+            matched_transaction ? response_request_id : NULL;
+
         ESP_LOGI(TAG,
                  "RF power: report accepted from %s to %s/%d dBm seq=%u",
                  old_power_unknown ? "unknown" : "previous",
                  rf_power_mode_name(reported_mode),
                  (int)reported_power, report_seq);
-        rf_power_publish_state(ind.src_short_addr, reported_power,
-                                reported_mode,
-                                matched_transaction ? "confirmed"
-                                                   : "report_received",
-                                matched_transaction ? response_request_id
-                                                   : NULL);
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+        if (background_active) {
+            if (!background_report_handled || !background_publish) {
+                publish_status_name = NULL;
+                ESP_LOGI(TAG,
+                         "RF power: background report publication suppressed");
+            } else {
+                publish_status_name =
+                    background_publish_status ==
+                            RF_BG_STATUS_PUBLISH_CONFIRMED
+                        ? "confirmed"
+                        : "report_received";
+                publish_request_id = NULL;
+            }
+        }
+#endif
+        if (publish_status_name != NULL) {
+            rf_power_publish_state(ind.src_short_addr, reported_power,
+                                   reported_mode, publish_status_name,
+                                   publish_request_id);
+        }
     } else if (reject_reason == RF_REJECT_UNSECURED) {
         ESP_LOGW(TAG, "RF power: reject unsecured frame cluster=0x%04x",
                  (unsigned)ind.cluster_id);

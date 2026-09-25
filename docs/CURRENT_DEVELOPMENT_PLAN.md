@@ -214,7 +214,7 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 5. commit handler 未注册时返回 501；handler 失败时会话进入 `error`，不会伪装 committed；响应和日志不回显密码；
 6. 组件非线程安全，真实 HTTP 集成必须单任务调用或加锁；
 7. 默认 OFF bin 仍为 `0x15f540`，实验 ON bin 仍为 `0x162150`；
-8. 下一步不直接启动服务：S2 先设计真实 Wi‑Fi 临时连接和回退，真实 `/commit` 必须等待 A/B Bundle 硬件验证。
+8. S2 设计已完成并复审 Approve（C/H/M/L=0）：见 `docs/PROVISIONING_WIFI_TEST_INTEGRATION_DESIGN.md`；真实接入先实现 QUEUED、完整 owner gate、静态命令队列和可主机测试逻辑；真实 `/commit` 必须等待 A/B Bundle 硬件验证。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；

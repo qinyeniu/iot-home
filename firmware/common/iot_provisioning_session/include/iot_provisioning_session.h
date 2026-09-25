@@ -23,6 +23,7 @@ extern "C" {
 
 typedef enum {
     IOT_PROV_STATE_WAITING = 0,
+    IOT_PROV_STATE_QUEUED,
     IOT_PROV_STATE_TESTING,
     IOT_PROV_STATE_TEST_PASSED,
     IOT_PROV_STATE_TEST_FAILED,
@@ -184,6 +185,38 @@ iot_prov_error_t iot_prov_begin_after_rate_limit_ex(
     const char *test_id,
     uint32_t now_ms,
     iot_prov_error_info_t *error_detail);
+
+/**
+ * Validate and place one RAM-only provisioning test in the bounded queue
+ * state. The caller must only report HTTP 202 after this succeeds.
+ */
+iot_prov_error_t iot_prov_queue_test(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms);
+
+/** Queue a test with explicit validation detail for HTTP mapping. */
+iot_prov_error_t iot_prov_queue_test_ex(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms,
+    iot_prov_error_info_t *error_detail);
+
+/** Queue a test after a rate-limit slot has already been consumed. */
+iot_prov_error_t iot_prov_queue_test_after_rate_limit_ex(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms,
+    iot_prov_error_info_t *error_detail);
+
+/** Move the matching queued test to testing when the worker consumes it. */
+iot_prov_error_t iot_prov_start_queued(
+    iot_prov_session_t *session,
+    const char *test_id,
+    uint32_t now_ms);
 
 /** Report the Wi-Fi test result for the active test. */
 iot_prov_error_t iot_prov_note_wifi_result(

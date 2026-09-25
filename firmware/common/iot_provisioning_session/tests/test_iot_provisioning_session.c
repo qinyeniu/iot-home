@@ -34,6 +34,19 @@ static iot_prov_request_t valid_request(void)
     return request;
 }
 
+static bool snapshot_is_blank(const iot_prov_session_t *session)
+{
+    const unsigned char *snapshot = (const unsigned char *)&session->snapshot;
+    size_t i;
+
+    for (i = 0U; i < sizeof(session->snapshot); ++i) {
+        if (snapshot[i] != 0U) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void init_session(iot_prov_session_t *session)
 {
     CHECK(iot_prov_session_init(session, "IoT-Home-3F9A", "0.1.0") ==
@@ -412,6 +425,159 @@ static void test_new_test_after_failure(void)
     CHECK(status.state == IOT_PROV_STATE_TEST_PASSED);
 }
 
+
+static void test_queued_lifecycle(void)
+{
+    iot_prov_session_t session;
+    iot_prov_request_t request = valid_request();
+    iot_prov_status_t status;
+    iot_prov_bundle_t bundle;
+
+    init_session(&session);
+    CHECK(iot_prov_queue_test(&session, &request, "tmp-queue1", 100U) ==
+          IOT_PROV_OK);
+    CHECK(iot_prov_get_status(&session, 101U, &status) == IOT_PROV_OK);
+    CHECK(status.state == IOT_PROV_STATE_QUEUED);
+    CHECK(!status.can_commit);
+    CHECK(status.input == IOT_PROV_STEP_PASSED);
+    CHECK(status.wifi == IOT_PROV_STEP_PENDING);
+    CHECK(status.mqtt == IOT_PROV_STEP_PENDING);
+    CHECK(status.started_at_ms == 100U);
+    CHECK(status.expires_at_ms == 300100U);
+
+    CHECK(iot_prov_note_wifi_result(&session, "tmp-queue1", 102U, true,
+                                    IOT_PROV_OK, IOT_PROV_FIELD_NONE) ==
+          IOT_PROV_ERR_TEST_NOT_FOUND);
+    CHECK(iot_prov_start_queued(&session, "tmp-queue1", 150U) ==
+          IOT_PROV_OK);
+    CHECK(iot_prov_get_status(&session, 151U, &status) == IOT_PROV_OK);
+    CHECK(status.state == IOT_PROV_STATE_TESTING);
+    CHECK(status.started_at_ms == 100U);
+    CHECK(status.expires_at_ms == 300100U);
+
+    CHECK(iot_prov_note_wifi_result(&session, "tmp-queue1", 152U, true,
+                                    IOT_PROV_OK, IOT_PROV_FIELD_NONE) ==
+          IOT_PROV_OK);
+    CHECK(iot_prov_note_mqtt_result(&session, "tmp-queue1", 153U, true,
+                                    IOT_PROV_OK, IOT_PROV_FIELD_NONE) ==
+          IOT_PROV_OK);
+    CHECK(iot_prov_get_status(&session, 154U, &status) == IOT_PROV_OK);
+    CHECK(status.state == IOT_PROV_STATE_TEST_PASSED);
+    CHECK(iot_prov_prepare_commit(&session, "tmp-queue1", 155U, &bundle) ==
+          IOT_PROV_OK);
+    CHECK(strcmp(bundle.wifi_ssid, "HomeWiFi") == 0);
+    CHECK(strcmp(bundle.wifi_password, "password123") == 0);
+}
+
+static void test_queued_conflicts_and_wrong_worker(void)
+{
+    iot_prov_session_t session;
+    iot_prov_request_t request = valid_request();
+
+    init_session(&session);
+    CHECK(iot_prov_queue_test(&session, &request, "tmp-queueA", 100U) ==
+          IOT_PROV_OK);
+    CHECK(iot_prov_queue_test(&session, &request, "tmp-queueB", 101U) ==
+          IOT_PROV_ERR_TEST_ACTIVE);
+    CHECK(iot_prov_begin(&session, &request, "tmp-direct", 102U) ==
+          IOT_PROV_ERR_TEST_ACTIVE);
+    CHECK(iot_prov_start_queued(&session, "tmp-queueB", 103U) ==
+          IOT_PROV_ERR_TEST_NOT_FOUND);
+    CHECK(iot_prov_start_queued(&session, "tmp-queueA", 104U) ==
+          IOT_PROV_OK);
+    CHECK(iot_prov_start_queued(&session, "tmp-queueA", 105U) ==
+          IOT_PROV_ERR_TEST_NOT_FOUND);
+}
+
+static void test_queued_cancel(void)
+{
+    iot_prov_session_t session;
+    iot_prov_request_t request = valid_request();
+    iot_prov_status_t status;
+    iot_prov_bundle_t bundle;
+
+    init_session(&session);
+    CHECK(iot_prov_queue_test(&session, &request, "tmp-qcancel", 100U) ==
+          IOT_PROV_OK);
+    CHECK(iot_prov_cancel(&session, "tmp-qcancel", 101U) == IOT_PROV_OK);
+    CHECK(iot_prov_get_status(&session, 102U, &status) == IOT_PROV_OK);
+    CHECK(status.state == IOT_PROV_STATE_WAITING);
+    CHECK(status.wifi == IOT_PROV_STEP_IDLE);
+    CHECK(status.mqtt == IOT_PROV_STEP_IDLE);
+    CHECK(iot_prov_start_queued(&session, "tmp-qcancel", 103U) ==
+          IOT_PROV_ERR_TEST_NOT_FOUND);
+    CHECK(iot_prov_prepare_commit(&session, "tmp-qcancel", 104U, &bundle) ==
+          IOT_PROV_ERR_TEST_EXPIRED);
+
+    CHECK(iot_prov_queue_test(&session, &request, "tmp-qcancel2", 200U) ==
+          IOT_PROV_OK);
+    CHECK(iot_prov_cancel(&session, NULL, 201U) == IOT_PROV_OK);
+    CHECK(iot_prov_get_status(&session, 202U, &status) == IOT_PROV_OK);
+    CHECK(status.state == IOT_PROV_STATE_WAITING);
+    CHECK(snapshot_is_blank(&session));
+}
+
+static void test_queued_expiration(void)
+{
+    iot_prov_session_t session;
+    iot_prov_request_t request = valid_request();
+    iot_prov_status_t status;
+
+    init_session(&session);
+    CHECK(iot_prov_queue_test(&session, &request, "tmp-qexp", 1000U) ==
+          IOT_PROV_OK);
+    CHECK(iot_prov_get_status(&session, 300999U, &status) == IOT_PROV_OK);
+    CHECK(status.state == IOT_PROV_STATE_QUEUED);
+    CHECK(status.wifi == IOT_PROV_STEP_PENDING);
+
+    CHECK(iot_prov_get_status(&session, 301000U, &status) == IOT_PROV_OK);
+    CHECK(status.state == IOT_PROV_STATE_TEST_FAILED);
+    CHECK(status.wifi == IOT_PROV_STEP_FAILED);
+    CHECK(status.mqtt == IOT_PROV_STEP_FAILED);
+    CHECK(status.error_count == 1U);
+    CHECK(status.errors[0].code == IOT_PROV_ERR_TEST_EXPIRED);
+    CHECK(iot_prov_start_queued(&session, "tmp-qexp", 301001U) ==
+          IOT_PROV_ERR_TEST_NOT_FOUND);
+    CHECK(snapshot_is_blank(&session));
+}
+
+static void test_queue_validation_detail_and_rate_slot(void)
+{
+    iot_prov_session_t session;
+    iot_prov_request_t request = valid_request();
+    iot_prov_error_info_t detail;
+    iot_prov_status_t status;
+
+    init_session(&session);
+    request.wifi_ssid[0] = '\0';
+    CHECK(iot_prov_queue_test_ex(&session, &request, "tmp-qbad", 100U,
+                                 &detail) == IOT_PROV_ERR_INVALID_FIELD);
+    CHECK(detail.field == IOT_PROV_FIELD_WIFI_SSID);
+    CHECK(iot_prov_get_status(&session, 101U, &status) == IOT_PROV_OK);
+    CHECK(status.state == IOT_PROV_STATE_WAITING);
+
+    init_session(&session);
+    CHECK(iot_prov_note_test_rate_limit(&session, 200U) == IOT_PROV_OK);
+    request = valid_request();
+    CHECK(iot_prov_queue_test_after_rate_limit_ex(
+              &session, &request, "tmp-qrated", 200U, NULL) == IOT_PROV_OK);
+    CHECK(iot_prov_start_queued(&session, "tmp-qrated", 201U) ==
+          IOT_PROV_OK);
+
+    init_session(&session);
+    CHECK(iot_prov_note_test_rate_limit(&session, 300U) == IOT_PROV_OK);
+    request = valid_request();
+    request.mqtt_port = 0U;
+    CHECK(iot_prov_queue_test_after_rate_limit_ex(
+              &session, &request, "tmp-qbad2", 300U, &detail) ==
+          IOT_PROV_ERR_INVALID_FIELD);
+    for (uint32_t now = 301U; now <= 304U; ++now) {
+        CHECK(iot_prov_note_test_rate_limit(&session, now) == IOT_PROV_OK);
+    }
+    CHECK(iot_prov_note_test_rate_limit(&session, 305U) ==
+          IOT_PROV_ERR_RATE_LIMITED);
+}
+
 int main(void)
 {
     test_initial_state();
@@ -430,6 +596,11 @@ int main(void)
     test_rate_limit();
     test_snapshot_immutable();
     test_new_test_after_failure();
+    test_queued_lifecycle();
+    test_queued_conflicts_and_wrong_worker();
+    test_queued_cancel();
+    test_queued_expiration();
+    test_queue_validation_detail_and_rate_slot();
 
     if (s_failures != 0) {
         printf("%d check(s) failed\n", s_failures);

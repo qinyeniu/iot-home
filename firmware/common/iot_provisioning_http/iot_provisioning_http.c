@@ -18,6 +18,8 @@ static const char *state_name(iot_prov_state_t state)
     switch (state) {
         case IOT_PROV_STATE_WAITING:
             return "waiting";
+        case IOT_PROV_STATE_QUEUED:
+            return "queued";
         case IOT_PROV_STATE_TESTING:
             return "testing";
         case IOT_PROV_STATE_TEST_PASSED:

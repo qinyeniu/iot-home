@@ -39,6 +39,19 @@ static bool same_test_id(const char *left, const char *right)
     return strcmp(left, right) == 0;
 }
 
+static void clear_snapshot(iot_prov_bundle_t *snapshot)
+{
+    volatile unsigned char *p = (volatile unsigned char *)snapshot;
+    size_t i;
+
+    if (snapshot == NULL) {
+        return;
+    }
+    for (i = 0U; i < sizeof(*snapshot); ++i) {
+        p[i] = 0U;
+    }
+}
+
 static void append_error_locked(iot_prov_session_t *session,
                                 iot_prov_error_t code,
                                 iot_prov_field_t field)
@@ -59,7 +72,7 @@ static void set_waiting_locked(iot_prov_session_t *session)
     session->test_active = false;
     session->test_id[0] = '\0';
     session->started_at_ms = 0U;
-    memset(&session->snapshot, 0, sizeof(session->snapshot));
+    clear_snapshot(&session->snapshot);
     session->error_count = 0U;
 }
 
@@ -72,7 +85,7 @@ static void fail_current_locked(iot_prov_session_t *session,
     session->test_active = false;
     session->test_id[0] = '\0';
     session->started_at_ms = 0U;
-    memset(&session->snapshot, 0, sizeof(session->snapshot));
+    clear_snapshot(&session->snapshot);
 }
 
 static bool label_is_valid(const char *value, size_t max_len)
@@ -294,7 +307,8 @@ static void expire_if_due_locked(iot_prov_session_t *session,
         return;
     }
 
-    if (session->state == IOT_PROV_STATE_TESTING) {
+    if (session->state == IOT_PROV_STATE_QUEUED ||
+        session->state == IOT_PROV_STATE_TESTING) {
         if (session->wifi == IOT_PROV_STEP_PENDING) {
             session->wifi = IOT_PROV_STEP_FAILED;
         }
@@ -338,6 +352,7 @@ static iot_prov_error_t begin_impl(
     const char *test_id,
     uint32_t now_ms,
     bool rate_limit_already_noted,
+    bool queue_only,
     iot_prov_error_info_t *error_detail)
 {
     char mqtt_uri[161];
@@ -361,7 +376,8 @@ static iot_prov_error_t begin_impl(
         }
     }
 
-    if (session->state == IOT_PROV_STATE_TESTING ||
+    if (session->state == IOT_PROV_STATE_QUEUED ||
+        session->state == IOT_PROV_STATE_TESTING ||
         session->state == IOT_PROV_STATE_TEST_PASSED) {
         validation_detail_set(error_detail, IOT_PROV_ERR_TEST_ACTIVE,
                               IOT_PROV_FIELD_NONE);
@@ -386,7 +402,8 @@ static iot_prov_error_t begin_impl(
     }
 
     set_waiting_locked(session);
-    session->state = IOT_PROV_STATE_TESTING;
+    session->state = queue_only ? IOT_PROV_STATE_QUEUED
+                                : IOT_PROV_STATE_TESTING;
     session->input = IOT_PROV_STEP_PASSED;
     session->wifi = IOT_PROV_STEP_PENDING;
     session->mqtt = IOT_PROV_STEP_PENDING;
@@ -429,7 +446,8 @@ iot_prov_error_t iot_prov_begin_ex(
     uint32_t now_ms,
     iot_prov_error_info_t *error_detail)
 {
-    return begin_impl(session, request, test_id, now_ms, false, error_detail);
+    return begin_impl(session, request, test_id, now_ms, false, false,
+                      error_detail);
 }
 
 iot_prov_error_t iot_prov_begin_after_rate_limit_ex(
@@ -439,7 +457,8 @@ iot_prov_error_t iot_prov_begin_after_rate_limit_ex(
     uint32_t now_ms,
     iot_prov_error_info_t *error_detail)
 {
-    return begin_impl(session, request, test_id, now_ms, true, error_detail);
+    return begin_impl(session, request, test_id, now_ms, true, false,
+                      error_detail);
 }
 iot_prov_error_t iot_prov_begin(
     iot_prov_session_t *session,
@@ -448,6 +467,57 @@ iot_prov_error_t iot_prov_begin(
     uint32_t now_ms)
 {
     return iot_prov_begin_ex(session, request, test_id, now_ms, NULL);
+}
+
+iot_prov_error_t iot_prov_queue_test_ex(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms,
+    iot_prov_error_info_t *error_detail)
+{
+    return begin_impl(session, request, test_id, now_ms, false, true,
+                      error_detail);
+}
+
+iot_prov_error_t iot_prov_queue_test_after_rate_limit_ex(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms,
+    iot_prov_error_info_t *error_detail)
+{
+    return begin_impl(session, request, test_id, now_ms, true, true,
+                      error_detail);
+}
+
+iot_prov_error_t iot_prov_queue_test(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms)
+{
+    return iot_prov_queue_test_ex(session, request, test_id, now_ms, NULL);
+}
+
+iot_prov_error_t iot_prov_start_queued(
+    iot_prov_session_t *session,
+    const char *test_id,
+    uint32_t now_ms)
+{
+    if (session == NULL || !session->initialized || test_id == NULL) {
+        return IOT_PROV_ERR_INVALID_ARG;
+    }
+
+    expire_if_due_locked(session, now_ms);
+    if (!session->test_active ||
+        session->state != IOT_PROV_STATE_QUEUED ||
+        !same_test_id(session->test_id, test_id)) {
+        return IOT_PROV_ERR_TEST_NOT_FOUND;
+    }
+
+    session->state = IOT_PROV_STATE_TESTING;
+    return IOT_PROV_OK;
 }
 
 iot_prov_error_t iot_prov_note_wifi_result(
@@ -573,7 +643,7 @@ iot_prov_error_t iot_prov_commit_succeeded(
     session->test_active = false;
     session->test_id[0] = '\0';
     session->started_at_ms = 0U;
-    memset(&session->snapshot, 0, sizeof(session->snapshot));
+    clear_snapshot(&session->snapshot);
     return IOT_PROV_OK;
 }
 
@@ -604,7 +674,7 @@ iot_prov_error_t iot_prov_commit_failed(
     session->test_active = false;
     session->test_id[0] = '\0';
     session->started_at_ms = 0U;
-    memset(&session->snapshot, 0, sizeof(session->snapshot));
+    clear_snapshot(&session->snapshot);
     return IOT_PROV_OK;
 }
 

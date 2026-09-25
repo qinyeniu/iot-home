@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 02:50（Asia/Shanghai；CQ-5/S1 HTTP 适配器已完成并通过离线加固）
+更新时间：2026-09-26 03:23（Asia/Shanghai；CQ-5/S2 会话 QUEUED 状态已离线完成）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 02:50 状态：CQ-4d 已提交；CQ-5/S1 SoftAP 配网 HTTP 适配器已离线完成，通用错误和 Content-Type 参数兼容已加固，最终复审 C/H/M/L 全 0。默认仍 OFF，服务尚未启动；硬件窗口优先 CQ-4e。
+> 03:23 状态：CQ-5/S2 第一块低风险准备已完成，会话内核支持 QUEUED 状态，最终复审 C/H/M/L 全 0。默认仍 OFF，服务尚未启动；硬件窗口优先 CQ-4e。
 
 ### 1.1 已经验证的主链路
 
@@ -67,6 +67,7 @@
    - 页面 gzip 后约 5.7 KB；网关应用分区剩余约 67 KB，只能按最小 HTTP/SoftAP 分阶段接入；
    - 02:05 已新增 RAM-only 配网会话内核：单测试、5 分钟过期、输入校验、快照与限流；
    - 02:40 已新增离线 HTTP 适配器：四个接口路由、JSON 映射、状态码、全请求限流、敏感 scratch 清理；当前仍未启动 SoftAP/HTTP。
+   - 03:23 会话内核已新增 QUEUED 状态和 queue/start 接口，TTL 从入队开始；真实 provisioning task、APSTA 和 Wi‑Fi 连接尚未接入。
 
 5. **RF policy Flash 去重**
    - 相同 `mode/mpwr` 已存在时跳过 `nvs_set/nvs_commit`；
@@ -214,7 +215,7 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 5. commit handler 未注册时返回 501；handler 失败时会话进入 `error`，不会伪装 committed；响应和日志不回显密码；
 6. 组件非线程安全，真实 HTTP 集成必须单任务调用或加锁；
 7. 默认 OFF bin 仍为 `0x15f540`，实验 ON bin 仍为 `0x162150`；
-8. S2 设计已完成并复审 Approve（C/H/M/L=0）：见 `docs/PROVISIONING_WIFI_TEST_INTEGRATION_DESIGN.md`；真实接入先实现 QUEUED、完整 owner gate、静态命令队列和可主机测试逻辑；真实 `/commit` 必须等待 A/B Bundle 硬件验证。
+8. S2 设计已完成并复审 Approve（C/H/M/L=0）：见 `docs/PROVISIONING_WIFI_TEST_INTEGRATION_DESIGN.md`；会话 QUEUED 状态已离线完成；下一步实现静态命令队列和完整 owner gate；真实 `/commit` 必须等待 A/B Bundle 硬件验证。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；

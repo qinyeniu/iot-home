@@ -3,7 +3,7 @@
 option(RF_COMMAND_QUEUE_ENABLED "Enable experimental RF private command queue" OFF)
 set(RF_CQ_EXTRA_SRCS "")
 if(RF_COMMAND_QUEUE_ENABLED)
-    list(APPEND RF_CQ_EXTRA_SRCS "rf_command_queue.c" "rf_dispatch_plan.c" "rf_background_schedule.c" "rf_background_query_plan.c" "rf_background_set_plan.c" "rf_background_execution_plan.c")
+    list(APPEND RF_CQ_EXTRA_SRCS "rf_command_queue.c" "rf_dispatch_plan.c" "rf_background_schedule.c" "rf_background_query_plan.c" "rf_background_set_plan.c" "rf_background_execution_plan.c" "rf_background_runtime_adapter.c")
     add_compile_definitions(RF_COMMAND_QUEUE_ENABLED=1)
 endif()
 

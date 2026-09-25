@@ -390,6 +390,10 @@ static void rf_cq_consumer_task(void *arg)
         }
         if (member == (QueueSetMemberHandle_t)ctx->queue) {
             if (xQueueReceive(ctx->queue, &cmd, 0) == pdTRUE) {
+                ESP_LOGI(RF_CQ_TAG,
+                         "dequeue id=%lu source=%u cmd=%u",
+                         (unsigned long)cmd.id, (unsigned)cmd.source,
+                         (unsigned)cmd.command);
                 if (s_dispatch_function != NULL) {
                     // The configured integration owns reservation, Zigbee send
                     // and waiting-transaction installation for this one command.
@@ -397,10 +401,14 @@ static void rf_cq_consumer_task(void *arg)
                 } else {
                     // CQ-1 fallback: prove the queue path without calling Zigbee.
                     ESP_LOGI(RF_CQ_TAG,
-                             "queued command id=%lu cmd=%u source=%u; no dispatch function",
-                             (unsigned long)cmd.id, (unsigned)cmd.command,
-                             (unsigned)cmd.source);
+                             "no dispatch function id=%lu",
+                             (unsigned long)cmd.id);
                 }
+                ESP_LOGI(RF_CQ_TAG,
+                         "stack_hwm id=%lu bytes=%u",
+                         (unsigned long)cmd.id,
+                         (unsigned)(uxTaskGetStackHighWaterMark(NULL) *
+                                    sizeof(StackType_t)));
             }
         }
     }
@@ -632,6 +640,13 @@ esp_err_t rf_cq_submit(const rf_dispatch_cmd_t *cmd)
     result = xQueueSend(s_rf_cq_queue, cmd, 0) == pdTRUE
                  ? ESP_OK
                  : ESP_ERR_NO_MEM;
+    if (result == ESP_OK) {
+        ESP_LOGI(RF_CQ_TAG,
+                 "submit id=%lu source=%u cmd=%u queued=%u",
+                 (unsigned long)cmd->id, (unsigned)cmd->source,
+                 (unsigned)cmd->command,
+                 (unsigned)uxQueueMessagesWaiting(s_rf_cq_queue));
+    }
     xSemaphoreGive(lock);
     return result;
 }

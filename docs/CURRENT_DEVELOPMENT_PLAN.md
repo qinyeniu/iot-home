@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 13:41（Asia/Shanghai；CQ-2a 复审通过，准备 CQ-2b 离线开发）
+更新时间：2026-09-25 13:46（Asia/Shanghai；CQ-2a 复审问题清零，准备 CQ-2b 离线开发）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。

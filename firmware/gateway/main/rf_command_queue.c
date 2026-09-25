@@ -167,7 +167,7 @@ rf_cq_result_t rf_cq_validate(const rf_dispatch_cmd_t *cmd)
         cmd->command < RF_CQ_COMMAND_QUERY ||
         cmd->command > RF_CQ_COMMAND_SET ||
         cmd->desired_mode > RF_CQ_MODE_MANUAL ||
-        cmd->created_ms == 0 || cmd->deadline_ms == 0 ||
+        cmd->created_ms == 0 ||
         (int32_t)(cmd->deadline_ms - cmd->created_ms) < 1000) {
         return RF_CQ_ERR_INVALID_ARG;
     }

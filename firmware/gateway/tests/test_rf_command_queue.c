@@ -344,6 +344,20 @@ static void test_tick_wrap_and_zero_backoff(void)
     CHECK(rf_cq_validate(&periodic) == RF_CQ_OK);
     CHECK(rf_cq_evaluate(&periodic, &context) == RF_CQ_OK);
 
+    /* A user TTL can legitimately wrap to deadline zero at the tick origin. */
+    periodic.created_ms = UINT32_MAX - 4999u;
+    periodic.deadline_ms = 0U;
+    context.now_ms = UINT32_MAX - 4000u;
+    CHECK(rf_cq_validate(&periodic) == RF_CQ_OK);
+    CHECK(rf_cq_evaluate(&periodic, &context) == RF_CQ_OK);
+    context.now_ms = 0U;
+    CHECK(rf_cq_evaluate(&periodic, &context) == RF_CQ_ERR_EXPIRED);
+
+    /* Zero deadline remains invalid when its relative TTL is in the past. */
+    periodic.created_ms = 1000U;
+    periodic.deadline_ms = 0U;
+    CHECK(rf_cq_validate(&periodic) == RF_CQ_ERR_INVALID_ARG);
+
     CHECK(rf_cq_time_reached(UINT32_MAX, UINT32_MAX - 100));
     CHECK(rf_cq_time_reached(10, UINT32_MAX - 100));
     CHECK(!rf_cq_time_reached(UINT32_MAX - 200, UINT32_MAX - 100));

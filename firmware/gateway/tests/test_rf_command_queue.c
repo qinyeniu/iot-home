@@ -60,6 +60,12 @@ static void test_request_id_and_validation(void)
                                               RF_CQ_COMMAND_QUERY,
                                               RF_CQ_MODE_AUTO, 0,
                                               RF_CQ_GENERATION_ANY);
+    rf_dispatch_cmd_t empty_periodic = make_cmd(RF_CQ_SOURCE_PERIODIC,
+                                               RF_CQ_COMMAND_QUERY,
+                                               RF_CQ_MODE_AUTO, 0, 10);
+    rf_dispatch_cmd_t empty_auto = make_cmd(RF_CQ_SOURCE_AUTO,
+                                           RF_CQ_COMMAND_SET,
+                                           RF_CQ_MODE_AUTO, -10, 10);
 
     CHECK(rf_cq_request_id_valid("0123456789abcdef"));
     CHECK(!rf_cq_request_id_valid("0123456789abcde"));
@@ -74,6 +80,13 @@ static void test_request_id_and_validation(void)
     CHECK(rf_cq_validate(&bad_power) == RF_CQ_ERR_INVALID_ARG);
     CHECK(rf_cq_validate(&bad_query) == RF_CQ_ERR_INVALID_ARG);
     CHECK(rf_cq_validate(&bad_periodic) == RF_CQ_ERR_INVALID_ARG);
+
+    empty_periodic.request_id[0] = '\0';
+    empty_auto.request_id[0] = '\0';
+    CHECK(rf_cq_validate(&empty_periodic) == RF_CQ_OK);
+    CHECK(rf_cq_validate(&empty_auto) == RF_CQ_OK);
+    empty_periodic.request_id[0] = 'x';
+    CHECK(rf_cq_validate(&empty_periodic) == RF_CQ_ERR_INVALID_ARG);
 
     automatic.ignore_backoff = true;
     CHECK(rf_cq_validate(&automatic) == RF_CQ_ERR_INVALID_ARG);
@@ -129,6 +142,62 @@ static void test_user_command_builders(void)
                                       &manual) == RF_CQ_ERR_INVALID_ARG);
     CHECK(rf_cq_build_user_auto_set(3, 1, "0123456789abcdef", 3000,
                                     &automatic) == RF_CQ_ERR_INVALID_ARG);
+}
+
+static void test_background_command_builders(void)
+{
+    rf_dispatch_cmd_t query;
+    rf_dispatch_cmd_t periodic_manual;
+    rf_dispatch_cmd_t periodic_auto;
+    rf_dispatch_cmd_t automatic;
+
+    CHECK(rf_cq_build_periodic_query(10, 20, 1000,
+                                    &query) == RF_CQ_OK);
+    CHECK(query.source == RF_CQ_SOURCE_PERIODIC);
+    CHECK(query.command == RF_CQ_COMMAND_QUERY);
+    CHECK(query.desired_mode == RF_CQ_MODE_AUTO);
+    CHECK(query.desired_power_dbm == 0);
+    CHECK(query.policy_generation == 20);
+    CHECK(query.request_id[0] == '\0');
+    CHECK(!query.ignore_backoff);
+    CHECK(query.created_ms == 1000);
+    CHECK(query.deadline_ms == 1000 + RF_CQ_BACKGROUND_TTL_MS);
+
+    CHECK(rf_cq_build_periodic_set(11, RF_CQ_MODE_MANUAL, 0, 20, 2000,
+                                  &periodic_manual) == RF_CQ_OK);
+    CHECK(periodic_manual.source == RF_CQ_SOURCE_PERIODIC);
+    CHECK(periodic_manual.command == RF_CQ_COMMAND_SET);
+    CHECK(periodic_manual.desired_mode == RF_CQ_MODE_MANUAL);
+    CHECK(periodic_manual.desired_power_dbm == 0);
+    CHECK(periodic_manual.policy_generation == 20);
+
+    CHECK(rf_cq_build_periodic_set(12, RF_CQ_MODE_AUTO, -10, 20, 3000,
+                                  &periodic_auto) == RF_CQ_OK);
+    CHECK(periodic_auto.desired_mode == RF_CQ_MODE_AUTO);
+    CHECK(periodic_auto.desired_power_dbm == -10);
+
+    CHECK(rf_cq_build_auto_set(13, -10, 20, 4000,
+                              &automatic) == RF_CQ_OK);
+    CHECK(automatic.source == RF_CQ_SOURCE_AUTO);
+    CHECK(automatic.command == RF_CQ_COMMAND_SET);
+    CHECK(automatic.desired_mode == RF_CQ_MODE_AUTO);
+    CHECK(automatic.desired_power_dbm == -10);
+    CHECK(automatic.policy_generation == 20);
+
+    CHECK(rf_cq_build_periodic_query(0, 20, 1000,
+                                    &query) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_periodic_query(10, 0, 1000,
+                                    &query) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_periodic_query(10, RF_CQ_GENERATION_ANY, 1000,
+                                    &query) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_periodic_query(10, 20, 1000,
+                                    NULL) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_periodic_set(11, 2, 0, 20, 2000,
+                                  &periodic_manual) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_periodic_set(11, RF_CQ_MODE_MANUAL, 1, 20, 2000,
+                                  &periodic_manual) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_auto_set(13, 1, 20, 4000,
+                              &automatic) == RF_CQ_ERR_INVALID_ARG);
 }
 
 static void test_fifo_order_capacity_and_wrap(void)
@@ -284,6 +353,7 @@ int main(void)
 {
     test_request_id_and_validation();
     test_user_command_builders();
+    test_background_command_builders();
     test_fifo_order_capacity_and_wrap();
     test_periodic_merge_and_user_order();
     test_evaluation_rules();

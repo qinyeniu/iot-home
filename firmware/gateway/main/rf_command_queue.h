@@ -11,6 +11,7 @@
 
 #define RF_CQ_CAPACITY 8u
 #define RF_CQ_USER_TTL_MS 5000u
+#define RF_CQ_BACKGROUND_TTL_MS 2000u
 #define RF_CQ_REQUEST_ID_LEN 16u
 #define RF_CQ_REQUEST_ID_SIZE 17u
 #define RF_CQ_GENERATION_ANY UINT32_MAX
@@ -96,6 +97,16 @@ rf_cq_result_t rf_cq_build_user_auto_set(uint32_t id, int8_t power_dbm,
                                          const char *request_id,
                                          uint32_t now_ms,
                                          rf_dispatch_cmd_t *cmd);
+rf_cq_result_t rf_cq_build_periodic_query(uint32_t id, uint32_t generation,
+                                          uint32_t now_ms,
+                                          rf_dispatch_cmd_t *cmd);
+rf_cq_result_t rf_cq_build_periodic_set(uint32_t id, rf_cq_mode_t desired_mode,
+                                        int8_t power_dbm, uint32_t generation,
+                                        uint32_t now_ms,
+                                        rf_dispatch_cmd_t *cmd);
+rf_cq_result_t rf_cq_build_auto_set(uint32_t id, int8_t power_dbm,
+                                    uint32_t generation, uint32_t now_ms,
+                                    rf_dispatch_cmd_t *cmd);
 
 void rf_cq_fifo_init(rf_cq_fifo_t *queue);
 uint8_t rf_cq_fifo_count(const rf_cq_fifo_t *queue);

@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 12:14（Asia/Shanghai；干净 4 小时长测 DEGRADED，CQ-2a 离线完成，等待硬件短测窗口）
+更新时间：2026-09-25 12:45（Asia/Shanghai；凭据校验阶段 1a 离线完成，等待硬件短测窗口）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 12:14 状态：07:25 干净 4 小时长测结论为 DEGRADED：无重启/业务黑障，但网关 RF 37 次中 4 次 `ESP_ERR_NO_MEM`。CQ-2a 已默认关闭离线完成，用户命令在实验 ON 时可经队列派发；尚未取得本阶段独立 Approve，硬件短测前需重新复审。
+> 12:45 状态：凭据输入校验阶段 1a 已离线完成并取得复审 Approve；07:25 干净 4 小时长测仍为 DEGRADED，CQ-2a 默认 OFF，硬件短测前仍需重新复审。
 
 ### 1.1 已经验证的主链路
 
@@ -103,6 +103,12 @@
    - 新增独立目标测试工程 `firmware/gateway/tests/target_lifecycle/`，离线构建 PASS；真实硬件运行留待后续硬件窗口；
    - 默认 `RF_COMMAND_QUEUE_ENABLED=OFF`，`main.c` 未调用，设备运行路径不变；
    - 普通模式与 `-DNDEBUG` 主机测试均 PASS；网关临时 ON 构建通过后已恢复 OFF，复审 **Approve**。
+11. **凭据输入校验阶段 1a（未接入运行路径）**
+    - 新增主机可测试的长度、NUL、ASCII C0/DEL 控制字符和 MQTT UTF-8 校验；
+    - 通用文本 API 使用显式容量，避免未终止输入造成越界读取；
+    - Wi‑Fi SSID/密码按 octet string 处理，MQTT 字段拒绝非法 UTF-8、surrogate 和 Unicode C1 控制字符；
+    - 普通模式与 -DNDEBUG 主机测试均 PASS；独立复审 **Approve**；
+    - 当前不接入 main.c、不改变 NVS 格式，后续 SoftAP 请求解析层应先复用该校验。
 
 ## 2. 当前主要风险
 

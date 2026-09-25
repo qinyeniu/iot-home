@@ -12,19 +12,13 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "iot_product_config_limits.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define IOT_PRODUCT_CONFIG_NAMESPACE "iotcfg"
-
-#define IOT_WIFI_SSID_MAX_LEN              32
-#define IOT_WIFI_PASSWORD_MAX_LEN          63
-#define IOT_MQTT_URI_MAX_LEN              160
-#define IOT_MQTT_USERNAME_MAX_LEN          64
-#define IOT_MQTT_PASSWORD_MAX_LEN          64
-#define IOT_MQTT_CLIENT_ID_MAX_LEN         64
 
 typedef struct {
     char ssid[IOT_WIFI_SSID_MAX_LEN + 1];

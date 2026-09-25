@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 13:18（Asia/Shanghai；凭据校验与 Flash 写入策略离线完成，等待硬件短测窗口）
+更新时间：2026-09-25 13:36（Asia/Shanghai；凭据/Flash/电池低功耗离线推进，等待硬件短测窗口）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -122,6 +122,12 @@
     - 强制模式只能跳过批量/年龄/间隔，不能突破写入预算；
     - 支持 32 位毫秒计数回绕；普通与 `-DNDEBUG` 主机测试 PASS；
     - 未写 Flash、未改分区表、未改变 RAM outbox；独立复审 **Approve**。
+
+14. **电池低功耗路线与唤醒调度（未接入运行路径）**
+    - 新增电池低功耗路线，先实测电流、对齐 sample/poll、门控外设，再评估 deep sleep；
+    - 新增纯 C 唤醒策略，输出入网、poll、采样、合并唤醒和本地事件；
+    - 普通与 `-DNDEBUG` 主机测试 PASS，覆盖过期 deadline、tick 回绕和本地事件合并；不改变现网节点/前后端 API；
+    - 独立复审最终 **Approve**，High/Medium/Low 均为 0。
 
 ## 2. 当前主要风险
 ### P0（历史证据）：烧录前 2 小时节点出现网关下行持续失败

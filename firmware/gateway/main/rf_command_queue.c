@@ -42,6 +42,65 @@ bool rf_cq_supported_power(int8_t power_dbm)
     return false;
 }
 
+static rf_cq_result_t rf_cq_build_user_base(uint32_t id,
+                                            rf_cq_command_t command,
+                                            rf_cq_mode_t desired_mode,
+                                            int8_t desired_power_dbm,
+                                            const char *request_id,
+                                            uint32_t now_ms,
+                                            rf_dispatch_cmd_t *cmd)
+{
+    if (cmd == NULL) {
+        return RF_CQ_ERR_INVALID_ARG;
+    }
+    if (id == 0 || now_ms == 0 || !rf_cq_request_id_valid(request_id)) {
+        return RF_CQ_ERR_INVALID_ARG;
+    }
+    if (!rf_cq_supported_power(desired_power_dbm)) {
+        return RF_CQ_ERR_INVALID_ARG;
+    }
+
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->id = id;
+    cmd->source = RF_CQ_SOURCE_USER;
+    cmd->command = command;
+    cmd->desired_mode = desired_mode;
+    cmd->desired_power_dbm = desired_power_dbm;
+    cmd->policy_generation = RF_CQ_GENERATION_ANY;
+    memcpy(cmd->request_id, request_id, RF_CQ_REQUEST_ID_LEN);
+    cmd->request_id[RF_CQ_REQUEST_ID_LEN] = '\0';
+    cmd->created_ms = now_ms;
+    cmd->deadline_ms = now_ms + RF_CQ_USER_TTL_MS;
+    cmd->ignore_backoff = true;
+    return rf_cq_validate(cmd);
+}
+
+rf_cq_result_t rf_cq_build_user_query(uint32_t id, const char *request_id,
+                                      uint32_t now_ms,
+                                      rf_dispatch_cmd_t *cmd)
+{
+    return rf_cq_build_user_base(id, RF_CQ_COMMAND_QUERY, RF_CQ_MODE_AUTO,
+                                 0, request_id, now_ms, cmd);
+}
+
+rf_cq_result_t rf_cq_build_user_manual_set(uint32_t id, int8_t power_dbm,
+                                           const char *request_id,
+                                           uint32_t now_ms,
+                                           rf_dispatch_cmd_t *cmd)
+{
+    return rf_cq_build_user_base(id, RF_CQ_COMMAND_SET, RF_CQ_MODE_MANUAL,
+                                 power_dbm, request_id, now_ms, cmd);
+}
+
+rf_cq_result_t rf_cq_build_user_auto_set(uint32_t id, int8_t power_dbm,
+                                         const char *request_id,
+                                         uint32_t now_ms,
+                                         rf_dispatch_cmd_t *cmd)
+{
+    return rf_cq_build_user_base(id, RF_CQ_COMMAND_SET, RF_CQ_MODE_AUTO,
+                                 power_dbm, request_id, now_ms, cmd);
+}
+
 rf_cq_result_t rf_cq_validate(const rf_dispatch_cmd_t *cmd)
 {
     if (cmd == NULL || cmd->request_id[RF_CQ_REQUEST_ID_LEN] != '\0' ||

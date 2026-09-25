@@ -82,6 +82,55 @@ static void test_request_id_and_validation(void)
     CHECK(rf_cq_validate(&automatic) == RF_CQ_ERR_INVALID_ARG);
 }
 
+static void test_user_command_builders(void)
+{
+    rf_dispatch_cmd_t query;
+    rf_dispatch_cmd_t manual;
+    rf_dispatch_cmd_t automatic;
+
+    CHECK(rf_cq_build_user_query(1, "0123456789abcdef", 1000,
+                                 &query) == RF_CQ_OK);
+    CHECK(query.id == 1);
+    CHECK(query.source == RF_CQ_SOURCE_USER);
+    CHECK(query.command == RF_CQ_COMMAND_QUERY);
+    CHECK(query.desired_mode == RF_CQ_MODE_AUTO);
+    CHECK(query.desired_power_dbm == 0);
+    CHECK(query.policy_generation == RF_CQ_GENERATION_ANY);
+    CHECK(query.created_ms == 1000);
+    CHECK(query.deadline_ms == 1000 + RF_CQ_USER_TTL_MS);
+    CHECK(query.ignore_backoff);
+    CHECK(strcmp(query.request_id, "0123456789abcdef") == 0);
+
+    CHECK(rf_cq_build_user_manual_set(2, 0, "0123456789abcdef", 2000,
+                                      &manual) == RF_CQ_OK);
+    CHECK(manual.command == RF_CQ_COMMAND_SET);
+    CHECK(manual.desired_mode == RF_CQ_MODE_MANUAL);
+    CHECK(manual.desired_power_dbm == 0);
+    CHECK(manual.created_ms == 2000);
+    CHECK(manual.deadline_ms == 2000 + RF_CQ_USER_TTL_MS);
+
+    CHECK(rf_cq_build_user_auto_set(3, -10, "0123456789abcdef", 3000,
+                                    &automatic) == RF_CQ_OK);
+    CHECK(automatic.command == RF_CQ_COMMAND_SET);
+    CHECK(automatic.desired_mode == RF_CQ_MODE_AUTO);
+    CHECK(automatic.desired_power_dbm == -10);
+    CHECK(automatic.created_ms == 3000);
+    CHECK(automatic.deadline_ms == 3000 + RF_CQ_USER_TTL_MS);
+
+    CHECK(rf_cq_build_user_query(0, "0123456789abcdef", 1000,
+                                 &query) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_user_query(1, "0123456789abcdef", 0,
+                                 &query) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_user_query(1, "0123456789abcde", 1000,
+                                 &query) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_user_query(1, "0123456789abcdef", 1000,
+                                 NULL) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_user_manual_set(2, 1, "0123456789abcdef", 2000,
+                                      &manual) == RF_CQ_ERR_INVALID_ARG);
+    CHECK(rf_cq_build_user_auto_set(3, 1, "0123456789abcdef", 3000,
+                                    &automatic) == RF_CQ_ERR_INVALID_ARG);
+}
+
 static void test_fifo_order_capacity_and_wrap(void)
 {
     rf_cq_fifo_t queue;
@@ -234,6 +283,7 @@ static void test_tick_wrap_and_zero_backoff(void)
 int main(void)
 {
     test_request_id_and_validation();
+    test_user_command_builders();
     test_fifo_order_capacity_and_wrap();
     test_periodic_merge_and_user_order();
     test_evaluation_rules();

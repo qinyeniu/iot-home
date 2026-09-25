@@ -162,7 +162,8 @@ rf_cq_result_t rf_cq_validate(const rf_dispatch_cmd_t *cmd)
 {
     bool request_id_ok;
 
-    if (cmd == NULL || cmd->request_id[RF_CQ_REQUEST_ID_LEN] != '\0' ||
+    if (cmd == NULL || cmd->id == 0U ||
+        cmd->request_id[RF_CQ_REQUEST_ID_LEN] != '\0' ||
         cmd->source > RF_CQ_SOURCE_AUTO ||
         cmd->command < RF_CQ_COMMAND_QUERY ||
         cmd->command > RF_CQ_COMMAND_SET ||
@@ -189,6 +190,7 @@ rf_cq_result_t rf_cq_validate(const rf_dispatch_cmd_t *cmd)
         // Periodic reconcile and automatic power changes are background work:
         // they carry a concrete generation and must respect RF backoff.
         if (cmd->ignore_backoff ||
+            cmd->policy_generation == 0U ||
             cmd->policy_generation == RF_CQ_GENERATION_ANY) {
             return RF_CQ_ERR_INVALID_ARG;
         }

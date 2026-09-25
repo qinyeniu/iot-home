@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 10:18（Asia/Shanghai；CQ-1 生命周期加固完成，干净 4 小时观察进行中）
+更新时间：2026-09-25 10:25（Asia/Shanghai；干净长测 3 小时 DEGRADED，等待 4 小时报告）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 10:18 状态：COM6 已运行 generation guard；短序列 PASS，正常物理拔节点已复测通过。CQ-1 RF 队列默认关闭，生命周期与目标测试脚手架已完成并复审 Approve；07:25 的干净 4 小时被动观察进行中。
+> 10:25 状态：COM6 已运行 generation guard；短序列 PASS，正常物理拔节点已复测通过。CQ-1 生命周期加固已复审 Approve；07:25 长测 3 小时为 DEGRADED，无重启/黑障，RF 33/35 成功、2 次 ESP_ERR_NO_MEM。
 
 ### 1.1 已经验证的主链路
 

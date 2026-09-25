@@ -158,6 +158,33 @@ iot_prov_error_t iot_prov_begin(
     const char *test_id,
     uint32_t now_ms);
 
+/**
+ * Same as iot_prov_begin, but optionally returns the precise validation error
+ * code and field for HTTP response mapping.
+ */
+iot_prov_error_t iot_prov_begin_ex(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms,
+    iot_prov_error_info_t *error_detail);
+
+/** Consume one POST /test rate-limit slot before protocol-level validation. */
+iot_prov_error_t iot_prov_note_test_rate_limit(
+    iot_prov_session_t *session,
+    uint32_t now_ms);
+
+/**
+ * Begin after iot_prov_note_test_rate_limit() has already consumed a slot.
+ * Used by the HTTP adapter so malformed requests are still rate limited.
+ */
+iot_prov_error_t iot_prov_begin_after_rate_limit_ex(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms,
+    iot_prov_error_info_t *error_detail);
+
 /** Report the Wi-Fi test result for the active test. */
 iot_prov_error_t iot_prov_note_wifi_result(
     iot_prov_session_t *session,
@@ -215,5 +242,3 @@ iot_prov_error_t iot_prov_get_status(
 #ifdef __cplusplus
 }
 #endif
-
-

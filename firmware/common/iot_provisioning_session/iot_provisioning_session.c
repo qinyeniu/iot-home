@@ -134,17 +134,21 @@ static bool validate_gateway_id(const char *gateway_id)
     return true;
 }
 
-static iot_prov_error_t map_credentials_error(
-    iot_credentials_error_t error)
+static void validation_detail_set(iot_prov_error_info_t *detail,
+                                   iot_prov_error_t code,
+                                   iot_prov_field_t field)
 {
-    return error == IOT_CREDENTIALS_OK ? IOT_PROV_OK
-                                       : IOT_PROV_ERR_INVALID_FIELD;
+    if (detail != NULL) {
+        detail->code = code;
+        detail->field = field;
+    }
 }
 
 static iot_prov_error_t validate_request(
     const iot_prov_request_t *request,
     char *mqtt_uri,
-    size_t mqtt_uri_size)
+    size_t mqtt_uri_size,
+    iot_prov_error_info_t *detail)
 {
     iot_credentials_field_t failed_field = IOT_CREDENTIALS_FIELD_NONE;
     iot_credentials_error_t credentials_error;
@@ -157,6 +161,8 @@ static iot_prov_error_t validate_request(
         IOT_PROV_AP_SSID_MAX_LEN, true, false,
         IOT_CREDENTIALS_FIELD_WIFI_SSID, &failed_field);
     if (credentials_error != IOT_CREDENTIALS_OK) {
+        validation_detail_set(detail, IOT_PROV_ERR_INVALID_FIELD,
+                              IOT_PROV_FIELD_WIFI_SSID);
         return IOT_PROV_ERR_INVALID_FIELD;
     }
 
@@ -164,24 +170,34 @@ static iot_prov_error_t validate_request(
                                        sizeof(request->wifi_password));
     if (request->open_network) {
         if (wifi_password_len != 0U) {
+            validation_detail_set(detail, IOT_PROV_ERR_INVALID_FIELD,
+                                  IOT_PROV_FIELD_WIFI_PASSWORD);
             return IOT_PROV_ERR_INVALID_FIELD;
         }
     } else {
         if (wifi_password_len < 8U || wifi_password_len > 63U) {
+            validation_detail_set(detail, IOT_PROV_ERR_INVALID_FIELD,
+                                  IOT_PROV_FIELD_WIFI_PASSWORD);
             return IOT_PROV_ERR_INVALID_FIELD;
         }
         credentials_error = iot_credentials_validate_text(
             request->wifi_password, sizeof(request->wifi_password), 63U,
             true, false, IOT_CREDENTIALS_FIELD_WIFI_PASSWORD, &failed_field);
         if (credentials_error != IOT_CREDENTIALS_OK) {
-            return map_credentials_error(credentials_error);
+            validation_detail_set(detail, IOT_PROV_ERR_INVALID_FIELD,
+                                  IOT_PROV_FIELD_WIFI_PASSWORD);
+            return IOT_PROV_ERR_INVALID_FIELD;
         }
     }
 
     if (request->mqtt_tls) {
+        validation_detail_set(detail, IOT_PROV_ERR_TLS_NOT_CONFIGURED,
+                              IOT_PROV_FIELD_MQTT_TLS);
         return IOT_PROV_ERR_TLS_NOT_CONFIGURED;
     }
     if (request->mqtt_port == 0U) {
+        validation_detail_set(detail, IOT_PROV_ERR_INVALID_FIELD,
+                              IOT_PROV_FIELD_MQTT_PORT);
         return IOT_PROV_ERR_INVALID_FIELD;
     }
 
@@ -190,6 +206,8 @@ static iot_prov_error_t validate_request(
         IOT_PROV_MQTT_HOST_MAX_LEN, true, false,
         IOT_CREDENTIALS_FIELD_MQTT_URI, &failed_field);
     if (credentials_error != IOT_CREDENTIALS_OK) {
+        validation_detail_set(detail, IOT_PROV_ERR_INVALID_FIELD,
+                              IOT_PROV_FIELD_MQTT_HOST);
         return IOT_PROV_ERR_INVALID_FIELD;
     }
 
@@ -197,6 +215,8 @@ static iot_prov_error_t validate_request(
         request->mqtt_username, sizeof(request->mqtt_username), 64U,
         false, true, IOT_CREDENTIALS_FIELD_MQTT_USERNAME, &failed_field);
     if (credentials_error != IOT_CREDENTIALS_OK) {
+        validation_detail_set(detail, IOT_PROV_ERR_INVALID_FIELD,
+                              IOT_PROV_FIELD_MQTT_USERNAME);
         return IOT_PROV_ERR_INVALID_FIELD;
     }
 
@@ -204,28 +224,35 @@ static iot_prov_error_t validate_request(
         request->mqtt_password, sizeof(request->mqtt_password), 64U,
         false, true, IOT_CREDENTIALS_FIELD_MQTT_PASSWORD, &failed_field);
     if (credentials_error != IOT_CREDENTIALS_OK) {
+        validation_detail_set(detail, IOT_PROV_ERR_INVALID_FIELD,
+                              IOT_PROV_FIELD_MQTT_PASSWORD);
         return IOT_PROV_ERR_INVALID_FIELD;
     }
 
     if (!validate_gateway_id(request->gateway_id)) {
+        validation_detail_set(detail, IOT_PROV_ERR_INVALID_FIELD,
+                              IOT_PROV_FIELD_GATEWAY_ID);
         return IOT_PROV_ERR_INVALID_FIELD;
     }
 
     uri_len = snprintf(mqtt_uri, mqtt_uri_size, "mqtt://%s:%u",
                        request->mqtt_host, (unsigned)request->mqtt_port);
     if (uri_len < 0 || (size_t)uri_len >= mqtt_uri_size) {
+        validation_detail_set(detail, IOT_PROV_ERR_INVALID_FIELD,
+                              IOT_PROV_FIELD_MQTT_HOST);
         return IOT_PROV_ERR_INVALID_FIELD;
     }
 
     uri_error = iot_mqtt_uri_validate(mqtt_uri, mqtt_uri_size);
-    switch (uri_error) {
-        case IOT_MQTT_URI_OK:
-            return IOT_PROV_OK;
-        case IOT_MQTT_URI_ERR_PORT:
-            return IOT_PROV_ERR_INVALID_FIELD;
-        default:
-            return IOT_PROV_ERR_INVALID_FIELD;
+    if (uri_error == IOT_MQTT_URI_OK) {
+        return IOT_PROV_OK;
     }
+    validation_detail_set(detail,
+                          IOT_PROV_ERR_INVALID_FIELD,
+                          uri_error == IOT_MQTT_URI_ERR_PORT
+                              ? IOT_PROV_FIELD_MQTT_PORT
+                              : IOT_PROV_FIELD_MQTT_HOST);
+    return IOT_PROV_ERR_INVALID_FIELD;
 }
 
 static iot_prov_error_t rate_limit_note_locked(iot_prov_session_t *session,
@@ -305,37 +332,55 @@ iot_prov_error_t iot_prov_session_init(
     return IOT_PROV_OK;
 }
 
-iot_prov_error_t iot_prov_begin(
+static iot_prov_error_t begin_impl(
     iot_prov_session_t *session,
     const iot_prov_request_t *request,
     const char *test_id,
-    uint32_t now_ms)
+    uint32_t now_ms,
+    bool rate_limit_already_noted,
+    iot_prov_error_info_t *error_detail)
 {
     char mqtt_uri[161];
     iot_prov_error_t error;
 
+    if (error_detail != NULL) {
+        error_detail->code = IOT_PROV_OK;
+        error_detail->field = IOT_PROV_FIELD_NONE;
+    }
     if (session == NULL || !session->initialized || request == NULL) {
+        validation_detail_set(error_detail, IOT_PROV_ERR_INVALID_ARG,
+                              IOT_PROV_FIELD_NONE);
         return IOT_PROV_ERR_INVALID_ARG;
     }
 
-    error = rate_limit_note_locked(session, now_ms);
-    if (error != IOT_PROV_OK) {
-        return error;
+    if (!rate_limit_already_noted) {
+        error = rate_limit_note_locked(session, now_ms);
+        if (error != IOT_PROV_OK) {
+            validation_detail_set(error_detail, error, IOT_PROV_FIELD_NONE);
+            return error;
+        }
     }
 
     if (session->state == IOT_PROV_STATE_TESTING ||
         session->state == IOT_PROV_STATE_TEST_PASSED) {
+        validation_detail_set(error_detail, IOT_PROV_ERR_TEST_ACTIVE,
+                              IOT_PROV_FIELD_NONE);
         return IOT_PROV_ERR_TEST_ACTIVE;
     }
     if (session->state == IOT_PROV_STATE_COMMITTED ||
         session->state == IOT_PROV_STATE_ERROR) {
+        validation_detail_set(error_detail, IOT_PROV_ERR_INVALID_STATE,
+                              IOT_PROV_FIELD_NONE);
         return IOT_PROV_ERR_INVALID_STATE;
     }
     if (!validate_test_id(test_id)) {
+        validation_detail_set(error_detail, IOT_PROV_ERR_INVALID_ARG,
+                              IOT_PROV_FIELD_NONE);
         return IOT_PROV_ERR_INVALID_ARG;
     }
 
-    error = validate_request(request, mqtt_uri, sizeof(mqtt_uri));
+    error = validate_request(request, mqtt_uri, sizeof(mqtt_uri),
+                            error_detail);
     if (error != IOT_PROV_OK) {
         return error;
     }
@@ -365,6 +410,44 @@ iot_prov_error_t iot_prov_begin(
               sizeof(session->snapshot.mqtt_client_id),
               request->gateway_id);
     return IOT_PROV_OK;
+}
+
+iot_prov_error_t iot_prov_note_test_rate_limit(
+    iot_prov_session_t *session,
+    uint32_t now_ms)
+{
+    if (session == NULL || !session->initialized) {
+        return IOT_PROV_ERR_INVALID_ARG;
+    }
+    return rate_limit_note_locked(session, now_ms);
+}
+
+iot_prov_error_t iot_prov_begin_ex(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms,
+    iot_prov_error_info_t *error_detail)
+{
+    return begin_impl(session, request, test_id, now_ms, false, error_detail);
+}
+
+iot_prov_error_t iot_prov_begin_after_rate_limit_ex(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms,
+    iot_prov_error_info_t *error_detail)
+{
+    return begin_impl(session, request, test_id, now_ms, true, error_detail);
+}
+iot_prov_error_t iot_prov_begin(
+    iot_prov_session_t *session,
+    const iot_prov_request_t *request,
+    const char *test_id,
+    uint32_t now_ms)
+{
+    return iot_prov_begin_ex(session, request, test_id, now_ms, NULL);
 }
 
 iot_prov_error_t iot_prov_note_wifi_result(

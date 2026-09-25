@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 02:05（Asia/Shanghai；CQ-5/S0 已完成 SoftAP 配网会话内核）
+更新时间：2026-09-26 02:40（Asia/Shanghai；CQ-5/S1 已完成 SoftAP 配网 HTTP 适配器）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 02:05 状态：CQ-4d 已提交；CQ-5/S0 SoftAP 配网会话内核已离线完成并复审 Approve。默认仍 OFF，下一步可离线做 HTTP 适配；硬件窗口优先 CQ-4e。
+> 02:40 状态：CQ-4d 已提交；CQ-5/S1 SoftAP 配网 HTTP 适配器已离线完成并复审 Approve。默认仍 OFF，服务尚未启动；硬件窗口优先 CQ-4e，硬件继续断开时可准备 S2 设计。
 
 ### 1.1 已经验证的主链路
 
@@ -65,7 +65,8 @@
    - 静态页面：`docs/provisioning/softap-prototype.html`；
    - 接口契约：`docs/SOFTAP_PROVISIONING_API_CONTRACT.md`；
    - 页面 gzip 后约 5.7 KB；网关应用分区剩余约 67 KB，只能按最小 HTTP/SoftAP 分阶段接入；
-   - 02:05 已新增 RAM-only 配网会话内核：单测试、5 分钟过期、输入校验、快照与限流；当前尚未启动 SoftAP/HTTP。
+   - 02:05 已新增 RAM-only 配网会话内核：单测试、5 分钟过期、输入校验、快照与限流；
+   - 02:40 已新增离线 HTTP 适配器：四个接口路由、JSON 映射、状态码、全请求限流、敏感 scratch 清理；当前仍未启动 SoftAP/HTTP。
 
 5. **RF policy Flash 去重**
    - 相同 `mode/mpwr` 已存在时跳过 `nvs_set/nvs_commit`；
@@ -204,13 +205,15 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 5. CQ-4e 硬件短测按 `docs/RF_CQ_SHORT_TEST_RUNBOOK.md` 和 `docs/RF_CQ_4_INTEGRATION_CONTRACT.md` 执行；
 6. 硬件窗口只烧录 COM6 应用区；不与 SoftAP、NVS A/B 运行时接入、TLS/VPN 或前后端改动混做。
 
-### 阶段 A3：CQ-5/S0 已完成，硬件断开时可继续 S1
+### 阶段 A3：CQ-5/S1 已完成，真实接入仍需等待
 
-1. 新增独立组件 `firmware/common/iot_provisioning_session`，但不接入 `main.c`；
-2. 会话内核只保存在 RAM，负责单测试上下文、字段校验、5 分钟过期、通过后快照和请求限流；
-3. 已明确 test_id 不得复用，组件非线程安全，HTTP 层必须单任务调用或加锁；
-4. 默认 OFF bin 仍为 `0x15f540`，实验 ON bin 仍为 `0x162150`；
-5. 下一步 S1 只设计/实现 HTTP 适配层与状态映射，不启动服务、不写 NVS；真正 `/commit` 必须等待 A/B Bundle 硬件验证。
+1. S0 新增独立组件 `firmware/common/iot_provisioning_session`，只保存在 RAM，负责单测试上下文、字段校验、5 分钟过期、通过后快照和请求限流；
+2. S1 新增独立组件 `firmware/common/iot_provisioning_http`，支持 `/status`、`/test`、`/commit`、`/cancel` 的路由、JSON 映射和状态响应；
+3. 所有 POST `/test` 均在协议解析前限流，畸形 JSON、415、413、空 body 和字段错误都不能绕过；
+4. commit handler 未注册时返回 501；handler 失败时会话进入 `error`，不会伪装 committed；响应和日志不回显密码；
+5. 组件非线程安全，真实 HTTP 集成必须单任务调用或加锁；
+6. 默认 OFF bin 仍为 `0x15f540`，实验 ON bin 仍为 `0x162150`；
+7. 下一步不直接启动服务：S2 先设计真实 Wi‑Fi 临时连接和回退，真实 `/commit` 必须等待 A/B Bundle 硬件验证。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；

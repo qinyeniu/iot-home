@@ -161,6 +161,11 @@ static cJSON *named_error_body(const char *state, iot_prov_error_t code,
 
 static cJSON *error_body(iot_prov_error_t code, iot_prov_field_t field)
 {
+    return named_error_body("error", code, field);
+}
+
+static cJSON *test_error_body(iot_prov_error_t code, iot_prov_field_t field)
+{
     return named_error_body("test_failed", code, field);
 }
 
@@ -212,8 +217,13 @@ static iot_prov_error_t build_current_status(
 
 static bool is_json_content_type(const char *content_type)
 {
-    return content_type != NULL &&
-           strcmp(content_type, "application/json") == 0;
+    if (content_type == NULL) {
+        return false;
+    }
+    if (strcmp(content_type, "application/json") == 0) {
+        return true;
+    }
+    return strncmp(content_type, "application/json;", 17) == 0;
 }
 
 static void clear_parse_scratch(iot_http_adapter_t *adapter)
@@ -416,7 +426,7 @@ static iot_prov_error_t handle_test(
                           sizeof(session_request.gateway_id), false,
                           IOT_PROV_FIELD_GATEWAY_ID, &detail)) {
         release_json(adapter, root);
-        (void)send_json(response, 400, error_body(detail.code, detail.field));
+        (void)send_json(response, 400, test_error_body(detail.code, detail.field));
         return IOT_PROV_OK;
     }
 
@@ -427,8 +437,8 @@ static iot_prov_error_t handle_test(
         port_item->valuedouble != (double)(int)port_item->valuedouble) {
         release_json(adapter, root);
         (void)send_json(response, 400,
-                        error_body(IOT_PROV_ERR_INVALID_FIELD,
-                                   IOT_PROV_FIELD_MQTT_PORT));
+                        test_error_body(IOT_PROV_ERR_INVALID_FIELD,
+                                        IOT_PROV_FIELD_MQTT_PORT));
         return IOT_PROV_OK;
     }
     session_request.mqtt_port =
@@ -437,7 +447,7 @@ static iot_prov_error_t handle_test(
     if (!copy_json_bool(root, "mqtt_tls", &session_request.mqtt_tls,
                         IOT_PROV_FIELD_MQTT_TLS, &detail)) {
         release_json(adapter, root);
-        (void)send_json(response, 400, error_body(detail.code, detail.field));
+        (void)send_json(response, 400, test_error_body(detail.code, detail.field));
         return IOT_PROV_OK;
     }
     release_json(adapter, root);

@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 02:40（Asia/Shanghai；CQ-5/S1 已完成 SoftAP 配网 HTTP 适配器）
+更新时间：2026-09-26 02:50（Asia/Shanghai；CQ-5/S1 HTTP 适配器已完成并通过离线加固）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 02:40 状态：CQ-4d 已提交；CQ-5/S1 SoftAP 配网 HTTP 适配器已离线完成并复审 Approve。默认仍 OFF，服务尚未启动；硬件窗口优先 CQ-4e，硬件继续断开时可准备 S2 设计。
+> 02:50 状态：CQ-4d 已提交；CQ-5/S1 SoftAP 配网 HTTP 适配器已离线完成，通用错误和 Content-Type 参数兼容已加固，最终复审 C/H/M/L 全 0。默认仍 OFF，服务尚未启动；硬件窗口优先 CQ-4e。
 
 ### 1.1 已经验证的主链路
 
@@ -209,11 +209,12 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 
 1. S0 新增独立组件 `firmware/common/iot_provisioning_session`，只保存在 RAM，负责单测试上下文、字段校验、5 分钟过期、通过后快照和请求限流；
 2. S1 新增独立组件 `firmware/common/iot_provisioning_http`，支持 `/status`、`/test`、`/commit`、`/cancel` 的路由、JSON 映射和状态响应；
-3. 所有 POST `/test` 均在协议解析前限流，畸形 JSON、415、413、空 body 和字段错误都不能绕过；
-4. commit handler 未注册时返回 501；handler 失败时会话进入 `error`，不会伪装 committed；响应和日志不回显密码；
-5. 组件非线程安全，真实 HTTP 集成必须单任务调用或加锁；
-6. 默认 OFF bin 仍为 `0x15f540`，实验 ON bin 仍为 `0x162150`；
-7. 下一步不直接启动服务：S2 先设计真实 Wi‑Fi 临时连接和回退，真实 `/commit` 必须等待 A/B Bundle 硬件验证。
+3. 所有 POST /test 均在协议解析前限流，畸形 JSON、415、413、空 body 和字段错误都不能绕过；
+4. Content-Type 接受 `application/json` 和 `application/json; charset=utf-8`；通用错误 body 使用 `state=error`，字段校验使用 `state=test_failed`；
+5. commit handler 未注册时返回 501；handler 失败时会话进入 `error`，不会伪装 committed；响应和日志不回显密码；
+6. 组件非线程安全，真实 HTTP 集成必须单任务调用或加锁；
+7. 默认 OFF bin 仍为 `0x15f540`，实验 ON bin 仍为 `0x162150`；
+8. 下一步不直接启动服务：S2 先设计真实 Wi‑Fi 临时连接和回退，真实 `/commit` 必须等待 A/B Bundle 硬件验证。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；
@@ -273,5 +274,3 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 - MQTT 安全部署、TLS/WSS 和 VPN 暂不自动执行；
 - 服务器资源需要保留余量，避免后端、MySQL、MQTT、Grafana 或日志占满磁盘/CPU；
 - 所有部署必须准备回退步骤，并避开用户使用网络的时间。
-
-

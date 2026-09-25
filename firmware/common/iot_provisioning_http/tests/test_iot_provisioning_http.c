@@ -79,6 +79,23 @@ static cJSON *response_json(const iot_http_response_t *response)
     return root;
 }
 
+static bool response_state_is(const iot_http_response_t *response,
+                              const char *expected_state)
+{
+    cJSON *root = cJSON_Parse(response->body);
+    cJSON *state;
+    bool matches;
+
+    if (root == NULL) {
+        return false;
+    }
+    state = cJSON_GetObjectItem(root, "state");
+    matches = state != NULL && cJSON_IsString(state) &&
+              strcmp(state->valuestring, expected_state) == 0;
+    cJSON_Delete(root);
+    return matches;
+}
+
 static void init_adapter(iot_http_adapter_t *adapter, uint32_t *counter,
                          iot_http_commit_handler_t handler)
 {
@@ -247,6 +264,7 @@ static void test_missing_commit_handler(void)
     CHECK(iot_http_dispatch(&adapter, &commit_request, &response) ==
           IOT_PROV_OK);
     CHECK(response.status_code == 501);
+    CHECK(response_state_is(&response, "error"));
 }
 
 static void test_routing_errors(void)
@@ -262,9 +280,11 @@ static void test_routing_errors(void)
     init_adapter(&adapter, &counter, commit_success);
     CHECK(iot_http_dispatch(&adapter, &unknown, &response) == IOT_PROV_OK);
     CHECK(response.status_code == 404);
+    CHECK(response_state_is(&response, "error"));
     CHECK(iot_http_dispatch(&adapter, &wrong_method, &response) ==
           IOT_PROV_OK);
     CHECK(response.status_code == 405);
+    CHECK(response_state_is(&response, "error"));
 }
 
 static void test_request_errors(void)
@@ -327,6 +347,22 @@ static void test_request_errors(void)
     }
 }
 
+static void test_content_type_parameters(void)
+{
+    iot_http_adapter_t adapter;
+    iot_http_response_t response;
+    uint32_t counter = 0;
+    iot_http_request_t parameterized = make_request(
+        "POST", "/api/provision/test", "application/json; charset=utf-8",
+        valid_body(), 100U);
+
+    init_adapter(&adapter, &counter, commit_success);
+    CHECK(iot_http_dispatch(&adapter, &parameterized, &response) ==
+          IOT_PROV_OK);
+    CHECK(response.status_code == 202);
+    CHECK(response_state_is(&response, "testing"));
+}
+
 static void test_body_too_large(void)
 {
     iot_http_adapter_t adapter;
@@ -354,6 +390,7 @@ static void test_body_too_large(void)
 
     CHECK(iot_http_dispatch(&adapter, &request, &response) == IOT_PROV_OK);
     CHECK(response.status_code == 413);
+    CHECK(response_state_is(&response, "error"));
     free(large);
 }
 
@@ -497,6 +534,7 @@ int main(void)
     test_missing_commit_handler();
     test_routing_errors();
     test_request_errors();
+    test_content_type_parameters();
     test_body_too_large();
     test_active_and_rate_limit();
     test_invalid_test_requests_rate_limited();

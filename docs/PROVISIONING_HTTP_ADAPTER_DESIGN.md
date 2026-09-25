@@ -81,7 +81,7 @@ JSON 解析完成并释放 cJSON 后，适配器立即清零保存请求体的 R
 }
 ```
 
-错误对象只包含 `code` 和 `field`，不回显用户输入。
+错误对象只包含 code 和 ield，不回显用户输入。通用协议/路由错误使用 state=error；仅测试字段校验失败使用 state=test_failed。
 
 ## 6. commit handler 时间语义
 

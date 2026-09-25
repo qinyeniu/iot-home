@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 13:46（Asia/Shanghai；CQ-2a 复审问题清零，准备 CQ-2b 离线开发）
+更新时间：2026-09-25 13:56（Asia/Shanghai；CQ-2b 纯发送计划完成，等待下一阶段执行集成）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -83,7 +83,7 @@
    - 周期 QUERY、reconcile、自动功率 SET 尚未入队，完整发送所有权收敛仍需 CQ-2b/CQ-3；
    - 已提供 submit/dequeue、栈高水位日志、短测判读脚本和硬件短测手册；
    - 实验 ON bin `0x1604e0`（4% 分区余量），默认 OFF bin `0x15f540`（5% 分区余量）；
-   - 当前阶段多次独立复审未返回有效结论，因此**未取得独立 Approve**。
+   - 独立复审最终 **Approve**；跨 tick deadline Low 已修复，High/Medium/Low 均为 0。
 
 8. **节点诊断 NVS 低磨损保存**
    - `rfctl/txp2` 已保存相同值时跳过 Flash 写入；
@@ -128,6 +128,12 @@
     - 新增纯 C 唤醒策略，输出入网、poll、采样、合并唤醒和本地事件；
     - 普通与 `-DNDEBUG` 主机测试 PASS，覆盖过期 deadline、tick 回绕和本地事件合并；不改变现网节点/前后端 API；
     - 独立复审最终 **Approve**，High/Medium/Low 均为 0。
+
+15. **CQ-2b 纯发送计划（实验 ON，尚未接入）**
+    - 新增消费者发送计划：QUERY waiting/接管、MANUAL 未知先查、AUTO 使用当前功率；
+    - MANUAL/AUTO 可清理旧 waiting；计划模块不调用 FreeRTOS、ZBOSS 或 NVS；
+    - 主机普通/`-DNDEBUG` 测试 PASS；实验 ON、默认 OFF、target_lifecycle 构建 PASS；
+    - 独立复审 **Approve**，High/Medium/Low 均为 0。
 
 ## 2. 当前主要风险
 ### P0（历史证据）：烧录前 2 小时节点出现网关下行持续失败
@@ -186,10 +192,10 @@ CQ-2a 已取得有效独立 Approve；CQ-2b 可离线开发，但 CQ-2b 固件�
 
 1. CQ-2a 已让实验 ON 路径中的用户 QUERY/SET/AUTO 先入队，再由 `rf-dispatch` 消费者派发；
 2. 默认 OFF 现网路径不变；默认 bin `0x15f540`；
-3. CQ-2b 再让消费者直接承担序号预留、Zigbee 发送和等待事务安装；
+3. CQ-2b 纯发送计划已完成并复审 Approve；下一步接入消费者执行、Zigbee 发送和等待事务安装；
 4. CQ-3 最后将周期/自动命令改为入队并停止旧直接发送路径；
 5. 硬件短测按 `docs/RF_CQ_SHORT_TEST_RUNBOOK.md` 执行，判读使用 `tools/analyze_rf_cq_short_test.py`；
-6. CQ-2a 已取得独立 Approve；CQ-2b 代码完成并复审后，才能硬件烧录；
+6. CQ-2a 已取得独立 Approve；CQ-2b 纯发送计划已 Approve，执行集成完成并复审后才能硬件烧录；
 7. 每一步单独构建、主机测试、提交；不得与 SoftAP/NVS A/B 运行时接入混做。
 
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）

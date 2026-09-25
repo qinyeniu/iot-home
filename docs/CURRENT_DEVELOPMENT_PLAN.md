@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 13:00（Asia/Shanghai；凭据输入与 MQTT URI 校验离线完成，等待硬件短测窗口）
+更新时间：2026-09-25 13:18（Asia/Shanghai；凭据校验与 Flash 写入策略离线完成，等待硬件短测窗口）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 12:51 状态：凭据输入校验阶段 1a 与 MQTT URI 格式校验阶段 1b 已离线完成；阶段 1a/1b 复审均为 Approve。07:25 长测仍为 DEGRADED，CQ-2a 硬件短测前仍需重新复审。
+> 13:08 状态：凭据输入、MQTT URI 格式和 Flash 写入节流策略已离线完成；凭据阶段复审 Approve，spool policy 复审 Approve。07:25 长测仍为 DEGRADED，CQ-2a 硬件短测前仍需重新复审。
 
 ### 1.1 已经验证的主链路
 
@@ -116,6 +116,12 @@
     - `mqtts/wss` 仅作语法预留，不自动配置 TLS/WSS/VPN；
     - 普通与 `-DNDEBUG` 主机测试 PASS；网关默认 OFF 构建 PASS，bin 仍 `0x15f540`；
     - 独立复审 **Approve**，最终 High/Medium/Low 均为 0。
+
+13. **Flash 写入节流策略阶段 B1（未接入运行路径）**
+    - 新增批量条数、数据年龄、最小写入间隔、小时/每日预算的纯 C 策略；
+    - 强制模式只能跳过批量/年龄/间隔，不能突破写入预算；
+    - 支持 32 位毫秒计数回绕；普通与 `-DNDEBUG` 主机测试 PASS；
+    - 未写 Flash、未改分区表、未改变 RAM outbox；独立复审 **Approve**。
 
 ## 2. 当前主要风险
 ### P0（历史证据）：烧录前 2 小时节点出现网关下行持续失败

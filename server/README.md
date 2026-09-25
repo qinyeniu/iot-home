@@ -36,3 +36,13 @@ docker compose -f docker-compose.yml \
 ```
 
 命令只作用于当前 Docker host（本机、`DOCKER_HOST` 或当前 Docker context 指向的主机）；如果在阿里云 ECS 的 SSH 会话中执行，就属于一次手动部署/容器重建。执行后检查容器状态、内存、磁盘和业务链路；资源预算说明见 `docs/ALIYUN_SERVER_MAINTENANCE_PLAN.md`。未经用户明确要求，不自动部署到阿里云。
+
+## ECS 只读体检脚本
+
+后续登录阿里云 ECS 后，可在仓库根目录手动运行：
+
+```bash
+bash server/scripts/server_resource_check.sh
+```
+
+该脚本只读取系统和 Docker 状态，不会执行 prune、删除、重启、部署或打印凭据；阈值可用 `WARN_DISK_PERCENT`、`CRIT_DISK_PERCENT`、`WARN_MEM_AVAIL_MB`、`CRIT_MEM_AVAIL_MB` 环境变量调整。枚举最大容器 JSON 日志通常需要 root/sudo 权限；权限不足时报告会明确提示。维护前若报告 WARNING/CRITICAL，应先确认资源余量。

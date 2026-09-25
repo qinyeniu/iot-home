@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 07:09（Asia/Shanghai；CQ-1 队列脚手架完成，4 小时观察进行中）
+更新时间：2026-09-25 10:18（Asia/Shanghai；CQ-1 生命周期加固完成，干净 4 小时观察进行中）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 07:09 状态：COM6 已运行 generation guard；短序列 PASS。CQ-1 RF 队列默认关闭脚手架已完成并复审 Approve；4 小时被动观察进行中，新固件物理拔节点仍待白天复测。
+> 10:18 状态：COM6 已运行 generation guard；短序列 PASS，正常物理拔节点已复测通过。CQ-1 RF 队列默认关闭，生命周期与目标测试脚手架已完成并复审 Approve；07:25 的干净 4 小时被动观察进行中。
 
 ### 1.1 已经验证的主链路
 
@@ -90,8 +90,10 @@
 
 8. **RF 私有命令队列 CQ-1（默认关闭）**
    - 新增 `rf_command_queue.c/.h` 与主机测试，封装 FIFO、意图合并、generation/backoff/waiting/deadline 判断；
+   - FreeRTOS 生命周期使用 Queue Set、私有 stop/done 信号、消费者自删除和静态 state mutex，已关闭 start/stop/submit 竞态；
+   - 新增独立目标测试工程 `firmware/gateway/tests/target_lifecycle/`，离线构建 PASS；真实硬件运行留待后续硬件窗口；
    - 默认 `RF_COMMAND_QUEUE_ENABLED=OFF`，`main.c` 未调用，设备运行路径不变；
-   - 普通模式与 `-DNDEBUG` 主机测试均 PASS；临时 ON 固件编译通过后已恢复 OFF，复审 **Approve**。
+   - 普通模式与 `-DNDEBUG` 主机测试均 PASS；网关临时 ON 构建通过后已恢复 OFF，复审 **Approve**。
 
 ## 2. 当前主要风险
 
@@ -125,9 +127,9 @@
 
 A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 save → restart → load、写入失败、异常 marker、掉电恢复和 legacy 回退。当前不得直接烧录或加入 SoftAP/HTTP。
 
-### P1：RF 发送仍应收敛到单命令队列
+### P1：RF 发送仍需完成 CQ-2/CQ-3 集成
 
-当前 generation guard 已在 COM6 运行，06:40 短序列中未见重复帧或旧事务重放。复审仍指出一个更窄窗口：周期任务预留序号后、实际调用 ZBOSS API 前，如果远程命令插入，旧周期请求仍可能被提交。因此后续仍需将所有 RF 私有命令收敛为单一队列：远程/周期任务只提交意图，一个消费者负责预留序号、发送和安装等待事务。
+当前 generation guard 已在 COM6 运行，06:40 短序列未见重复帧或旧事务重放；正常物理拔节点也已通过。CQ-1 已把队列生命周期、停止信号和 start/stop/submit 并发保护离线加固，但消费者尚未调用 Zigbee API。后续仍需将远程/周期任务接入同一消费者，由它负责预留序号、发送和安装等待事务。
 
 ### P1：仓库工作区较乱
 
@@ -139,16 +141,17 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 
 1. COM6 当前运行提交 `67f7df6` 的网关应用，bin SHA256 `D748CE3C635F9E2A7AFCD05BB9FCF4047AE3DCC6A200FCD2059C037D1320DFBB`；
 2. 06:40 已完成短序列和 fresh QUERY，结论 **PASS**；
-3. 06:54:50 已启动 4 小时双串口只读观察，期间不烧录、不重启、不切换网卡、不部署云服务器；
-4. 白天请用户物理拔掉一次 COM5，确认新网关固件不会重启；
-5. 若长测再次出现连续 RF 下发失败，继续定位 ZBOSS APS 资源路径，不直接升级协议栈；
-6. 节点 NVS 低磨损固件暂不烧录，等待下一次明确维护窗口。
+3. 正常物理拔节点已复测：网关不重启，仅出现预期断链提示；
+4. 06:54 的观察段因约 07:09 双侧 USB_UART_HPSYS 复位已作废；07:25:08 已启动干净 4 小时双串口只读观察；
+5. 长测期间不烧录、不重启、不切换网卡、不部署云服务器；
+6. 若长测再次出现连续 RF 下发失败，继续定位 ZBOSS APS 资源路径，不直接升级协议栈；
+7. 节点 NVS 低磨损固件暂不烧录，等待下一次明确维护窗口。
 
-### 阶段 A2：实施 CQ-2/CQ-3（等待短测结论后进行）
+### 阶段 A2：实施 CQ-2/CQ-3（等待 4 小时长测结论后进行）
 
 1. CQ-2 先将远程用户 QUERY/SET 改为提交命令意图，保持消费者单出口；
 2. CQ-3 再将周期/自动命令改为入队并删除旧直接发送路径；
-3. 接入前硬化任务停止信号、start/stop/submit 并发保护和队列删除时机；
+3. start/stop/submit 并发保护、停止信号和队列删除时机已在 CQ-1 离线加固；后续硬件窗口需实际运行 lifecycle app；
 4. 每一步单独构建、主机测试、提交；不得与 SoftAP/NVS A/B 运行时接入混做。
 
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）

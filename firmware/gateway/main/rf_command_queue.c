@@ -6,6 +6,7 @@
 #ifndef RF_COMMAND_QUEUE_HOST_TEST
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #endif
@@ -193,74 +194,296 @@ rf_cq_result_t rf_cq_evaluate(const rf_dispatch_cmd_t *cmd,
 
 #ifndef RF_COMMAND_QUEUE_HOST_TEST
 static const char *const RF_CQ_TAG = "rf-cq";
+
+typedef struct {
+    QueueHandle_t queue;
+    SemaphoreHandle_t stop_event;
+    QueueSetHandle_t queue_set;
+} rf_cq_worker_ctx_t;
+
+static SemaphoreHandle_t s_state_mutex;
+static StaticSemaphore_t s_state_mutex_buffer;
+static portMUX_TYPE s_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
+static rf_cq_worker_ctx_t s_worker_ctx;
 static QueueHandle_t s_rf_cq_queue;
+static SemaphoreHandle_t s_rf_cq_stop_event;
+static QueueSetHandle_t s_rf_cq_queue_set;
 static TaskHandle_t s_rf_cq_task;
+static SemaphoreHandle_t s_rf_cq_done;
+static bool s_stopping;
+
+static SemaphoreHandle_t rf_cq_state_lock(void)
+{
+    if (s_state_mutex == NULL) {
+        portENTER_CRITICAL(&s_mutex_init_lock);
+        if (s_state_mutex == NULL) {
+            s_state_mutex = xSemaphoreCreateMutexStatic(&s_state_mutex_buffer);
+        }
+        portEXIT_CRITICAL(&s_mutex_init_lock);
+    }
+    return s_state_mutex;
+}
+
+static void rf_cq_cleanup_start(QueueHandle_t queue,
+                                SemaphoreHandle_t stop_event,
+                                QueueSetHandle_t queue_set,
+                                bool queue_added,
+                                bool stop_added)
+{
+    if (queue_set != NULL) {
+        if (stop_added) {
+            xQueueRemoveFromSet(stop_event, queue_set);
+        }
+        if (queue_added) {
+            xQueueRemoveFromSet(queue, queue_set);
+        }
+    }
+    if (queue_set != NULL) {
+        vQueueDelete((QueueHandle_t)queue_set);
+    }
+    if (stop_event != NULL) {
+        vSemaphoreDelete(stop_event);
+    }
+    if (queue != NULL) {
+        vQueueDelete(queue);
+    }
+}
 
 static void rf_cq_consumer_task(void *arg)
 {
+    rf_cq_worker_ctx_t *ctx = (rf_cq_worker_ctx_t *)arg;
     rf_dispatch_cmd_t cmd;
+    QueueSetMemberHandle_t member;
 
-    (void)arg;
     for (;;) {
-        if (xQueueReceive(s_rf_cq_queue, &cmd, pdMS_TO_TICKS(60000)) == pdTRUE) {
-            // CQ-1 only proves ownership scaffolding. Do not call any Zigbee
-            // API until CQ-2/CQ-3 integrates reservation and waiting state.
-            ESP_LOGI(RF_CQ_TAG,
-                     "queued command id=%lu cmd=%u source=%u; not dispatched in CQ-1",
-                     (unsigned long)cmd.id, (unsigned)cmd.command,
-                     (unsigned)cmd.source);
+        member = xQueueSelectFromSet(ctx->queue_set, portMAX_DELAY);
+        if (member == (QueueSetMemberHandle_t)ctx->stop_event) {
+            (void)xSemaphoreTake(ctx->stop_event, 0);
+            break;
+        }
+        if (member == (QueueSetMemberHandle_t)ctx->queue) {
+            if (xQueueReceive(ctx->queue, &cmd, 0) == pdTRUE) {
+                // CQ-1 only proves ownership scaffolding. Do not call any
+                // Zigbee API until CQ-2/CQ-3 integrates reservation and
+                // waiting state.
+                ESP_LOGI(RF_CQ_TAG,
+                         "queued command id=%lu cmd=%u source=%u; not dispatched in CQ-1",
+                         (unsigned long)cmd.id, (unsigned)cmd.command,
+                         (unsigned)cmd.source);
+            }
         }
     }
+
+    /*
+     * At this point the consumer no longer touches the queue, queue set, or
+     * stop event. The completion semaphore is private to the stop transaction;
+     * after giving it, the task deletes itself rather than being force-deleted
+     * while it may still be inside a FreeRTOS call.
+     */
+    if (s_rf_cq_done != NULL) {
+        xSemaphoreGive(s_rf_cq_done);
+    }
+    vTaskDelete(NULL);
 }
 
 bool rf_cq_is_started(void)
 {
-    return s_rf_cq_task != NULL;
+    bool started;
+    SemaphoreHandle_t lock = rf_cq_state_lock();
+
+    xSemaphoreTake(lock, portMAX_DELAY);
+    started = s_rf_cq_task != NULL && !s_stopping;
+    xSemaphoreGive(lock);
+    return started;
 }
 
 esp_err_t rf_cq_start(void)
 {
-    BaseType_t task_result;
+    QueueHandle_t queue = NULL;
+    SemaphoreHandle_t stop_event = NULL;
+    QueueSetHandle_t queue_set = NULL;
+    TaskHandle_t task = NULL;
+    bool queue_added = false;
+    bool stop_added = false;
+    BaseType_t result;
+    SemaphoreHandle_t lock = rf_cq_state_lock();
 
-    if (s_rf_cq_task != NULL) {
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (s_rf_cq_task != NULL || s_stopping) {
+        xSemaphoreGive(lock);
         return ESP_ERR_INVALID_STATE;
     }
-    s_rf_cq_queue = xQueueCreate(RF_CQ_CAPACITY, sizeof(rf_dispatch_cmd_t));
-    if (s_rf_cq_queue == NULL) {
+
+    queue = xQueueCreate(RF_CQ_CAPACITY, sizeof(rf_dispatch_cmd_t));
+    if (queue == NULL) {
+        xSemaphoreGive(lock);
         return ESP_ERR_NO_MEM;
     }
-    task_result = xTaskCreate(rf_cq_consumer_task, "rf-dispatch",
-                              4096, NULL, 5, &s_rf_cq_task);
-    if (task_result != pdPASS) {
-        s_rf_cq_task = NULL;
-        vQueueDelete(s_rf_cq_queue);
-        s_rf_cq_queue = NULL;
+
+    stop_event = xSemaphoreCreateBinary();
+    if (stop_event == NULL) {
+        rf_cq_cleanup_start(queue, stop_event, queue_set,
+                            queue_added, stop_added);
+        xSemaphoreGive(lock);
         return ESP_ERR_NO_MEM;
     }
+
+    queue_set = xQueueCreateSet(RF_CQ_CAPACITY + 1);
+    if (queue_set == NULL) {
+        rf_cq_cleanup_start(queue, stop_event, queue_set,
+                            queue_added, stop_added);
+        xSemaphoreGive(lock);
+        return ESP_ERR_NO_MEM;
+    }
+
+    result = xQueueAddToSet(queue, queue_set);
+    if (result != pdPASS) {
+        rf_cq_cleanup_start(queue, stop_event, queue_set,
+                            queue_added, stop_added);
+        xSemaphoreGive(lock);
+        return ESP_FAIL;
+    }
+    queue_added = true;
+
+    result = xQueueAddToSet(stop_event, queue_set);
+    if (result != pdPASS) {
+        rf_cq_cleanup_start(queue, stop_event, queue_set,
+                            queue_added, stop_added);
+        xSemaphoreGive(lock);
+        return ESP_FAIL;
+    }
+    stop_added = true;
+
+    s_worker_ctx.queue = queue;
+    s_worker_ctx.stop_event = stop_event;
+    s_worker_ctx.queue_set = queue_set;
+
+    result = xTaskCreate(rf_cq_consumer_task, "rf-dispatch", 4096,
+                         &s_worker_ctx, 5, &task);
+    if (result != pdPASS) {
+        rf_cq_cleanup_start(queue, stop_event, queue_set,
+                            queue_added, stop_added);
+        xSemaphoreGive(lock);
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_rf_cq_queue = queue;
+    s_rf_cq_stop_event = stop_event;
+    s_rf_cq_queue_set = queue_set;
+    s_rf_cq_task = task;
+    s_stopping = false;
+    xSemaphoreGive(lock);
     return ESP_OK;
 }
 
 esp_err_t rf_cq_stop(void)
 {
+    SemaphoreHandle_t done;
+    QueueHandle_t queue;
+    SemaphoreHandle_t stop_event;
+    QueueSetHandle_t queue_set;
+    bool acknowledged = false;
+    int wait_iteration;
+    SemaphoreHandle_t lock = rf_cq_state_lock();
+
+    xSemaphoreTake(lock, portMAX_DELAY);
     if (s_rf_cq_task == NULL) {
+        xSemaphoreGive(lock);
         return ESP_ERR_INVALID_STATE;
     }
-    vTaskDelete(s_rf_cq_task);
-    s_rf_cq_task = NULL;
-    vQueueDelete(s_rf_cq_queue);
+
+    if (s_stopping) {
+        /*
+         * Normally this branch is unreachable while an earlier stop is active
+         * because this mutex is held for the whole wait. It remains a safe
+         * recovery path after a previous stop timed out and released the lock.
+         */
+        if (s_rf_cq_done == NULL) {
+            xSemaphoreGive(lock);
+            return ESP_ERR_INVALID_STATE;
+        }
+        done = s_rf_cq_done;
+        stop_event = s_rf_cq_stop_event;
+    } else {
+        done = xSemaphoreCreateBinary();
+        if (done == NULL) {
+            xSemaphoreGive(lock);
+            return ESP_ERR_NO_MEM;
+        }
+        s_rf_cq_done = done;
+        s_stopping = true;
+        done = s_rf_cq_done;
+        stop_event = s_rf_cq_stop_event;
+    }
+
+    queue = s_rf_cq_queue;
+    queue_set = s_rf_cq_queue_set;
+
+    /*
+     * The worker does not acquire this state mutex, so it can wake from the
+     * queue set even while stop holds the lock. Holding the lock here also
+     * prevents submit/start from racing with queue deletion and serializes
+     * concurrent stop callers.
+     */
+    (void)xSemaphoreGive(stop_event);
+
+    for (wait_iteration = 0; wait_iteration < 50; ++wait_iteration) {
+        if (xSemaphoreTake(done, pdMS_TO_TICKS(100))) {
+            acknowledged = true;
+            break;
+        }
+    }
+
+    if (!acknowledged) {
+        /*
+         * Keep the stopping state latched and release the lock. A later
+         * rf_cq_stop() can consume a late completion and clean up the owned
+         * task/queue objects safely.
+         */
+        xSemaphoreGive(lock);
+        return ESP_ERR_TIMEOUT;
+    }
+
     s_rf_cq_queue = NULL;
+    s_rf_cq_stop_event = NULL;
+    s_rf_cq_queue_set = NULL;
+    s_rf_cq_task = NULL;
+    s_rf_cq_done = NULL;
+    s_stopping = false;
+    memset(&s_worker_ctx, 0, sizeof(s_worker_ctx));
+    xSemaphoreGive(lock);
+
+    vQueueDelete(queue);
+    vSemaphoreDelete(stop_event);
+    vQueueDelete((QueueHandle_t)queue_set);
+    vSemaphoreDelete(done);
     return ESP_OK;
 }
 
 esp_err_t rf_cq_submit(const rf_dispatch_cmd_t *cmd)
 {
+    esp_err_t result;
+    SemaphoreHandle_t lock = rf_cq_state_lock();
+
     if (rf_cq_validate(cmd) != RF_CQ_OK) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_rf_cq_queue == NULL) {
+
+    /*
+     * The same mutex is held across the non-blocking queue send. rf_cq_stop()
+     * marks the stopping state and deletes the queue only after this operation
+     * has completely returned.
+     */
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (s_stopping || s_rf_cq_task == NULL || s_rf_cq_queue == NULL) {
+        xSemaphoreGive(lock);
         return ESP_ERR_INVALID_STATE;
     }
-    return xQueueSend(s_rf_cq_queue, cmd, 0) == pdTRUE ? ESP_OK
-                                                       : ESP_ERR_NO_MEM;
+
+    result = xQueueSend(s_rf_cq_queue, cmd, 0) == pdTRUE
+                 ? ESP_OK
+                 : ESP_ERR_NO_MEM;
+    xSemaphoreGive(lock);
+    return result;
 }
 #endif

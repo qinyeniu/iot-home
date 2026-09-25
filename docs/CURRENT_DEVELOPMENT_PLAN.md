@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 10:25（Asia/Shanghai；干净长测 3 小时 DEGRADED，等待 4 小时报告）
+更新时间：2026-09-25 12:14（Asia/Shanghai；干净 4 小时长测 DEGRADED，CQ-2a 离线完成，等待硬件短测窗口）
 事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 10:25 状态：COM6 已运行 generation guard；短序列 PASS，正常物理拔节点已复测通过。CQ-1 生命周期加固已复审 Approve；07:25 长测 3 小时为 DEGRADED，无重启/黑障，RF 33/35 成功、2 次 ESP_ERR_NO_MEM。
+> 12:14 状态：07:25 干净 4 小时长测结论为 DEGRADED：无重启/业务黑障，但网关 RF 37 次中 4 次 `ESP_ERR_NO_MEM`。CQ-2a 已默认关闭离线完成，用户命令在实验 ON 时可经队列派发；尚未取得本阶段独立 Approve，硬件短测前需重新复审。
 
 ### 1.1 已经验证的主链路
 
@@ -28,7 +28,8 @@
    - 00:36 旧短序列中 AUTO 当次确认超时，fresh QUERY 确认真实状态为 `auto/-10 dBm`；
    - 03:33 已只烧录 RF 发送失败后退避网关，03:36 新短序列 QUERY → SET 0 → SET -10 → AUTO 全部匹配确认；
    - 06:38 已只烧录 generation guard 网关应用区；06:40 短序列 QUERY → SET 0 → SET -10 → AUTO 全部匹配确认，fresh QUERY 同样为 `auto/-10 dBm`；
-   - 新固件 4–8 小时长测仍待执行；
+   - 07:25 干净 4 小时长测已完成，结论 DEGRADED：业务连续，但 RF 37 次中 4 次 `ESP_ERR_NO_MEM`；
+   - 后续 4–8 小时长测应在 CQ-2/CQ-3 硬件短测后再安排；
    - 后端 RF policy REST API 和 Grafana 功率/模式面板已完成，但公网后端仍未部署这部分 API。
 
 4. **事务一致性**
@@ -76,19 +77,27 @@
    - 周期快照若在预留 Zigbee 序号前被用户命令 overtaken，会跳过旧发送，不再占用第二个有效序号；
    - 网关 bin `0x15f540`，SHA256 `D748CE3C635F9E2A7AFCD05BB9FCF4047AE3DCC6A200FCD2059C037D1320DFBB`，复审 **Approve**；06:38 已只烧录网关应用区，短序列 **PASS**。
 
-7. **节点诊断 NVS 低磨损保存**
+7. **RF 单队列 CQ-2a（实验路径，默认 OFF）**
+   - 用户 QUERY / MANUAL SET / AUTO SET 在实验 ON 时通过有界队列提交；
+   - `rf-dispatch` 单一消费者检查来源和 TTL 后复用现有成熟发送函数；
+   - 周期 QUERY、reconcile、自动功率 SET 尚未入队，完整发送所有权收敛仍需 CQ-2b/CQ-3；
+   - 已提供 submit/dequeue、栈高水位日志、短测判读脚本和硬件短测手册；
+   - 实验 ON bin `0x1604e0`（4% 分区余量），默认 OFF bin `0x15f540`（5% 分区余量）；
+   - 当前阶段多次独立复审未返回有效结论，因此**未取得独立 Approve**。
+
+8. **节点诊断 NVS 低磨损保存**
    - `rfctl/txp2` 已保存相同值时跳过 Flash 写入；
    - 保存与功率变更共用互斥锁，当前功率只快照一次；
    - NVS 失败保留 dirty，安静 60 秒超时后低频补试；
    - 节点 bin `0xdb190`，SHA256 `7349CF157F59B336B0D14D7F44624B1903179B9923F688A455BB6610D22C853C`，复审 **Approve**，尚未烧录。
 
-6. **On/Off 陈旧目标保护**
+9. **On/Off 陈旧目标保护**
    - RF QUERY/SET/AUTO 只校验 active child；
    - on/off/toggle 额外要求 180 秒内有 join/announce 或有效 ZCL report；
    - 不写 NVS、不改 active 状态；离线构建通过，**尚未烧录**；
    - MQTT negative ACK 和能力校验仍待前后端联动设计。
 
-8. **RF 私有命令队列 CQ-1（默认关闭）**
+10. **RF 私有命令队列 CQ-1（默认关闭）**
    - 新增 `rf_command_queue.c/.h` 与主机测试，封装 FIFO、意图合并、generation/backoff/waiting/deadline 判断；
    - FreeRTOS 生命周期使用 Queue Set、私有 stop/done 信号、消费者自删除和静态 state mutex，已关闭 start/stop/submit 竞态；
    - 新增独立目标测试工程 `firmware/gateway/tests/target_lifecycle/`，离线构建 PASS；真实硬件运行留待后续硬件窗口；
@@ -109,7 +118,7 @@
 - 节点累计新增 7 次 APS 失败；
 - 网关 RF QUERY 下发在 uptime 9412 秒后连续 47 次返回 `ESP_ERR_NO_MEM`。
 
-这说明“节点 → 网关 → MQTT”的上行仍可用，但“网关 → 节点”的主动 APS 下发在该时段持续不可用。该 FAIL 是烧录 backoff 版本前的历史证据；03:38 已启动新的 8 小时复测，在最终报告出来前不能判定问题已解决。
+这说明“节点 → 网关 → MQTT”的上行仍可用，但“网关 → 节点”的主动 APS 下发在该时段持续不可用。该 FAIL 是烧录 backoff 版本前的历史证据；后续短测与 07:25 的干净 4 小时观察均未再出现连续 47 次失败，但 4 小时结论仍为 DEGRADED，不能判定 APS 资源问题已根治。
 
 ### P0：网关主动下行 APS 资源异常
 
@@ -121,15 +130,17 @@
 
 ### P1：应用分区余量紧张
 
-网关应用分区仅剩约 5%（约 `0x11810` 字节）。SoftAP/HTTP、页面和校验逻辑继续叠加前必须先构建验收，不能直接加入完整 HTTP 配网功能。
+默认 OFF 网关应用分区仅剩约 5%（约 `0x10ac0` 字节）；实验 ON 队列固件约剩 4%（`0xfb20` 字节）。SoftAP/HTTP、页面和校验逻辑继续叠加前必须先构建验收，不能直接加入完整 HTTP 配网功能。
 
 ### P1：NVS A/B 接口尚未硬件验证
 
 A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 save → restart → load、写入失败、异常 marker、掉电恢复和 legacy 回退。当前不得直接烧录或加入 SoftAP/HTTP。
 
-### P1：RF 发送仍需完成 CQ-2/CQ-3 集成
+### P1：RF 发送仍需完成 CQ-2b/CQ-3 集成
 
-当前 generation guard 已在 COM6 运行，06:40 短序列未见重复帧或旧事务重放；正常物理拔节点也已通过。CQ-1 已把队列生命周期、停止信号和 start/stop/submit 并发保护离线加固，但消费者尚未调用 Zigbee API。后续仍需将远程/周期任务接入同一消费者，由它负责预留序号、发送和安装等待事务。
+当前 generation guard 已在 COM6 运行，06:40 短序列未见重复帧或旧事务重放；正常物理拔节点也已通过。CQ-2a 已让实验 ON 路径中的用户命令通过队列消费者派发，但消费者暂时复用旧函数，周期/自动路径也尚未入队。后续仍需将远程、周期、自动任务接入同一消费者，由它负责预留序号、发送和安装等待事务。
+
+CQ-2a 尚未取得有效独立 Approve；硬件烧录实验 ON 固件前必须重新复审。
 
 ### P1：仓库工作区较乱
 
@@ -137,22 +148,25 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 
 ## 3. 下一阶段建议顺序
 
-### 阶段 A：新 generation guard 长测（当前最高优先级）
+### 阶段 A：4 小时长测已结束，结论 DEGRADED
 
-1. COM6 当前运行提交 `67f7df6` 的网关应用，bin SHA256 `D748CE3C635F9E2A7AFCD05BB9FCF4047AE3DCC6A200FCD2059C037D1320DFBB`；
-2. 06:40 已完成短序列和 fresh QUERY，结论 **PASS**；
-3. 正常物理拔节点已复测：网关不重启，仅出现预期断链提示；
-4. 06:54 的观察段因约 07:09 双侧 USB_UART_HPSYS 复位已作废；07:25:08 已启动干净 4 小时双串口只读观察；
-5. 长测期间不烧录、不重启、不切换网卡、不部署云服务器；
-6. 若长测再次出现连续 RF 下发失败，继续定位 ZBOSS APS 资源路径，不直接升级协议栈；
-7. 节点 NVS 低磨损固件暂不烧录，等待下一次明确维护窗口。
+1. COM6 已运行 generation guard；06:40 短序列和 fresh QUERY 结论 **PASS**；
+2. 正常物理拔节点已复测：网关不重启，仅出现预期断链提示；
+3. 07:25:08 启动的干净 4 小时双串口观察覆盖 14,400.3 秒；
+4. 最终结论 **DEGRADED**：无重启、panic、观察缺口或业务黑障，但网关 RF 37 次中 4 次返回 `ESP_ERR_NO_MEM`；
+5. 单队列主要解决发送所有权和并发重复提交，不承诺必然修复 ZBOSS 内部 APS 资源问题；
+6. 后续硬件窗口重点观察失败前后 ZBOSS signal、APS repair、rejoin 与周期 QUERY 的关系；
+7. 节点 NVS 低磨损固件暂不烧录，等待明确维护窗口。
 
-### 阶段 A2：实施 CQ-2/CQ-3（等待 4 小时长测结论后进行）
+### 阶段 A2：CQ-2a 已离线完成，下一步等待硬件短测
 
-1. CQ-2 先将远程用户 QUERY/SET 改为提交命令意图，保持消费者单出口；
-2. CQ-3 再将周期/自动命令改为入队并删除旧直接发送路径；
-3. start/stop/submit 并发保护、停止信号和队列删除时机已在 CQ-1 离线加固；后续硬件窗口需实际运行 lifecycle app；
-4. 每一步单独构建、主机测试、提交；不得与 SoftAP/NVS A/B 运行时接入混做。
+1. CQ-2a 已让实验 ON 路径中的用户 QUERY/SET/AUTO 先入队，再由 `rf-dispatch` 消费者派发；
+2. 默认 OFF 现网路径不变；默认 bin `0x15f540`；
+3. CQ-2b 再让消费者直接承担序号预留、Zigbee 发送和等待事务安装；
+4. CQ-3 最后将周期/自动命令改为入队并停止旧直接发送路径；
+5. 硬件短测按 `docs/RF_CQ_SHORT_TEST_RUNBOOK.md` 执行，判读使用 `tools/analyze_rf_cq_short_test.py`；
+6. CQ-2a 未取得独立 Approve；硬件烧录或进入 CQ-2b 前必须重新复审；
+7. 每一步单独构建、主机测试、提交；不得与 SoftAP/NVS A/B 运行时接入混做。
 
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 

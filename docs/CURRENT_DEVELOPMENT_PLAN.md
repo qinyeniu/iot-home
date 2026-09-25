@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 01:17（Asia/Shanghai；CQ-4d 已接入后台 timeout/send failure）
+更新时间：2026-09-26 02:05（Asia/Shanghai；CQ-5/S0 已完成 SoftAP 配网会话内核）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 01:17 状态：CQ-4d 已在实验 ON 路径接入后台 timeout/send failure 并复审 Approve；默认仍 OFF，下一步等待硬件窗口做 CQ-4e。
+> 02:05 状态：CQ-4d 已提交；CQ-5/S0 SoftAP 配网会话内核已离线完成并复审 Approve。默认仍 OFF，下一步可离线做 HTTP 适配；硬件窗口优先 CQ-4e。
 
 ### 1.1 已经验证的主链路
 
@@ -65,7 +65,7 @@
    - 静态页面：`docs/provisioning/softap-prototype.html`；
    - 接口契约：`docs/SOFTAP_PROVISIONING_API_CONTRACT.md`；
    - 页面 gzip 后约 5.7 KB；网关应用分区剩余约 67 KB，只能按最小 HTTP/SoftAP 分阶段接入；
-   - 当前尚未接入固件。
+   - 02:05 已新增 RAM-only 配网会话内核：单测试、5 分钟过期、输入校验、快照与限流；当前尚未启动 SoftAP/HTTP。
 
 5. **RF policy Flash 去重**
    - 相同 `mode/mpwr` 已存在时跳过 `nvs_set/nvs_commit`；
@@ -167,7 +167,7 @@
 
 ### P1：应用分区余量紧张
 
-默认 OFF 网关应用分区仅剩约 5%（约 `0x10ac0` 字节）；实验 ON 队列固件约剩 4%（`0xfb20` 字节）。SoftAP/HTTP、页面和校验逻辑继续叠加前必须先构建验收，不能直接加入完整 HTTP 配网功能。
+默认 OFF 网关应用分区仅剩约 5%（约 `0x10ac0` 字节）；实验 ON 队列固件约剩 4%（`0xdeb0` 字节）。SoftAP/HTTP、页面和校验逻辑继续叠加前必须先构建验收，不能直接加入完整 HTTP 配网功能。
 
 ### P1：NVS A/B 接口尚未硬件验证
 
@@ -195,7 +195,7 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 6. 后续硬件窗口重点观察失败前后 ZBOSS signal、APS repair、rejoin 与周期 QUERY 的关系；
 7. 节点 NVS 低磨损固件暂不烧录，等待明确维护窗口。
 
-### 阶段 A2：CQ-4d 已完成，下一步等待 CQ-4e 硬件窗口
+### 阶段 A2：CQ-4d 已提交，硬件窗口等待 CQ-4e
 
 1. CQ-4b 已在实验 ON 下让后台 QUERY/SET 复用同一 RF 队列；
 2. CQ-4c 已接入后台 REPORT 的 CQ-3f 完成策略，不冒用用户 request_id；
@@ -204,6 +204,13 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 5. CQ-4e 硬件短测按 `docs/RF_CQ_SHORT_TEST_RUNBOOK.md` 和 `docs/RF_CQ_4_INTEGRATION_CONTRACT.md` 执行；
 6. 硬件窗口只烧录 COM6 应用区；不与 SoftAP、NVS A/B 运行时接入、TLS/VPN 或前后端改动混做。
 
+### 阶段 A3：CQ-5/S0 已完成，硬件断开时可继续 S1
+
+1. 新增独立组件 `firmware/common/iot_provisioning_session`，但不接入 `main.c`；
+2. 会话内核只保存在 RAM，负责单测试上下文、字段校验、5 分钟过期、通过后快照和请求限流；
+3. 已明确 test_id 不得复用，组件非线程安全，HTTP 层必须单任务调用或加锁；
+4. 默认 OFF bin 仍为 `0x15f540`，实验 ON bin 仍为 `0x162150`；
+5. 下一步 S1 只设计/实现 HTTP 适配层与状态映射，不启动服务、不写 NVS；真正 `/commit` 必须等待 A/B Bundle 硬件验证。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；
@@ -263,3 +270,5 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 - MQTT 安全部署、TLS/WSS 和 VPN 暂不自动执行；
 - 服务器资源需要保留余量，避免后端、MySQL、MQTT、Grafana 或日志占满磁盘/CPU；
 - 所有部署必须准备回退步骤，并避开用户使用网络的时间。
+
+

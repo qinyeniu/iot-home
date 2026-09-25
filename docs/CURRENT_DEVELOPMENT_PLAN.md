@@ -1,7 +1,7 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-25 20:44（Asia/Shanghai；CQ-3f 完成，CQ-4 集成契约已确定）
-事实来源：`docs/HANDOFF_2026-09-25.md`、`docs/HANDOFF/_2026-09-25.md`、`docs/HANDOFF_2026-09-24.md`
+更新时间：2026-09-26 00:18（Asia/Shanghai；CQ-4b 已接入实验 ON 单队列）
+事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
 
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 20:44 状态：CQ-1 至 CQ-3f 的离线策略已完成并复审 Approve；默认仍 OFF，下一步按 `docs/RF_CQ_4_INTEGRATION_CONTRACT.md` 小步接入后台命令。
+> 00:18 状态：CQ-4b 已在实验 ON 路径把后台 QUERY/SET 接入同一 RF 队列并复审 Approve；默认仍 OFF，下一步做 CQ-4c REPORT 完成策略。
 
 ### 1.1 已经验证的主链路
 
@@ -136,11 +136,11 @@
     - 主机普通/`-DNDEBUG` 测试 PASS；实验 ON、默认 OFF、target_lifecycle 构建 PASS；
     - 独立复审 **Approve**，High/Medium/Low 均为 0。
 
-8. **CQ-3 后台 RF 策略与 CQ-4 契约（实验路径，默认 OFF）**
+8. **CQ-3/CQ-4b 后台 RF 策略与队列集成（实验路径，默认 OFF）**
    - 已完成后台准入、QUERY、SET、组合执行计划、网关运行态 adapter 和完成/超时/失败状态策略；
-   - CQ 全量普通与 `-DNDEBUG` 主机测试 16/16 PASS，独立复审 Approve；
+   - CQ 全量普通与 `-DNDEBUG` 主机测试 10/10 PASS，独立复审 Approve；
    - 新增 `docs/RF_CQ_4_INTEGRATION_CONTRACT.md`，明确锁顺序、命令身份、MQTT 节流、资源预算和硬件短测边界；
-   - 当前仍未接入 `main.c`，默认 OFF 现网路径不变。
+   - CQ-4b 已在实验 ON 下接入 `main.c`：后台 QUERY/SET 提交同一 RF 队列，提交失败可回滚 ownership；默认 OFF 现网路径不变。
 
 ## 2. 当前主要风险
 ### P0（历史证据）：烧录前 2 小时节点出现网关下行持续失败
@@ -173,11 +173,11 @@
 
 A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 save → restart → load、写入失败、异常 marker、掉电恢复和 legacy 回退。当前不得直接烧录或加入 SoftAP/HTTP。
 
-### P1：RF 后台命令仍需 CQ-4 集成
+### P1：RF 后台命令仍需 CQ-4c/4d/4e
 
-当前 generation guard 已在 COM6 运行，06:40 短序列未见重复帧或旧事务重放；正常物理拔节点也已通过。CQ-1 至 CQ-3f 已完成默认 OFF 的队列和纯策略，但实验 ON 的周期入口尚未运行后台 QUERY/SET。
+当前 generation guard 已在 COM6 运行，06:40 短序列未见重复帧或旧事务重放；正常物理拔节点也已通过。CQ-4b 已让实验 ON 的周期后台 QUERY/SET 进入同一队列，但完整 REPORT、timeout/send failure 和硬件短测仍未完成。
 
-下一步按 CQ-4a → CQ-4b → CQ-4c → CQ-4d 小步开发：先增加后台命令 RAM 记录，再提交队列，然后处理 REPORT、timeout 和 send failure。每个阶段均需主机测试、静态检查、离线构建和独立复审。
+下一步按 CQ-4c → CQ-4d → CQ-4e 小步推进：先处理后台 REPORT 完成策略，再处理 timeout/send failure，最后在硬件窗口只烧 COM6 应用区短测。每个阶段均需主机测试、静态检查、离线构建和独立复审。
 
 ### P1：仓库工作区较乱
 
@@ -195,13 +195,13 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 6. 后续硬件窗口重点观察失败前后 ZBOSS signal、APS repair、rejoin 与周期 QUERY 的关系；
 7. 节点 NVS 低磨损固件暂不烧录，等待明确维护窗口。
 
-### 阶段 A2：CQ-3f 已完成，下一步开发 CQ-4a
+### 阶段 A2：CQ-4b 已完成，下一步开发 CQ-4c
 
-1. CQ-1 至 CQ-3f 已完成默认 OFF 的 RF 单队列和后台 QUERY/SET 策略；
-2. 默认 OFF 现网路径不变；默认 bin `0x15f540`，实验 ON bin `0x160300`；
-3. 下一步 CQ-4a 只增加后台命令 RAM 记录与字段映射，不实际提交后台 RF；
-4. CQ-4b 才将后台命令提交同一队列，CQ-4c/4d 处理完成、超时和失败；
-5. 硬件短测按 `docs/RF_CQ_SHORT_TEST_RUNBOOK.md` 和 `docs/RF_CQ_4_INTEGRATION_CONTRACT.md` 执行；
+1. CQ-4b 已在实验 ON 下让后台 QUERY/SET 复用同一 RF 队列；
+2. 默认 OFF 现网路径不变；默认 bin `0x15f540`，实验 ON bin `0x161830`；
+3. 下一步 CQ-4c 接入后台 REPORT 的 CQ-3f 完成策略，不冒用用户 request_id；
+4. CQ-4d 再处理 timeout/send failure 和负向 MQTT 节流；
+5. CQ-4e 硬件短测按 `docs/RF_CQ_SHORT_TEST_RUNBOOK.md` 和 `docs/RF_CQ_4_INTEGRATION_CONTRACT.md` 执行；
 6. 每个小阶段必须复审通过后才能提交，硬件窗口再只烧录 COM6 应用区；
 7. 不与 SoftAP、NVS A/B 运行时接入、TLS/VPN 或前后端改动混做。
 

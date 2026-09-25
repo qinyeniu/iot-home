@@ -33,6 +33,8 @@
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
 #include "rf_command_queue.h"
 #include "rf_dispatch_plan.h"
+#include "rf_background_command_mapper.h"
+#include "rf_background_dispatch_plan.h"
 #endif
 
 #include "esp_sleep.h"
@@ -466,6 +468,8 @@ static bool s_rf_dispatch_active;
 static uint32_t s_rf_user_intent_generation;
 static uint32_t s_rf_user_intent_started_ms;
 static uint32_t s_rf_user_intent_retry_after_ms;
+static bool s_rf_background_active;
+static rf_dispatch_cmd_t s_rf_background_command;
 #endif
 static char s_rf_expected_request_id[17];
 static bool s_rf_expected_user_transaction;
@@ -480,6 +484,7 @@ static bool rf_power_request_id_valid(const char *request_id);
 static void rf_power_reconcile_pending_intent(void);
 static void rf_power_handle_accepted_report_locked(uint32_t now,
     bool matched_transaction);
+static void rf_power_clear_background_locked(void);
 #endif
 
 static bool rf_power_is_monitored_cluster(uint16_t cluster_id)
@@ -674,6 +679,11 @@ static void rf_power_policy_init(void)
     s_rf_user_intent_started_ms = 0U;
     s_rf_user_intent_retry_after_ms = 0U;
     s_rf_report_submitting = false;
+    rf_power_clear_background_locked();
+    if (s_rf_policy_generation == 0U ||
+        s_rf_policy_generation == RF_POLICY_GENERATION_ANY) {
+        s_rf_policy_generation = 1U;
+    }
 #endif
     ESP_LOGI(TAG, "RF power policy: mode=%s manual=%d dBm",
              rf_power_mode_name(mode), (int)manual_power_dbm);
@@ -707,6 +717,7 @@ static void rf_power_forget_node(uint16_t addr)
         s_rf_policy_request_id[0] = '\0';
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
         s_rf_report_submitting = false;
+        rf_power_clear_background_locked();
         memset(&s_rf_user_intent, 0, sizeof(s_rf_user_intent));
         s_rf_user_intent_pending = false;
         s_rf_user_intent_queued = false;
@@ -754,6 +765,7 @@ static void rf_power_reset_for_announce(uint16_t addr)
     }
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
     s_rf_report_submitting = false;
+    rf_power_clear_background_locked();
     s_rf_dispatch_active = false;
     s_rf_user_intent_queued = false;
     if (s_rf_user_intent_pending) {
@@ -908,6 +920,12 @@ static bool rf_power_expire_waiting_if_due_locked(uint32_t now)
 }
 
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+static void rf_power_clear_background_locked(void)
+{
+    s_rf_background_active = false;
+    memset(&s_rf_background_command, 0, sizeof(s_rf_background_command));
+}
+
 static void rf_power_clear_user_intent_locked(void)
 {
     memset(&s_rf_user_intent, 0, sizeof(s_rf_user_intent));
@@ -951,6 +969,9 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
     int8_t recent_rssi = -127;
     bool old_power_unknown = true;
     bool matched_transaction = false;
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    bool matched_background = false;
+#endif
     char response_request_id[17] = {0};
     rf_reject_reason_t reject_reason = RF_REJECT_NONE;
 
@@ -1037,6 +1058,12 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
                  reported_mode == expected_mode)) {
                 accept_report = true;
                 matched_transaction = expected_user;
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+                matched_background = !expected_user &&
+                    s_rf_background_active &&
+                    s_rf_background_command.policy_generation ==
+                        s_rf_policy_generation;
+#endif
                 strlcpy(response_request_id, s_rf_expected_request_id,
                         sizeof(response_request_id));
                 s_rf_expected_request_id[0] = '\0';
@@ -1057,6 +1084,11 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
     if (accept_report) {
         s_rf_node_power_dbm = reported_power;
         s_rf_node_mode = packet_v2 ? reported_mode : RF_MODE_UNKNOWN;
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+        if (matched_background) {
+            rf_power_clear_background_locked();
+        }
+#endif
         if (!s_rf_policy_user_transaction && packet_v2 &&
             ((s_rf_mode == RF_MODE_MANUAL &&
               reported_mode == RF_MODE_MANUAL &&
@@ -1462,6 +1494,133 @@ static uint32_t rf_power_new_command_id(void)
     return id;
 }
 
+static uint32_t rf_power_new_background_command_id(uint32_t active_id)
+{
+    uint32_t id = esp_random();
+
+    if (id == 0U) {
+        id = 1U;
+    }
+    if (id == active_id) {
+        id = active_id == UINT32_MAX ? 1U : active_id + 1U;
+    }
+    return id;
+}
+
+static bool rf_power_map_runtime_locked(
+    rf_background_runtime_state_t *runtime, uint32_t now)
+{
+    rf_background_command_mapper_input_t input;
+    rf_background_command_mapper_output_t output;
+
+    memset(&input, 0, sizeof(input));
+    input.now_ms = now;
+    input.last_eval_ms = s_rf_last_eval_ms;
+    input.node_addr = s_rf_node_addr;
+    input.last_rx_ms = s_rf_last_rx_ms;
+    input.confirmed_ms = s_rf_power_confirmed_ms;
+    input.current_power_dbm = s_rf_node_power_dbm;
+    input.node_mode = s_rf_node_mode;
+    input.desired_mode = s_rf_mode;
+    input.desired_manual_power_dbm = s_rf_manual_power_dbm;
+    input.policy_apply_pending = s_rf_policy_apply_pending;
+    input.tx_backoff_until_ms = s_rf_tx_backoff_until_ms;
+    input.user_intent_active = s_rf_user_intent_pending;
+    input.report_waiting = s_rf_report_waiting;
+    input.report_submitting = s_rf_report_submitting;
+    input.wait_started_ms = s_rf_wait_started_ms;
+    input.dispatch_active = s_rf_dispatch_active;
+    input.background_command_active = s_rf_background_active;
+    input.active_command_id = s_rf_background_command.id;
+    input.active_command_generation = s_rf_background_command.policy_generation;
+    input.next_command_id =
+        rf_power_new_background_command_id(s_rf_background_command.id);
+    input.policy_generation = s_rf_policy_generation;
+
+    if (!rf_background_command_mapper_map(&input, &output) ||
+        output.result != RF_BG_MAPPER_OK) {
+        return false;
+    }
+
+    *runtime = output.runtime;
+    return true;
+}
+
+static void rf_power_apply_runtime_locked(
+    const rf_background_runtime_state_t *runtime)
+{
+    s_rf_last_eval_ms = runtime->last_eval_ms;
+    s_rf_node_power_dbm = runtime->current_power_dbm;
+    s_rf_node_mode = runtime->node_mode;
+    s_rf_power_confirmed_ms = runtime->confirmed_ms;
+    s_rf_policy_apply_pending = runtime->policy_apply_pending;
+    s_rf_report_waiting = runtime->report_waiting;
+    s_rf_report_submitting = runtime->report_submitting;
+    s_rf_wait_started_ms = runtime->wait_started_ms;
+
+    if (runtime->background_command_active) {
+        s_rf_background_active = true;
+        s_rf_background_command.id = runtime->active_command_id;
+        s_rf_background_command.policy_generation =
+            runtime->active_command_generation;
+    } else {
+        rf_power_clear_background_locked();
+    }
+}
+
+static void rf_power_background_controller_periodic(void)
+{
+    rf_background_runtime_state_t runtime;
+    rf_background_runtime_adapter_result_t result;
+    rf_dispatch_cmd_t command;
+    uint32_t now;
+    bool should_submit = false;
+    esp_err_t submit_err;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    if (!rf_power_map_runtime_locked(&runtime, now) ||
+        !rf_background_runtime_adapter_apply(&runtime, &result) ||
+        result.result == RF_BG_EXEC_INVALID_ARG ||
+        result.result == RF_BG_EXEC_REJECTED) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+
+    if (result.state_changed) {
+        rf_power_apply_runtime_locked(&result.next_state);
+    }
+    if (result.has_command) {
+        s_rf_background_command = result.command;
+        command = result.command;
+        should_submit = true;
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (!should_submit) {
+        return;
+    }
+
+    submit_err = rf_cq_submit(&command);
+    if (submit_err == ESP_OK) {
+        return;
+    }
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    if (rf_power_map_runtime_locked(&runtime, now)) {
+        rf_background_runtime_state_t rollback_state;
+        rf_background_runtime_rollback_result_t rollback_result;
+
+        if (rf_background_runtime_rollback_command(
+                &runtime, &command, &rollback_result, &rollback_state) &&
+            rollback_result == RF_BG_RUNTIME_ROLLBACK_DONE) {
+            rf_power_apply_runtime_locked(&rollback_state);
+        }
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+}
+
 static void rf_power_generate_cq_request_id(char *buffer)
 {
     static const char hex[] = "0123456789abcdef";
@@ -1540,6 +1699,7 @@ static void rf_power_prepare_manual_policy_locked(
     int8_t target_power_dbm, const char *request_id, uint32_t now)
 {
     rf_power_clear_waiting_locked();
+    rf_power_clear_background_locked();
     s_rf_mode = RF_MODE_MANUAL;
     s_rf_manual_power_dbm = target_power_dbm;
     s_rf_policy_apply_pending = true;
@@ -1553,6 +1713,7 @@ static void rf_power_prepare_auto_policy_locked(
     const char *request_id, uint32_t now)
 {
     rf_power_clear_waiting_locked();
+    rf_power_clear_background_locked();
     s_rf_mode = RF_MODE_AUTO;
     s_rf_policy_apply_pending = true;
     s_rf_last_eval_ms = now;
@@ -1715,8 +1876,102 @@ static void rf_power_send_intent_command(const rf_dispatch_cmd_t *cmd)
     taskEXIT_CRITICAL(&s_rf_power_lock);
 }
 
+static void rf_power_preinstall_background_waiting_locked(
+    const rf_background_dispatch_plan_t *bg, uint32_t now)
+{
+    s_rf_report_waiting = true;
+    s_rf_report_submitting = true;
+    s_rf_expected_report_seq = bg->seq;
+    s_rf_expected_report_power = bg->expected_report_power_dbm;
+    s_rf_expected_report_mode = bg->expected_report_mode;
+    s_rf_wait_started_ms = now;
+    s_rf_expected_user_transaction = false;
+    s_rf_expected_request_id[0] = '\0';
+}
+
+static void rf_power_send_background_command(const rf_dispatch_cmd_t *cmd)
+{
+    rf_background_dispatch_state_t state;
+    rf_background_dispatch_plan_t bg;
+    rf_dispatch_plan_t packet;
+    uint32_t now;
+    bool can_send = false;
+    esp_err_t err = ESP_FAIL;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    memset(&state, 0, sizeof(state));
+    state.now_ms = now;
+    state.node_addr = s_rf_node_addr;
+    state.packet_sequence = s_rf_packet_sequence;
+    state.active_command_id = s_rf_background_command.id;
+    state.active_command_generation = s_rf_background_command.policy_generation;
+    state.user_intent_active = s_rf_user_intent_pending;
+    state.report_waiting = s_rf_report_waiting;
+    state.report_submitting = s_rf_report_submitting;
+    state.dispatch_active = s_rf_dispatch_active;
+
+    if (!rf_background_dispatch_plan_create(cmd, &state, &bg)) {
+        taskEXIT_CRITICAL(&s_rf_power_lock);
+        return;
+    }
+
+    if (bg.status == RF_BG_DISPATCH_SEND) {
+        memset(&packet, 0, sizeof(packet));
+        packet.status = RF_DISPATCH_PLAN_SEND;
+        packet.node_addr = bg.node_addr;
+        packet.seq = bg.seq;
+        packet.command = bg.command;
+        packet.power_dbm = bg.packet_power_dbm;
+        packet.mode = bg.packet_mode;
+        packet.publish_querying = false;
+        packet.clear_waiting = false;
+        packet.expected_report_power_dbm = bg.expected_report_power_dbm;
+        packet.expected_report_mode = bg.expected_report_mode;
+
+        s_rf_packet_sequence = bg.seq;
+        rf_power_preinstall_background_waiting_locked(&bg, now);
+        s_rf_dispatch_active = true;
+        can_send = true;
+    } else if (bg.status == RF_BG_DISPATCH_CLOSE_EXPIRED ||
+               bg.status == RF_BG_DISPATCH_CLOSE_STATE_CHANGED ||
+               bg.status == RF_BG_DISPATCH_CLOSE_INACTIVE) {
+        rf_power_clear_background_locked();
+    }
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (!can_send) {
+        return;
+    }
+
+    err = rf_power_execute_plan(&packet);
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
+    rf_tx_note_result_locked(err, now);
+
+    if (s_rf_background_active &&
+        s_rf_background_command.id == cmd->id &&
+        s_rf_background_command.policy_generation == cmd->policy_generation) {
+        if (err != ESP_OK) {
+            if (s_rf_report_waiting && s_rf_report_submitting) {
+                rf_power_clear_waiting_locked();
+            }
+            rf_power_clear_background_locked();
+        } else {
+            s_rf_report_submitting = false;
+        }
+    }
+    s_rf_dispatch_active = false;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+}
 static void rf_power_dispatch_from_queue(const rf_dispatch_cmd_t *cmd)
 {
+    if (cmd->source == RF_CQ_SOURCE_PERIODIC) {
+        rf_power_send_background_command(cmd);
+        return;
+    }
+
     uint32_t now;
     bool matched = false;
     bool expired = false;
@@ -2033,6 +2288,7 @@ static void rf_power_controller_periodic(void)
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
     rf_power_reconcile_pending_intent();
+    rf_power_background_controller_periodic();
     return;
 #endif
     uint16_t addr = 0;

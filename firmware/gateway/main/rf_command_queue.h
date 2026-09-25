@@ -67,6 +67,20 @@ typedef struct {
     uint32_t backoff_until_ms;
 } rf_cq_context_t;
 
+/*
+ * Invoked by the single consumer for one dequeued command. The pointer is only
+ * valid for the duration of the callback; callbacks must not retain it and must
+ * not synchronously call rf_cq_stop().
+ *
+ * A configured function remains installed across a successful stop/restart and
+ * may be replaced only while no consumer exists and no stop is in progress.
+ * Passing NULL is not accepted; returning to the log-only CQ-1 path requires a
+ * reboot. The callback must return promptly. Long Zigbee waits should be stored
+ * as asynchronous state because a callback running beyond rf_cq_stop()'s bounded
+ * wait makes that call return ESP_ERR_TIMEOUT.
+ */
+typedef void (*rf_cq_dispatch_func_t)(const rf_dispatch_cmd_t *cmd);
+
 bool rf_cq_request_id_valid(const char *request_id);
 bool rf_cq_supported_power(int8_t power_dbm);
 rf_cq_result_t rf_cq_validate(const rf_dispatch_cmd_t *cmd);
@@ -84,6 +98,7 @@ rf_cq_result_t rf_cq_evaluate(const rf_dispatch_cmd_t *cmd,
                               const rf_cq_context_t *context);
 
 #ifndef RF_COMMAND_QUEUE_HOST_TEST
+esp_err_t rf_cq_configure_dispatch(rf_cq_dispatch_func_t func);
 esp_err_t rf_cq_start(void);
 esp_err_t rf_cq_stop(void);
 esp_err_t rf_cq_submit(const rf_dispatch_cmd_t *cmd);

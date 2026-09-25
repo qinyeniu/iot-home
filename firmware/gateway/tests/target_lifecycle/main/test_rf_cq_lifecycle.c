@@ -52,6 +52,49 @@ static rf_dispatch_cmd_t make_periodic_query(uint32_t generation)
     return cmd;
 }
 
+static TaskHandle_t s_test_task;
+static volatile uint32_t s_callback_count;
+static volatile uint32_t s_last_callback_id;
+static volatile uint32_t s_last_callback_command;
+static volatile uint32_t s_last_callback_source;
+
+static void test_dispatch_callback(const rf_dispatch_cmd_t *cmd)
+{
+    s_last_callback_id = cmd->id;
+    s_last_callback_command = cmd->command;
+    s_last_callback_source = cmd->source;
+    ++s_callback_count;
+    if (s_test_task != NULL) {
+        xTaskNotifyGive(s_test_task);
+    }
+}
+
+static void test_dispatch_callback_invoked(void)
+{
+    rf_dispatch_cmd_t user = make_user_query();
+
+    s_test_task = xTaskGetCurrentTaskHandle();
+    s_callback_count = 0;
+    s_last_callback_id = 0;
+    s_last_callback_command = 0;
+    s_last_callback_source = 0;
+
+    CHECK(rf_cq_configure_dispatch(NULL) == ESP_ERR_INVALID_ARG);
+    CHECK(rf_cq_configure_dispatch(test_dispatch_callback) == ESP_OK);
+    CHECK(rf_cq_start() == ESP_OK);
+    CHECK(rf_cq_configure_dispatch(test_dispatch_callback) == ESP_ERR_INVALID_STATE);
+    CHECK(rf_cq_submit(&user) == ESP_OK);
+    CHECK(ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000)) == 1);
+    CHECK(s_callback_count == 1);
+    CHECK(s_last_callback_id == 1);
+    CHECK(s_last_callback_command == RF_CQ_COMMAND_QUERY);
+    CHECK(s_last_callback_source == RF_CQ_SOURCE_USER);
+    CHECK(rf_cq_stop() == ESP_OK);
+    // The integration function is retained across a successful stop and can be
+    // replaced before another consumer is started.
+    CHECK(rf_cq_configure_dispatch(test_dispatch_callback) == ESP_OK);
+}
+
 static void test_idle_start_stop(void)
 {
     CHECK(rf_cq_start() == ESP_OK);
@@ -83,6 +126,7 @@ void app_main(void)
 {
     test_idle_start_stop();
     test_submit_before_stop();
+    test_dispatch_callback_invoked();
 
     if (s_failures != 0) {
         ESP_LOGE(TAG, "RF command queue lifecycle tests: FAIL (%d)", s_failures);

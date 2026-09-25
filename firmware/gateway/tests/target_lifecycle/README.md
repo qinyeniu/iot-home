@@ -8,9 +8,12 @@
 - 重复 start/stop 的错误返回；
 - stop 后重新 start；
 - submit 用户/周期命令后 stop；
+- 配置 dispatch 回调后，验证回调由单一消费者按命令内容调用；
 - 队列对象和消费者任务的正常生命周期。
 
 当前只保留离线构建通过证据；真实硬件运行、超时 latched cleanup 和并发 submit/stop 测试留待后续硬件窗口。
+
+dispatch 回调会在成功 stop/restart 后保持；只能在消费者不存在且未处于 stopping 状态时替换。回调必须及时返回，不能同步调用 `rf_cq_stop()`，也不能长期等待 Zigbee 事务。
 
 ## 构建
 

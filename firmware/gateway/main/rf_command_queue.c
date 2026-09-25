@@ -211,6 +211,7 @@ static QueueSetHandle_t s_rf_cq_queue_set;
 static TaskHandle_t s_rf_cq_task;
 static SemaphoreHandle_t s_rf_cq_done;
 static bool s_stopping;
+static rf_cq_dispatch_func_t s_dispatch_function;
 
 static SemaphoreHandle_t rf_cq_state_lock(void)
 {
@@ -263,13 +264,17 @@ static void rf_cq_consumer_task(void *arg)
         }
         if (member == (QueueSetMemberHandle_t)ctx->queue) {
             if (xQueueReceive(ctx->queue, &cmd, 0) == pdTRUE) {
-                // CQ-1 only proves ownership scaffolding. Do not call any
-                // Zigbee API until CQ-2/CQ-3 integrates reservation and
-                // waiting state.
-                ESP_LOGI(RF_CQ_TAG,
-                         "queued command id=%lu cmd=%u source=%u; not dispatched in CQ-1",
-                         (unsigned long)cmd.id, (unsigned)cmd.command,
-                         (unsigned)cmd.source);
+                if (s_dispatch_function != NULL) {
+                    // The configured integration owns reservation, Zigbee send
+                    // and waiting-transaction installation for this one command.
+                    s_dispatch_function(&cmd);
+                } else {
+                    // CQ-1 fallback: prove the queue path without calling Zigbee.
+                    ESP_LOGI(RF_CQ_TAG,
+                             "queued command id=%lu cmd=%u source=%u; no dispatch function",
+                             (unsigned long)cmd.id, (unsigned)cmd.command,
+                             (unsigned)cmd.source);
+                }
             }
         }
     }
@@ -295,6 +300,24 @@ bool rf_cq_is_started(void)
     started = s_rf_cq_task != NULL && !s_stopping;
     xSemaphoreGive(lock);
     return started;
+}
+
+esp_err_t rf_cq_configure_dispatch(rf_cq_dispatch_func_t func)
+{
+    SemaphoreHandle_t lock = rf_cq_state_lock();
+
+    if (func == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (s_rf_cq_task != NULL || s_stopping) {
+        xSemaphoreGive(lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_dispatch_function = func;
+    xSemaphoreGive(lock);
+    return ESP_OK;
 }
 
 esp_err_t rf_cq_start(void)

@@ -30,6 +30,10 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+#include "rf_command_queue.h"
+#endif
+
 #include "esp_sleep.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -1356,6 +1360,97 @@ static void rf_power_remote_set_auto(const char *request_id)
         taskEXIT_CRITICAL(&s_rf_power_lock);
     }
 }
+
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+static uint32_t rf_power_new_command_id(void)
+{
+    uint32_t id = 0;
+
+    do {
+        id = esp_random();
+    } while (id == 0);
+    return id;
+}
+
+static void rf_power_dispatch_from_queue(const rf_dispatch_cmd_t *cmd)
+{
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+
+    if (cmd->source != RF_CQ_SOURCE_USER) {
+        ESP_LOGW(TAG, "RF power queue: non-user command is not integrated");
+        return;
+    }
+    if (rf_cq_time_reached(now, cmd->deadline_ms)) {
+        ESP_LOGW(TAG, "RF power queue: drop expired command id=%lu",
+                 (unsigned long)cmd->id);
+        return;
+    }
+
+    if (cmd->command == RF_CQ_COMMAND_QUERY) {
+        rf_power_remote_query(cmd->request_id);
+    } else if (cmd->command == RF_CQ_COMMAND_SET &&
+               cmd->desired_mode == RF_CQ_MODE_MANUAL) {
+        rf_power_remote_set_manual(cmd->desired_power_dbm, cmd->request_id);
+    } else if (cmd->command == RF_CQ_COMMAND_SET) {
+        // The queue object needs a supported power to validate. AUTO derives
+        // the actual current power inside the existing mature handler.
+        rf_power_remote_set_auto(cmd->request_id);
+    }
+}
+
+static void rf_power_queued_query(const char *request_id)
+{
+    rf_dispatch_cmd_t cmd;
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+
+    if (rf_cq_build_user_query(rf_power_new_command_id(), request_id, now,
+                               &cmd) != RF_CQ_OK) {
+        ESP_LOGW(TAG, "RF power: reject queued QUERY");
+        return;
+    }
+    if (rf_cq_submit(&cmd) != ESP_OK) {
+        ESP_LOGW(TAG, "RF power: QUERY queue submission failed");
+    }
+}
+
+static void rf_power_queued_set_manual(int8_t target_power_dbm,
+                                       const char *request_id)
+{
+    rf_dispatch_cmd_t cmd;
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+
+    if (rf_cq_build_user_manual_set(rf_power_new_command_id(),
+                                    target_power_dbm, request_id, now,
+                                    &cmd) != RF_CQ_OK) {
+        ESP_LOGW(TAG, "RF power: reject queued MANUAL SET");
+        return;
+    }
+    if (rf_cq_submit(&cmd) != ESP_OK) {
+        ESP_LOGW(TAG, "RF power: MANUAL SET queue submission failed");
+    }
+}
+
+static void rf_power_queued_set_auto(const char *request_id)
+{
+    rf_dispatch_cmd_t cmd;
+    uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
+    int8_t placeholder_power;
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
+    placeholder_power = s_rf_manual_power_dbm;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (rf_cq_build_user_auto_set(rf_power_new_command_id(),
+                                  placeholder_power, request_id, now,
+                                  &cmd) != RF_CQ_OK) {
+        ESP_LOGW(TAG, "RF power: reject queued AUTO SET");
+        return;
+    }
+    if (rf_cq_submit(&cmd) != ESP_OK) {
+        ESP_LOGW(TAG, "RF power: AUTO SET queue submission failed");
+    }
+}
+#endif
 
 static void rf_power_controller_periodic(void)
 {
@@ -2780,13 +2875,21 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
         }
         if (strcmp(command_name, "rf_query_power") == 0) {
             ESP_LOGI(TAG, "CMD rf: node=0x%04x query", (unsigned)short_addr);
+            #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+            rf_power_queued_query(request_id);
+#else
             rf_power_remote_query(request_id);
+#endif
             cJSON_Delete(root);
             return;
         }
         if (strcmp(command_name, "rf_set_auto") == 0) {
             ESP_LOGI(TAG, "CMD rf: node=0x%04x automatic", (unsigned)short_addr);
+            #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+            rf_power_queued_set_auto(request_id);
+#else
             rf_power_remote_set_auto(request_id);
+#endif
             cJSON_Delete(root);
             return;
         }
@@ -2797,7 +2900,11 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
             if (rf_command_get_i8(holder, "power_dbm", &target_power_dbm)) {
                 ESP_LOGI(TAG, "CMD rf: node=0x%04x set %d dBm",
                          (unsigned)short_addr, (int)target_power_dbm);
+                #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+                rf_power_queued_set_manual(target_power_dbm, request_id);
+#else
                 rf_power_remote_set_manual(target_power_dbm, request_id);
+#endif
             } else {
                 ESP_LOGW(TAG, "CMD rf: missing/invalid power_dbm");
             }
@@ -3729,6 +3836,10 @@ void app_main(void)
     }
 
     rf_power_policy_init();
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    ESP_ERROR_CHECK(rf_cq_configure_dispatch(rf_power_dispatch_from_queue));
+    ESP_ERROR_CHECK(rf_cq_start());
+#endif
     rf_health_log_init();
 
     {

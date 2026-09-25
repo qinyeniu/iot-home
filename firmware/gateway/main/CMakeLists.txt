@@ -4,6 +4,7 @@ option(RF_COMMAND_QUEUE_ENABLED "Enable experimental RF private command queue" O
 set(RF_CQ_EXTRA_SRCS "")
 if(RF_COMMAND_QUEUE_ENABLED)
     list(APPEND RF_CQ_EXTRA_SRCS "rf_command_queue.c")
+    add_compile_definitions(RF_COMMAND_QUEUE_ENABLED=1)
 endif()
 
 idf_component_register(SRCS "main.c" ${RF_CQ_EXTRA_SRCS}

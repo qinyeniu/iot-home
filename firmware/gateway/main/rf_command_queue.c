@@ -507,7 +507,7 @@ esp_err_t rf_cq_start(void)
     s_worker_ctx.stop_event = stop_event;
     s_worker_ctx.queue_set = queue_set;
 
-    result = xTaskCreate(rf_cq_consumer_task, "rf-dispatch", 4096,
+    result = xTaskCreate(rf_cq_consumer_task, "rf-dispatch", 6144,
                          &s_worker_ctx, 5, &task);
     if (result != pdPASS) {
         rf_cq_cleanup_start(queue, stop_event, queue_set,

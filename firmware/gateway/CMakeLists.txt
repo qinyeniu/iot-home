@@ -4,6 +4,7 @@ cmake_minimum_required(VERSION 3.16)
 # Shared productization components.
 list(APPEND EXTRA_COMPONENT_DIRS "../common/iot_product_config"
                              "../common/iot_provisioning_session"
+                             "../common/iot_provisioning_command"
                              "../common/iot_provisioning_http")
 
 # Include the ESP-IDF CMake functions

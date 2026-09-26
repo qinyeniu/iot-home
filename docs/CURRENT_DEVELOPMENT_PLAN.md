@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 03:23（Asia/Shanghai；CQ-5/S2 会话 QUEUED 状态已离线完成）
+更新时间：2026-09-26 09:44（Asia/Shanghai；S2 配网命令队列已完成，CQ-4e 等待上行热点恢复）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 03:23 状态：CQ-5/S2 第一块低风险准备已完成，会话内核支持 QUEUED 状态，最终复审 C/H/M/L 全 0。默认仍 OFF，服务尚未启动；硬件窗口优先 CQ-4e。
+> 09:44 状态：S2 配网命令队列已完成并复审 C/H/M/L 全 0；实验网关已只烧应用区，节点已 rejoin。因电脑热点未广播，用户 QUERY/SET 序列等待网络恢复后继续。
 
 ### 1.1 已经验证的主链路
 
@@ -68,6 +68,7 @@
    - 02:05 已新增 RAM-only 配网会话内核：单测试、5 分钟过期、输入校验、快照与限流；
    - 02:40 已新增离线 HTTP 适配器：四个接口路由、JSON 映射、状态码、全请求限流、敏感 scratch 清理；当前仍未启动 SoftAP/HTTP。
    - 03:23 会话内核已新增 QUEUED 状态和 queue/start 接口，TTL 从入队开始；真实 provisioning task、APSTA 和 Wi‑Fi 连接尚未接入。
+   - 09:44 已新增静态深度 2 的 iot_provisioning_command 命令队列，覆盖 START/CANCEL/WIFI_EVENT/TIMER_TICK、stale generation 和槽位清理；真实 provisioning task 尚未接入。
 
 5. **RF policy Flash 去重**
    - 相同 `mode/mpwr` 已存在时跳过 `nvs_set/nvs_commit`；
@@ -203,8 +204,10 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 2. CQ-4c 已接入后台 REPORT 的 CQ-3f 完成策略，不冒用用户 request_id；
 3. CQ-4d 已处理 timeout/send failure、SET pending 保持和负向 MQTT 5 分钟节流；
 4. 默认 OFF 现网路径不变；默认 bin `0x15f540`，实验 ON bin `0x162150`；
-5. CQ-4e 硬件短测按 `docs/RF_CQ_SHORT_TEST_RUNBOOK.md` 和 `docs/RF_CQ_4_INTEGRATION_CONTRACT.md` 执行；
-6. 硬件窗口只烧录 COM6 应用区；不与 SoftAP、NVS A/B 运行时接入、TLS/VPN 或前后端改动混做。
+5. CQ-4e 已只烧录 COM6 网关应用区，节点已 secure rejoin，后台 QUERY seq=1/2 成功；
+6. 用户 QUERY → SET 0 → SET -10 → AUTO 等待电脑热点恢复后继续；
+7. 完整短测手册仍见 `docs/RF_CQ_SHORT_TEST_RUNBOOK.md` 和 `docs/RF_CQ_4_INTEGRATION_CONTRACT.md`；
+8. 硬件窗口只烧录 COM6 应用区；不与 SoftAP、NVS A/B 运行时接入、TLS/VPN 或前后端改动混做。
 
 ### 阶段 A3：CQ-5/S1 已完成，真实接入仍需等待
 
@@ -215,7 +218,7 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 5. commit handler 未注册时返回 501；handler 失败时会话进入 `error`，不会伪装 committed；响应和日志不回显密码；
 6. 组件非线程安全，真实 HTTP 集成必须单任务调用或加锁；
 7. 默认 OFF bin 仍为 `0x15f540`，实验 ON bin 仍为 `0x162150`；
-8. S2 设计已完成并复审 Approve（C/H/M/L=0）：见 `docs/PROVISIONING_WIFI_TEST_INTEGRATION_DESIGN.md`；会话 QUEUED 状态已离线完成；下一步实现静态命令队列和完整 owner gate；真实 `/commit` 必须等待 A/B Bundle 硬件验证。
+8. S2 设计已完成并复审 Approve（C/H/M/L=0）：见 `docs/PROVISIONING_WIFI_TEST_INTEGRATION_DESIGN.md`；会话 QUEUED 状态和静态命令队列均离线完成；下一步实现完整 owner gate；真实 `/commit` 必须等待 A/B Bundle 硬件验证。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；

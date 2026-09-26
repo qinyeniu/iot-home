@@ -14,5 +14,5 @@ endif()
 idf_component_register(SRCS "main.c" ${RF_CQ_EXTRA_SRCS}
                        INCLUDE_DIRS "."
                        REQUIRES driver esp_wifi esp_event esp_netif mqtt nvs_flash
-                                iot_product_config iot_provisioning_wifi_owner ieee802154 esp_coex json
+                                iot_product_config iot_ssd1306 iot_provisioning_wifi_owner ieee802154 esp_coex json
                                 iot_provisioning_recovery_quiesce)

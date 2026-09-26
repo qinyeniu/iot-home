@@ -56,6 +56,7 @@
 #include "wifi_secrets.h"
 #include "mqtt_secrets.h"
 #include "iot_product_config.h"
+#include "iot_ssd1306.h"
 #include "iot_provisioning_wifi_owner.h"
 #include "cJSON.h"
 #include "zcl/esp_zigbee_zcl_on_off.h"
@@ -79,6 +80,7 @@
 #define OLED_ADDR               0x3C
 #define OLED_WIDTH              128
 #define OLED_HEIGHT             64
+#define OLED_I2C_FREQ_HZ        100000
 
 #define STATUS_INTERVAL_MS      30000
 #define OLED_UPDATE_MS          1000
@@ -3135,347 +3137,10 @@ static void rf_power_controller_periodic(void)
 }
 
 // ==================== OLED SSD1306 ====================
-// Minimal local text driver for this 128x64 yellow/blue SSD1306 panel.
-// The installed espressif/ssd1306 1.0.5 text/font path produced garbled glyphs
-// on this board.  Use a standard 5x7 font, page-order framebuffer, horizontal
-// addressing, and short retried I2C strips with local bus/panel recovery.
-
-#define OLED_FB_SIZE            (OLED_WIDTH * OLED_HEIGHT / 8)
-#define OLED_I2C_FREQ_HZ        100000
-#define OLED_I2C_TIMEOUT_MS     200
-#define OLED_CHUNK_COLS         32
-#define OLED_TX_ATTEMPTS        3
-#define OLED_BUS_RECOVERY_PULSES 9
-
-static uint8_t s_fb[OLED_FB_SIZE];
-static uint32_t s_oled_tx_retry_count;
-static uint32_t s_oled_tx_failure_count;
-static uint32_t s_oled_recovery_count;
-static uint32_t s_oled_consecutive_flush_failures;
-
-static esp_err_t oled_i2c_force_bus_idle(void)
-{
-    // If a transfer was interrupted and the SSD1306 holds SDA low, temporarily
-    // bit-bang nine SCL pulses followed by STOP, then return the pins to I2C.
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL << I2C_SDA_PIN) | (1ULL << I2C_SCL_PIN),
-        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    esp_err_t ret = gpio_config(&io);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    gpio_set_level(I2C_SDA_PIN, 1);
-    gpio_set_level(I2C_SCL_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(2));
-
-    for (int i = 0; i < OLED_BUS_RECOVERY_PULSES; i++) {
-        gpio_set_level(I2C_SCL_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(1));
-        gpio_set_level(I2C_SCL_PIN, 1);
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
-    gpio_set_level(I2C_SDA_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(2));
-    gpio_set_level(I2C_SCL_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(2));
-    gpio_set_level(I2C_SDA_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(2));
-
-    gpio_reset_pin(I2C_SDA_PIN);
-    gpio_reset_pin(I2C_SCL_PIN);
-    return ESP_OK;
-}
-
-static esp_err_t oled_i2c_init(void)
-{
-    i2c_config_t i2c_cfg = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = OLED_I2C_FREQ_HZ,
-    };
-
-    esp_err_t ret = i2c_param_config(I2C_NUM_0, &i2c_cfg);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    ret = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
-    if (ret == ESP_ERR_INVALID_STATE) {
-        return ESP_OK;
-    }
-    return ret;
-}
-
-static esp_err_t oled_i2c_write_once(uint8_t control, const uint8_t *data, size_t len)
-{
-    i2c_cmd_handle_t h = i2c_cmd_link_create();
-    if (h == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    i2c_master_start(h);
-    i2c_master_write_byte(h, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(h, control, true);
-    if (data != NULL && len > 0) {
-        i2c_master_write(h, data, len, true);
-    }
-    i2c_master_stop(h);
-
-    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, h,
-                                         pdMS_TO_TICKS(OLED_I2C_TIMEOUT_MS));
-    i2c_cmd_link_delete(h);
-    return ret;
-}
-
-static esp_err_t oled_i2c_write(uint8_t control, const uint8_t *data, size_t len)
-{
-    esp_err_t ret = ESP_FAIL;
-
-    for (int attempt = 0; attempt < OLED_TX_ATTEMPTS; attempt++) {
-        ret = oled_i2c_write_once(control, data, len);
-        if (ret == ESP_OK) {
-            return ESP_OK;
-        }
-        s_oled_tx_retry_count++;
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-
-    s_oled_tx_failure_count++;
-    return ret;
-}
-
-static bool oled_check_device(void)
-{
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(OLED_I2C_TIMEOUT_MS));
-    i2c_cmd_link_delete(cmd);
-    return (ret == ESP_OK);
-}
-
-static bool oled_init(void)
-{
-    // Standard SSD1306 128x64 initialization. A1+C8 is the previously
-    // verified orientation for this particular yellow/blue module.
-    static const uint8_t init_cmds[] = {
-        0xAE,             // display off
-        0xD5, 0x80,       // clock divide / oscillator
-        0xA8, 0x3F,       // multiplex ratio 1/64
-        0xD3, 0x00,       // display offset 0
-        0x40,             // display start line 0
-        0xA1,             // segment remap
-        0xC8,             // COM scan direction (upright on this panel)
-        0xDA, 0x12,       // COM pins: 128x64 alternative mapping
-        0x81, 0xCF,       // contrast
-        0xD9, 0xF1,       // pre-charge period
-        0xDB, 0x40,       // VCOMH deselect level
-        0x8D, 0x14,       // enable charge pump
-        0xA4,             // output follows GDDRAM
-        0xA6,             // normal display (not inverse)
-        0x20, 0x00,       // horizontal addressing mode
-        0x21, 0x00, 0x7F, // column window 0..127
-        0x22, 0x00, 0x07, // page window 0..7
-        0xAF,             // display on
-    };
-
-    esp_err_t ret = oled_i2c_write(0x00, init_cmds, sizeof(init_cmds));
-    memset(s_fb, 0, sizeof(s_fb));
-    return (ret == ESP_OK);
-}
-
-static bool oled_recover_bus_and_panel(void)
-{
-    s_oled_recovery_count++;
-    ESP_LOGW(TAG, "OLED refresh failed; local recovery #%lu (retries=%lu failures=%lu)",
-             (unsigned long)s_oled_recovery_count,
-             (unsigned long)s_oled_tx_retry_count,
-             (unsigned long)s_oled_tx_failure_count);
-
-    // Keep Zigbee, Wi-Fi and MQTT alive; only rebuild the I2C bus/display.
-    i2c_driver_delete(I2C_NUM_0);
-    vTaskDelay(pdMS_TO_TICKS(80));
-    (void)oled_i2c_force_bus_idle();
-
-    if (oled_i2c_init() != ESP_OK) {
-        ESP_LOGE(TAG, "OLED I2C driver recovery failed");
-        return false;
-    }
-    vTaskDelay(pdMS_TO_TICKS(80));
-
-    if (!oled_check_device()) {
-        ESP_LOGW(TAG, "OLED did not ACK after I2C bus recovery");
-        return false;
-    }
-    if (!oled_init()) {
-        ESP_LOGW(TAG, "OLED SSD1306 reinitialization failed");
-        return false;
-    }
-
-    ESP_LOGI(TAG, "OLED recovered by I2C/SSD1306 local reset");
-    return true;
-}
-
-static bool oled_flush_once(void)
-{
-    // Refresh in short horizontal strips. Every strip sets an explicit
-    // window, so a retry cannot continue at the wrong GDDRAM location and
-    // turn later columns into horizontal garbage.
-    for (int page = 0; page < OLED_HEIGHT / 8; page++) {
-        for (int x0 = 0; x0 < OLED_WIDTH; x0 += OLED_CHUNK_COLS) {
-            int x1 = x0 + OLED_CHUNK_COLS - 1;
-            uint8_t window_cmds[] = {
-                0x20, 0x00,                     // horizontal addressing
-                0x21, (uint8_t)x0, (uint8_t)x1,
-                0x22, (uint8_t)page, (uint8_t)page,
-            };
-
-            esp_err_t ret = oled_i2c_write(0x00, window_cmds, sizeof(window_cmds));
-            if (ret != ESP_OK) {
-                return false;
-            }
-
-            const uint8_t *chunk = &s_fb[page * OLED_WIDTH + x0];
-            ret = oled_i2c_write(0x40, chunk, OLED_CHUNK_COLS);
-            if (ret != ESP_OK) {
-                return false;
-            }
-        }
-    }
-
-    return true;
-}
-
-static bool oled_flush(void)
-{
-    if (oled_flush_once()) {
-        if (s_oled_consecutive_flush_failures > 0) {
-            ESP_LOGI(TAG, "OLED refresh recovered after %lu failed frame(s)",
-                     (unsigned long)s_oled_consecutive_flush_failures);
-        }
-        s_oled_consecutive_flush_failures = 0;
-        return true;
-    }
-
-    s_oled_consecutive_flush_failures++;
-    if (!oled_recover_bus_and_panel()) {
-        return false;
-    }
-
-    // s_fb is preserved, so the next task tick redraws the complete screen.
-    return oled_flush_once();
-}
-static void oled_clear(void)
-{
-    memset(s_fb, 0, sizeof(s_fb));
-}
-
-// Compact 5x7 ASCII font, space (0x20) through Z (0x5A).
-static const uint8_t FONT_5x7[][5] = {
-    {0x00,0x00,0x00,0x00,0x00}, // space
-    {0x00,0x00,0x5F,0x00,0x00}, // !
-    {0x00,0x07,0x00,0x07,0x00}, // "
-    {0x14,0x7F,0x14,0x7F,0x14}, // #
-    {0x24,0x2A,0x7F,0x2A,0x12}, // $
-    {0x23,0x13,0x08,0x64,0x62}, // %
-    {0x36,0x49,0x55,0x22,0x50}, // &
-    {0x00,0x05,0x03,0x00,0x00}, // '
-    {0x00,0x1C,0x22,0x41,0x00}, // (
-    {0x00,0x41,0x22,0x1C,0x00}, // )
-    {0x08,0x2A,0x1C,0x2A,0x08}, // *
-    {0x08,0x08,0x3E,0x08,0x08}, // +
-    {0x00,0x50,0x30,0x00,0x00}, // ,
-    {0x08,0x08,0x08,0x08,0x08}, // -
-    {0x00,0x60,0x60,0x00,0x00}, // .
-    {0x20,0x10,0x08,0x04,0x02}, // /
-    {0x3E,0x51,0x49,0x45,0x3E}, // 0
-    {0x00,0x42,0x7F,0x40,0x00}, // 1
-    {0x42,0x61,0x51,0x49,0x46}, // 2
-    {0x21,0x41,0x45,0x4B,0x31}, // 3
-    {0x18,0x14,0x12,0x7F,0x10}, // 4
-    {0x27,0x45,0x45,0x45,0x39}, // 5
-    {0x3C,0x4A,0x49,0x49,0x30}, // 6
-    {0x01,0x71,0x09,0x05,0x03}, // 7
-    {0x36,0x49,0x49,0x49,0x36}, // 8
-    {0x06,0x49,0x49,0x29,0x1E}, // 9
-    {0x00,0x36,0x36,0x00,0x00}, // :
-    {0x00,0x56,0x36,0x00,0x00}, // ;
-    {0x00,0x08,0x14,0x22,0x41}, // <
-    {0x14,0x14,0x14,0x14,0x14}, // =
-    {0x41,0x22,0x14,0x08,0x00}, // >
-    {0x02,0x01,0x51,0x09,0x06}, // ?
-    {0x32,0x49,0x79,0x41,0x3E}, // @
-    {0x7E,0x11,0x11,0x11,0x7E}, // A
-    {0x7F,0x49,0x49,0x49,0x36}, // B
-    {0x3E,0x41,0x41,0x41,0x22}, // C
-    {0x7F,0x41,0x41,0x22,0x1C}, // D
-    {0x7F,0x49,0x49,0x49,0x41}, // E
-    {0x7F,0x09,0x09,0x01,0x01}, // F
-    {0x3E,0x41,0x41,0x51,0x32}, // G
-    {0x7F,0x08,0x08,0x08,0x7F}, // H
-    {0x00,0x41,0x7F,0x41,0x00}, // I
-    {0x20,0x40,0x41,0x3F,0x01}, // J
-    {0x7F,0x08,0x14,0x22,0x41}, // K
-    {0x7F,0x40,0x40,0x40,0x40}, // L
-    {0x7F,0x02,0x04,0x02,0x7F}, // M
-    {0x7F,0x04,0x08,0x10,0x7F}, // N
-    {0x3E,0x41,0x41,0x41,0x3E}, // O
-    {0x7F,0x09,0x09,0x09,0x06}, // P
-    {0x3E,0x41,0x51,0x21,0x5E}, // Q
-    {0x7F,0x09,0x19,0x29,0x46}, // R
-    {0x46,0x49,0x49,0x49,0x31}, // S
-    {0x01,0x01,0x7F,0x01,0x01}, // T
-    {0x3F,0x40,0x40,0x40,0x3F}, // U
-    {0x1F,0x20,0x40,0x20,0x1F}, // V
-    {0x7F,0x20,0x18,0x20,0x7F}, // W
-    {0x63,0x14,0x08,0x14,0x63}, // X
-    {0x03,0x04,0x78,0x04,0x03}, // Y
-    {0x61,0x51,0x49,0x45,0x43}, // Z
-};
-
-static void oled_char(int x, int y, char c)
-{
-    if (c >= 'a' && c <= 'z') {
-        c = (char)(c - 'a' + 'A');
-    }
-    if (c == '_') {
-        c = '-';
-    }
-    if (c < ' ' || c > 'Z') {
-        return;
-    }
-
-    int idx = c - ' ';
-    for (int col = 0; col < 5; col++) {
-        uint8_t line = FONT_5x7[idx][col];
-        for (int row = 0; row < 7; row++) {
-            int px = x + col;
-            int py = y + row;
-            if ((line & (1 << row)) && px >= 0 && px < OLED_WIDTH && py >= 0 && py < OLED_HEIGHT) {
-                s_fb[(py / 8) * OLED_WIDTH + px] |= (uint8_t)(1u << (py % 8));
-            }
-        }
-    }
-}
-
-static void oled_text(int x, int y, const char *s)
-{
-    while (*s != 0) {
-        oled_char(x, y, *s);
-        x += 6;
-        s++;
-    }
-}
+// Reusable driver implementation lives in common/iot_ssd1306. main.c owns the
+// static instance and framebuffer and supplies the board-specific wiring.
+static uint8_t s_oled_fb[IOT_SSD1306_128X64_FB_SIZE];
+static iot_ssd1306_t s_oled;
 
 // ==================== Zigbee ====================
 
@@ -4840,27 +4505,27 @@ static void oled_task(void *arg)
         char line[24];
 
         if (s_oled_available) {
-            oled_clear();
+            iot_ssd1306_clear(&s_oled);
 
             // Yellow band: 11 characters * 6px = 66px, x=(128-66)/2=31.
-            oled_text(31, 4, "IOT-HOME GW");
+            iot_ssd1306_draw_text(&s_oled, 31, 4, "IOT-HOME GW");
 
             // Blue band: compact status lines.
             snprintf(line, sizeof(line), "IP:%s", s_ip);
-            oled_text(0, 18, line);
+            iot_ssd1306_draw_text(&s_oled, 0, 18, line);
 
             snprintf(line, sizeof(line), "WIFI:%s MQTT:%s",
                      s_wifi_ok ? "OK" : "NO",
                      s_mqtt_ok ? "OK" : "NO");
-            oled_text(0, 30, line);
+            iot_ssd1306_draw_text(&s_oled, 0, 30, line);
 
             snprintf(line, sizeof(line), "UP:%02d:%02d:%02d", h, m, sec);
-            oled_text(0, 42, line);
+            iot_ssd1306_draw_text(&s_oled, 0, 42, line);
 
             snprintf(line, sizeof(line), "ZB NODES:%d", s_zigbee_devices);
-            oled_text(0, 54, line);
+            iot_ssd1306_draw_text(&s_oled, 0, 54, line);
 
-            oled_flush();
+            iot_ssd1306_flush(&s_oled);
         }
 
         vTaskDelay(pdMS_TO_TICKS(OLED_UPDATE_MS));
@@ -5482,27 +5147,48 @@ void app_main(void)
 #endif
     
     // I2C / OLED bus
-    ret = oled_i2c_init();
+    const iot_ssd1306_config_t oled_config = {
+        .i2c_port = I2C_NUM_0,
+        .sda_gpio = I2C_SDA_PIN,
+        .scl_gpio = I2C_SCL_PIN,
+        .i2c_address = OLED_ADDR,
+        .i2c_freq_hz = OLED_I2C_FREQ_HZ,
+        .framebuffer = s_oled_fb,
+        .framebuffer_size = sizeof(s_oled_fb),
+    };
+    ret = iot_ssd1306_init(&s_oled, &oled_config);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "I2C init failed (SDA=%d SCL=%d): %s",
                  I2C_SDA_PIN, I2C_SCL_PIN, esp_err_to_name(ret));
     } else {
         ESP_LOGI(TAG, "I2C init OK (SDA=%d SCL=%d)", I2C_SDA_PIN, I2C_SCL_PIN);
     }
-    
-    // OLED: local verified SSD1306 128x64 text driver
-    if (oled_check_device() && oled_init()) {
+
+    // OLED: reusable SSD1306 128x64 text driver
+    bool oled_present = false;
+    esp_err_t oled_probe_ret = ESP_FAIL;
+    esp_err_t oled_panel_ret = ESP_FAIL;
+    if (ret == ESP_OK) {
+        oled_probe_ret = iot_ssd1306_probe(&s_oled, &oled_present);
+    }
+    if (ret == ESP_OK && oled_probe_ret == ESP_OK && oled_present) {
+        oled_panel_ret = iot_ssd1306_panel_start(&s_oled);
+    }
+    if (ret == ESP_OK && oled_probe_ret == ESP_OK && oled_present &&
+        oled_panel_ret == ESP_OK) {
         s_oled_available = true;
-        oled_clear();
-        oled_text(31, 4, "IOT-HOME GW");
-        oled_text(31, 30, "STARTING...");
-        if (oled_flush()) {
-            ESP_LOGI(TAG, "OLED init OK (local SSD1306 text driver)");
+        iot_ssd1306_clear(&s_oled);
+        iot_ssd1306_draw_text(&s_oled, 31, 4, "IOT-HOME GW");
+        iot_ssd1306_draw_text(&s_oled, 31, 30, "STARTING...");
+        if (iot_ssd1306_flush(&s_oled) == ESP_OK) {
+            ESP_LOGI(TAG, "OLED init OK (reusable SSD1306 text driver)");
         } else {
             ESP_LOGW(TAG, "OLED initialized but first flush failed");
         }
     } else {
-        ESP_LOGW(TAG, "OLED not available, running without display");
+        ESP_LOGW(TAG, "OLED not available (init=%s probe=%s present=%d panel=%s), running without display",
+                 esp_err_to_name(ret), esp_err_to_name(oled_probe_ret),
+                 oled_present ? 1 : 0, esp_err_to_name(oled_panel_ret));
     }
 
     

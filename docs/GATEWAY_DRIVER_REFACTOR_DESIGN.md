@@ -2,7 +2,7 @@
 
 日期：2026-09-26
 适用固件：`firmware/gateway`
-状态：阶段 A/B 已完成。基础驱动类型、可复用 SSD1306 组件和 USB Serial/JTAG 传输组件已落地；默认/实验构建通过，拆分后硬件短测 PASS。OLED 当前无 I2C ACK，且已确认重构前日志中同样无应答。
+状态：阶段 A/B 已完成。基础驱动类型、可复用 SSD1306 组件和 USB Serial/JTAG 传输组件已落地；默认/实验构建通过，拆分后硬件短测 PASS。当前面板经用户确认按 128x64、vertical addressing 整帧刷新，显示正常。
 
 ## 1. 背景与目标
 
@@ -237,3 +237,75 @@ const iot_driver_t *iot_ssd1306_driver(void);
 - 实验 ON：`firmware/gateway/build-cq/iot-home-gateway.bin`，`1459552 / 0x164560`，SHA256 `43D8FCD048936077787F244459CAB9F40DE1757BA368FB4DBE97BCD5C324F09720975`。
 
 硬件结果：实验 ON 只写入 COM6 应用区 `0x10000`；稳定在线状态下通过该传输层执行 5 次 raw APS 查询，5/5 accepted、REPORT、COMPLETE，confirm status=0×5，`ESP_ERR_NO_MEM=0`，无复位。C/C++ 复审 **APPROVE**。
+
+
+## 9. OLED 规格回溯与纵向整帧刷新恢复（2026-09-26）
+
+### 9.1 现象与误判
+
+OLED 排线重新接回后，先后出现整屏上下重复、字体拉长、字迹不清等现象。中途曾根据部分现象怀疑面板为 128x32，并临时把网关装配为 height=32；用户随后观察到画面更像历史 64 帧画面的一角，因此需要回到历史已验证代码做差异对比。
+
+最终经用户确认，当前网关面板应为 **SSD1306 128x64**。128x32 初始化参数仍保留在驱动中，供后续不同面板复用，但该规格没有在本机当前屏幕上完成视觉验证，不能称为本硬件已验证。
+
+### 9.2 历史对比结论
+
+对比历史硬件测试正常版本后确认，当前面板历史上使用：
+
+```text
+width=128
+height=64
+multiplex=0x3f
+COM pins=0x12
+page window=0..7
+framebuffer=1024 bytes
+A1 + C8 orientation
+```
+
+拆分提交本身保留了上述参数；导致显示异常的关键差异是刷新策略偏离了最早正常方案。最早正常版本使用：
+
+```text
+0x20,0x01 vertical addressing
+page-major framebuffer -> column-major GRAM conversion
+one continuous 1024-byte data transaction per frame
+I2C transaction timeout=1000 ms
+```
+
+后续横向 addressing、短分块写入方案会让当前面板字迹不清，因此撤回。
+
+### 9.3 最终实现
+
+`iot_ssd1306_config_t` 保留 `width`、`height`，并新增调用方提供的：
+
+- `framebuffer`：应用绘图使用的 page-major 帧缓冲；
+- `scratch_buffer`：刷屏前用于转换 GRAM 字节序的临时缓冲；
+- 两者大小均不得小于当前面板帧大小，且不应指向同一块存储。
+
+`iot_ssd1306_flush()` 现在执行：
+
+1. 设置 vertical addressing；
+2. 设置完整 column/page window；
+3. 将 page-major framebuffer 转成 column-major GRAM scratch；
+4. 一次连续发送完整帧数据。
+
+驱动和两块缓冲均由 `main.c` 静态提供，驱动内部不做动态分配。
+
+### 9.4 Wi‑Fi 省电策略
+
+网关为电脑 Windows 移动热点场景，将 STA 省电策略从 `WIFI_PS_MAX_MODEM` 调整为 `WIFI_PS_MIN_MODEM`。网关由 USB 供电，优先保证热点兼容性、IP 获取和 MQTT 稳定性；`MIN_MODEM` 仍保留 Wi‑Fi modem sleep，并非完全关闭省电。
+
+### 9.5 验证结果
+
+构建结果：
+
+- 默认 OFF：`firmware/gateway/build/iot-home-gateway.bin`，`1442432 / 0x160280`，SHA256 `50971B5E5F51E5F2F463D153872013CF720C32A851CDC2F23BA799138D3C66D7`；
+- 实验 ON：`firmware/gateway/build-cq/iot-home-gateway.bin`，`1460064 / 0x164760`，SHA256 `FDF9D30330CDAAD77F8A36A02634ECB6FC096EB62EBDFBB0679506A1334FFC4C`。
+
+硬件复测：
+
+- 热点开启后的 100 秒 paired 复测中，网关获得 IP `192.168.137.140`，MQTT connected；
+- 最终默认固件只写入应用区后，又执行 85 秒复测：节点约 16.7 秒入网，短地址 `0x82cb`；
+- 85 秒复测记录到 25 条 RF sample、24 条 cached report、8 条 MQTT telemetry 发布；
+- RF power command/confirm 正常，100 秒和 85 秒测试均无崩溃、无异常复位；
+- 用户确认 OLED 显示恢复正常。
+
+复审：初次复审 APPROVE（指出 1 个 M、3 个 L 的加固建议）；完成加固后的增量复审 APPROVE，C/H/M/L=0。

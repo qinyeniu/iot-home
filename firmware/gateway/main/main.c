@@ -3141,6 +3141,7 @@ static void rf_power_controller_periodic(void)
 // Reusable driver implementation lives in common/iot_ssd1306. main.c owns the
 // static instance and framebuffer and supplies the board-specific wiring.
 static uint8_t s_oled_fb[IOT_SSD1306_128X64_FB_SIZE];
+static uint8_t s_oled_gram[IOT_SSD1306_128X64_FB_SIZE];
 static iot_ssd1306_t s_oled;
 
 // ==================== Zigbee ====================
@@ -4034,10 +4035,13 @@ static void wifi_start(void)
         ESP_LOGW(TAG, "WiFi set country failed: %s", esp_err_to_name(err));
     }
 
-    // Give the active 802.15.4 coordinator as much shared-radio time as
-    // possible. MAX_MODEM lets Wi-Fi sleep between DTIM/listen windows; MQTT
-    // traffic here is low-rate, while ZED rejoin scans are latency sensitive.
-    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    // Balance Windows-hotspot stability with the active 802.15.4 coordinator.
+    // NONE starves Zigbee association, while MAX_MODEM can leave the Wi-Fi
+    // protocol task poorly served on this hotspot; use the lighter MIN_MODEM.
+    err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi set power save failed: %s", esp_err_to_name(err));
+    }
     esp_wifi_set_config(WIFI_IF_STA, &wcfg);
     esp_wifi_start();
 
@@ -5142,13 +5146,15 @@ void app_main(void)
         .txrx = IEEE802154_LOW,
         .txrx_at = IEEE802154_MIDDLE,
     });
-    ESP_LOGI(TAG, "Wi-Fi/IEEE 802.15.4 coexistence enabled (15.4 priority LOW/MIDDLE; Wi-Fi MAX_MODEM)");
+    ESP_LOGI(TAG, "Wi-Fi/IEEE 802.15.4 coexistence enabled (15.4 priority LOW/MIDDLE; Wi-Fi MIN_MODEM)");
 #else
     ESP_LOGW(TAG, "ZB-only RF diagnostic: Wi-Fi/coexistence disabled");
 #endif
     
     // I2C / OLED bus
     const iot_ssd1306_config_t oled_config = {
+        .width = OLED_WIDTH,
+        .height = OLED_HEIGHT,
         .i2c_port = I2C_NUM_0,
         .sda_gpio = I2C_SDA_PIN,
         .scl_gpio = I2C_SCL_PIN,
@@ -5156,6 +5162,8 @@ void app_main(void)
         .i2c_freq_hz = OLED_I2C_FREQ_HZ,
         .framebuffer = s_oled_fb,
         .framebuffer_size = sizeof(s_oled_fb),
+        .scratch_buffer = s_oled_gram,
+        .scratch_buffer_size = sizeof(s_oled_gram),
     };
     ret = iot_ssd1306_init(&s_oled, &oled_config);
     if (ret != ESP_OK) {
@@ -5165,7 +5173,7 @@ void app_main(void)
         ESP_LOGI(TAG, "I2C init OK (SDA=%d SCL=%d)", I2C_SDA_PIN, I2C_SCL_PIN);
     }
 
-    // OLED: reusable SSD1306 128x64 text driver
+    // OLED: reusable SSD1306 text driver
     bool oled_present = false;
     esp_err_t oled_probe_ret = ESP_FAIL;
     esp_err_t oled_panel_ret = ESP_FAIL;

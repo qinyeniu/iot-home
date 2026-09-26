@@ -12,13 +12,19 @@
 extern "C" {
 #endif
 
-#define IOT_SSD1306_WIDTH              128
-#define IOT_SSD1306_HEIGHT             64
-#define IOT_SSD1306_128X64_FB_SIZE     ((IOT_SSD1306_WIDTH * IOT_SSD1306_HEIGHT) / 8)
+#define IOT_SSD1306_WIDTH_128          128
+#define IOT_SSD1306_HEIGHT_32          32
+#define IOT_SSD1306_HEIGHT_64          64
+#define IOT_SSD1306_128X32_FB_SIZE     ((IOT_SSD1306_WIDTH_128 * IOT_SSD1306_HEIGHT_32) / 8)
+#define IOT_SSD1306_128X64_FB_SIZE     ((IOT_SSD1306_WIDTH_128 * IOT_SSD1306_HEIGHT_64) / 8)
 
 /* All APIs are task-context only and one instance is not protected for
-   concurrent calls from multiple tasks. Storage must remain caller-owned. */
+   concurrent calls from multiple tasks. Storage must remain caller-owned.
+   framebuffer and scratch_buffer must have separate, non-overlapping storage;
+   scratch_buffer is temporarily owned by the driver while flush() runs. */
 typedef struct {
+    uint16_t width;
+    uint16_t height;
     i2c_port_t i2c_port;
     gpio_num_t sda_gpio;
     gpio_num_t scl_gpio;
@@ -26,6 +32,8 @@ typedef struct {
     uint32_t i2c_freq_hz;
     uint8_t *framebuffer;
     size_t framebuffer_size;
+    uint8_t *scratch_buffer;
+    size_t scratch_buffer_size;
 } iot_ssd1306_config_t;
 
 typedef struct {
@@ -41,7 +49,8 @@ typedef struct {
 /**
  * @brief Validate and save the configuration, then initialize the I2C bus.
  *
- * Storage for both the instance and framebuffer is provided by the caller.
+ * Storage for the instance, drawing framebuffer and GRAM scratch buffer is
+ * provided by the caller. The two byte buffers must not overlap.
  */
 esp_err_t iot_ssd1306_init(iot_ssd1306_t *self,
                            const iot_ssd1306_config_t *config);

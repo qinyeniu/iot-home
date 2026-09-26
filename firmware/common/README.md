@@ -11,6 +11,6 @@
 ## 通用驱动与基础类型
 
 - `iot_driver_base`：统一最小驱动生命周期（init/start/stop/deinit/poll），未使用回调可为空；
-- `iot_ssd1306`：SSD1306 128x64 文本屏驱动，实例和帧缓冲由调用方静态提供，驱动内部不做动态分配；
+- `iot_ssd1306`：SSD1306 文本屏驱动，支持 128x32/128x64 配置；实例、framebuffer 和 GRAM scratch 由调用方静态提供，驱动内部不做动态分配；
 - `iot_usb_serial_jtag`：USB Serial/JTAG 传输驱动，统一安装、启动、停止和阻塞读写，命令解析仍属于应用层；
 - 具体业务仍应优先使用强类型驱动 API，`iot_driver_t` 用于统一装配、启动和轮询。

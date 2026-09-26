@@ -6,8 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define IOT_SSD1306_I2C_TIMEOUT_MS       200
-#define IOT_SSD1306_CHUNK_COLS           32
+#define IOT_SSD1306_I2C_TIMEOUT_MS       1000
 #define IOT_SSD1306_TX_ATTEMPTS          3
 #define IOT_SSD1306_BUS_RECOVERY_PULSES  9
 
@@ -156,7 +155,8 @@ esp_err_t iot_ssd1306_probe(iot_ssd1306_t *self, bool *present)
     return ret;
 }
 
-esp_err_t iot_ssd1306_panel_start(iot_ssd1306_t *self)
+static esp_err_t oled_panel_start_impl(iot_ssd1306_t *self,
+                                       bool clear_framebuffer)
 {
     if (self == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -165,9 +165,7 @@ esp_err_t iot_ssd1306_panel_start(iot_ssd1306_t *self)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Standard SSD1306 128x64 initialization. A1+C8 is the previously
-       verified orientation for this particular yellow/blue module. */
-    static const uint8_t init_cmds[] = {
+    static const uint8_t init_cmds_128x64[] = {
         0xAE,             /* display off */
         0xD5, 0x80,       /* clock divide / oscillator */
         0xA8, 0x3F,       /* multiplex ratio 1/64 */
@@ -182,16 +180,58 @@ esp_err_t iot_ssd1306_panel_start(iot_ssd1306_t *self)
         0x8D, 0x14,       /* enable charge pump */
         0xA4,             /* output follows GDDRAM */
         0xA6,             /* normal display */
-        0x20, 0x00,       /* horizontal addressing mode */
+        0x20, 0x01,       /* vertical addressing mode */
         0x21, 0x00, 0x7F, /* column window 0..127 */
         0x22, 0x00, 0x07, /* page window 0..7 */
         0xAF,             /* display on */
     };
+    static const uint8_t init_cmds_128x32[] = {
+        0xAE,             /* display off */
+        0xD5, 0x80,       /* clock divide / oscillator */
+        0xA8, 0x1F,       /* multiplex ratio 1/32 */
+        0xD3, 0x00,       /* display offset 0 */
+        0x40,             /* display start line 0 */
+        0xA1,             /* segment remap */
+        0xC8,             /* COM scan direction */
+        0xDA, 0x02,       /* COM pins: 128x32 mapping */
+        0x81, 0x8F,       /* contrast */
+        0xD9, 0xF1,       /* pre-charge period */
+        0xDB, 0x40,       /* VCOMH deselect level */
+        0x8D, 0x14,       /* enable charge pump */
+        0xA4,             /* output follows GDDRAM */
+        0xA6,             /* normal display */
+        0x20, 0x01,       /* vertical addressing mode */
+        0x21, 0x00, 0x7F, /* column window 0..127 */
+        0x22, 0x00, 0x03, /* page window 0..3 */
+        0xAF,             /* display on */
+    };
+    const uint8_t *init_cmds;
+    size_t init_cmd_len;
 
-    esp_err_t ret = oled_i2c_write(self, 0x00, init_cmds, sizeof(init_cmds));
-    memset(self->config.framebuffer, 0, IOT_SSD1306_128X64_FB_SIZE);
+    if (self->config.width == IOT_SSD1306_WIDTH_128 &&
+        self->config.height == IOT_SSD1306_HEIGHT_32) {
+        init_cmds = init_cmds_128x32;
+        init_cmd_len = sizeof(init_cmds_128x32);
+    } else if (self->config.width == IOT_SSD1306_WIDTH_128 &&
+               self->config.height == IOT_SSD1306_HEIGHT_64) {
+        init_cmds = init_cmds_128x64;
+        init_cmd_len = sizeof(init_cmds_128x64);
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = oled_i2c_write(self, 0x00, init_cmds, init_cmd_len);
+    if (clear_framebuffer) {
+        memset(self->config.framebuffer, 0,
+               (size_t)self->config.width * self->config.height / 8U);
+    }
     self->panel_ready = (ret == ESP_OK);
     return ret;
+}
+
+esp_err_t iot_ssd1306_panel_start(iot_ssd1306_t *self)
+{
+    return oled_panel_start_impl(self, true);
 }
 
 static esp_err_t oled_panel_stop(iot_ssd1306_t *self)
@@ -243,7 +283,7 @@ esp_err_t iot_ssd1306_recover(iot_ssd1306_t *self)
         return ESP_ERR_NOT_FOUND;
     }
 
-    ret = iot_ssd1306_panel_start(self);
+    ret = oled_panel_start_impl(self, false);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "OLED SSD1306 reinitialization failed: %s",
                  esp_err_to_name(ret));
@@ -256,32 +296,45 @@ esp_err_t iot_ssd1306_recover(iot_ssd1306_t *self)
 
 static bool oled_flush_once(iot_ssd1306_t *self)
 {
-    /* Refresh in short horizontal strips. Every strip sets an explicit
-       window, so a retry cannot continue at the wrong GDDRAM location. */
-    for (int page = 0; page < IOT_SSD1306_HEIGHT / 8; page++) {
-        for (int x0 = 0; x0 < IOT_SSD1306_WIDTH; x0 += IOT_SSD1306_CHUNK_COLS) {
-            int x1 = x0 + IOT_SSD1306_CHUNK_COLS - 1;
-            uint8_t window_cmds[] = {
-                0x20, 0x00,
-                (uint8_t)x0, (uint8_t)x1,
-                (uint8_t)page, (uint8_t)page,
-            };
+    const int pages = self->config.height / 8;
+    uint8_t window_cmds[] = {
+        0x20, 0x01,                     /* vertical addressing mode */
+        0x21, 0x00, (uint8_t)(self->config.width - 1U),
+        0x22, 0x00, (uint8_t)(pages - 1),
+    };
 
-            esp_err_t ret = oled_i2c_write(self, 0x00, window_cmds,
-                                           sizeof(window_cmds));
-            if (ret != ESP_OK) {
-                return false;
-            }
-
-            const uint8_t *chunk = &self->config.framebuffer[page * IOT_SSD1306_WIDTH + x0];
-            ret = oled_i2c_write(self, 0x40, chunk, IOT_SSD1306_CHUNK_COLS);
-            if (ret != ESP_OK) {
-                return false;
-            }
+    /* Vertical addressing consumes one complete column, page 0 through the
+       final page, before advancing to the next column. Convert the page-major
+       framebuffer into caller-owned scratch storage, then send one frame. */
+    for (int x = 0; x < self->config.width; x++) {
+        for (int page = 0; page < pages; page++) {
+            self->config.scratch_buffer[x * pages + page] =
+                self->config.framebuffer[page * self->config.width + x];
         }
     }
 
-    return true;
+    const size_t gram_size =
+        (size_t)self->config.width * self->config.height / 8U;
+
+    /* If a frame transfer is interrupted after some GRAM bytes, the panel
+       pointer moves. Every retry must therefore restart from the same window. */
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 0; attempt < IOT_SSD1306_TX_ATTEMPTS; attempt++) {
+        ret = oled_i2c_write_once(self, 0x00, window_cmds,
+                                  sizeof(window_cmds));
+        if (ret == ESP_OK) {
+            ret = oled_i2c_write_once(self, 0x40, self->config.scratch_buffer,
+                                      gram_size);
+        }
+        if (ret == ESP_OK) {
+            return true;
+        }
+        self->tx_retry_count++;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    self->tx_failure_count++;
+    return false;
 }
 
 esp_err_t iot_ssd1306_flush(iot_ssd1306_t *self)
@@ -313,7 +366,8 @@ esp_err_t iot_ssd1306_clear(iot_ssd1306_t *self)
     if (self == NULL || self->config.framebuffer == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    memset(self->config.framebuffer, 0, IOT_SSD1306_128X64_FB_SIZE);
+    memset(self->config.framebuffer, 0,
+           (size_t)self->config.width * self->config.height / 8U);
     return ESP_OK;
 }
 
@@ -403,9 +457,9 @@ esp_err_t iot_ssd1306_draw_char(iot_ssd1306_t *self, int x, int y, char ch)
             int px = x + col;
             int py = y + row;
             if ((line & (1 << row)) &&
-                px >= 0 && px < IOT_SSD1306_WIDTH &&
-                py >= 0 && py < IOT_SSD1306_HEIGHT) {
-                self->config.framebuffer[(py / 8) * IOT_SSD1306_WIDTH + px] |=
+                px >= 0 && px < self->config.width &&
+                py >= 0 && py < self->config.height) {
+                self->config.framebuffer[(py / 8) * self->config.width + px] |=
                     (uint8_t)(1u << (py % 8));
             }
         }
@@ -431,14 +485,40 @@ esp_err_t iot_ssd1306_draw_text(iot_ssd1306_t *self, int x, int y,
     return ESP_OK;
 }
 
+static bool oled_ranges_overlap(const void *a, size_t a_size,
+                                const void *b, size_t b_size)
+{
+    const uintptr_t a_start = (uintptr_t)a;
+    const uintptr_t a_end = a_start + a_size;
+    const uintptr_t b_start = (uintptr_t)b;
+    const uintptr_t b_end = b_start + b_size;
+    return a_start < b_end && b_start < a_end;
+}
+
 esp_err_t iot_ssd1306_init(iot_ssd1306_t *self,
                            const iot_ssd1306_config_t *config)
 {
     if (self == NULL || config == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    size_t required_fb_size;
+    if (config->width == IOT_SSD1306_WIDTH_128 &&
+        config->height == IOT_SSD1306_HEIGHT_32) {
+        required_fb_size = IOT_SSD1306_128X32_FB_SIZE;
+    } else if (config->width == IOT_SSD1306_WIDTH_128 &&
+               config->height == IOT_SSD1306_HEIGHT_64) {
+        required_fb_size = IOT_SSD1306_128X64_FB_SIZE;
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (config->framebuffer == NULL ||
-        config->framebuffer_size < IOT_SSD1306_128X64_FB_SIZE) {
+        config->framebuffer_size < required_fb_size ||
+        config->scratch_buffer == NULL ||
+        config->scratch_buffer_size < required_fb_size) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (oled_ranges_overlap(config->framebuffer, required_fb_size,
+                            config->scratch_buffer, required_fb_size)) {
         return ESP_ERR_INVALID_ARG;
     }
     if (config->i2c_freq_hz == 0U || config->i2c_address > 0x7FU ||

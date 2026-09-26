@@ -7,7 +7,12 @@ if(RF_COMMAND_QUEUE_ENABLED)
     add_compile_definitions(RF_COMMAND_QUEUE_ENABLED=1)
 endif()
 
+# The recovery quiesce component is required by the experimental path. ESP-IDF
+# resolves REQUIRES before component-local option values are available, so it is
+# listed here unconditionally. Default-off code does not reference it, and the
+# linker discards the unused static component from the application.
 idf_component_register(SRCS "main.c" ${RF_CQ_EXTRA_SRCS}
                        INCLUDE_DIRS "."
                        REQUIRES driver esp_wifi esp_event esp_netif mqtt nvs_flash
-                                iot_product_config iot_provisioning_wifi_owner ieee802154 esp_coex json)
+                                iot_product_config iot_provisioning_wifi_owner ieee802154 esp_coex json
+                                iot_provisioning_recovery_quiesce)

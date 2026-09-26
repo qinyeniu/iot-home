@@ -37,6 +37,7 @@
 #include "rf_background_command_mapper.h"
 #include "rf_background_dispatch_plan.h"
 #include "rf_background_status_plan.h"
+#include "iot_provisioning_recovery_quiesce.h"
 #endif
 
 #include "esp_sleep.h"
@@ -3694,6 +3695,10 @@ static StaticSemaphore_t s_provisioning_lock_storage;
 static iot_wifi_owner_state_t s_wifi_owner;
 static bool s_wifi_owner_ready;
 static bool s_wifi_owner_skip_logged;
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+static iot_recovery_quiesce_t s_recovery_quiesce;
+static uint32_t s_recovery_operation_id;
+#endif
 
 static bool provisioning_lock_take(void)
 {
@@ -3765,8 +3770,78 @@ static void wifi_owner_runtime_init(void)
 
     owner_result = iot_wifi_owner_init(&s_wifi_owner);
     configASSERT(owner_result == IOT_WIFI_OWNER_OK);
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    configASSERT(iot_recovery_quiesce_init(&s_recovery_quiesce) ==
+                 IOT_RECOVERY_QUIESCE_OK);
+#endif
     s_wifi_owner_ready = true;
 }
+
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+static uint32_t recovery_operation_next_id(void)
+{
+    if (s_recovery_operation_id == UINT32_MAX) {
+        return 0U;
+    }
+    return ++s_recovery_operation_id;
+}
+
+static bool recovery_quiesce_begin(uint32_t *operation_id)
+{
+    uint32_t next_id;
+    iot_recovery_quiesce_result_t result;
+
+    if (operation_id == NULL) {
+        return false;
+    }
+    next_id = recovery_operation_next_id();
+    if (next_id == 0U) {
+        ESP_LOGE(TAG, "RF recovery operation IDs exhausted");
+        return false;
+    }
+
+    if (!provisioning_lock_take()) {
+        return false;
+    }
+    result = iot_recovery_quiesce_begin_operation(&s_recovery_quiesce, next_id);
+    provisioning_lock_give();
+
+    if (result == IOT_RECOVERY_QUIESCE_OK) {
+        *operation_id = next_id;
+        return true;
+    }
+    if (result == IOT_RECOVERY_QUIESCE_BUSY) {
+        ESP_LOGI(TAG, "Provision quiesce active; skip RF health scan");
+    } else {
+        ESP_LOGW(TAG, "RF recovery operation begin failed: %d", (int)result);
+    }
+    return false;
+}
+
+static bool recovery_quiesce_end(uint32_t operation_id,
+                                 bool request_destructive_tail,
+                                 bool *destructive_tail_active)
+{
+    iot_recovery_quiesce_result_t result;
+
+    if (destructive_tail_active == NULL) {
+        return false;
+    }
+    if (!provisioning_lock_take()) {
+        return false;
+    }
+    result = iot_recovery_quiesce_end_operation(
+        &s_recovery_quiesce, operation_id, request_destructive_tail,
+        destructive_tail_active);
+    provisioning_lock_give();
+
+    if (result != IOT_RECOVERY_QUIESCE_OK) {
+        ESP_LOGW(TAG, "RF recovery operation end failed: %d", (int)result);
+        return false;
+    }
+    return true;
+}
+#endif
 
 // A normal router outage still leaves many neighboring 2.4GHz APs visible. If
 // an active scan sees zero APs repeatedly, the Wi-Fi/RF subsystem is wedged in
@@ -3792,6 +3867,16 @@ static void wifi_rf_deep_sleep_recovery(void)
 // proves RF reception works even if the home router itself is temporarily off.
 static bool wifi_rf_health_scan(void)
 {
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    uint32_t operation_id = 0U;
+    bool destructive_tail_claimed = false;
+    bool request_destructive_tail = false;
+
+    if (!recovery_quiesce_begin(&operation_id)) {
+        return false;
+    }
+#endif
+
     wifi_scan_config_t scan_cfg = {
         .show_hidden = true,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
@@ -3808,6 +3893,9 @@ static bool wifi_rf_health_scan(void)
     esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "RF health scan failed to start: %s", esp_err_to_name(err));
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+        (void)recovery_quiesce_end(operation_id, false, &destructive_tail_claimed);
+#endif
         return false;  // Scan failure is not evidence that RF is dead.
     }
 
@@ -3815,6 +3903,9 @@ static bool wifi_rf_health_scan(void)
     err = esp_wifi_scan_get_ap_num(&ap_count);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "RF health scan count failed: %s", esp_err_to_name(err));
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+        (void)recovery_quiesce_end(operation_id, false, &destructive_tail_claimed);
+#endif
         return false;
     }
 
@@ -3840,6 +3931,18 @@ static bool wifi_rf_health_scan(void)
         }
     }
 
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    // Claim the non-returning deep-sleep tail atomically while still under the
+    // coordinator lock. This prevents a provisioning request from completing
+    // after scan end but before the destructive recovery starts.
+    request_destructive_tail = ap_count == 0 &&
+        (s_rf_empty_scans + 1 >= WIFI_RF_EMPTY_LIMIT);
+    if (!recovery_quiesce_end(operation_id, request_destructive_tail,
+                              &destructive_tail_claimed)) {
+        return false;
+    }
+#endif
+
     if (ap_count > 0) {
         s_rf_empty_scans = 0;
         s_rf_environment_alive = true;
@@ -3853,7 +3956,12 @@ static bool wifi_rf_health_scan(void)
     ESP_LOGW(TAG, "RF health scan empty %d/%d (target router off would still show neighbors)",
              s_rf_empty_scans, WIFI_RF_EMPTY_LIMIT);
     if (s_rf_empty_scans >= WIFI_RF_EMPTY_LIMIT) {
-        wifi_rf_deep_sleep_recovery();
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+        if (destructive_tail_claimed)
+#endif
+        {
+            wifi_rf_deep_sleep_recovery();
+        }
     }
     return false;
 }

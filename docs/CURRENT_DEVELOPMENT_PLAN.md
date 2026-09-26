@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 10:58（Asia/Shanghai；完成普通恢复静默协调器，4 小时长测运行中）
+更新时间：2026-09-26 11:52（Asia/Shanghai；I4a 完成 RF health scan 恢复静默接入，4 小时长测运行中）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -227,6 +227,11 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 14. 已完成 I4 前置的普通恢复 in-flight/quiesce 协调器：`firmware/common/iot_provisioning_recovery_quiesce`，可阻止配网 owner 获取期间普通长时扫描或破坏性恢复动作介入。
 15. 协调器已覆盖操作登记、静默请求 BUSY/重试、破坏性尾部 fail-closed、取消、重置，以及 operation_id 全启动周期严格单调和不复用；独立复审 Approve。
 16. 当前协调器尚未接入 `main.c`，默认 OFF/实验 ON 固件大小保持 `0x15fa80`/`0x162660`；下一步按小阶段将其接入 RF health scan，再考虑 owner acquire。
+
+17. I4a 已完成：实验 ON 下 RF health scan 已接入恢复静默协调器；默认 OFF 现网行为不变。
+18. 破坏性 deep-sleep 尾部已改为 coordinator 的显式 tail claim，在同一把配网锁内原子完成；只有 claim 成功才执行 recovery。
+19. I4a 主机 analyzer/`NDEBUG`/cppcheck、完整默认 OFF/实验 ON 构建和独立复审均通过；实验 ON 固件为 `0x162a10`。下一步等待 14:06 长测结束后进入 CQ-4e 硬件短测。
+
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；

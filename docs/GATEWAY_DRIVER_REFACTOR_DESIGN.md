@@ -2,7 +2,7 @@
 
 日期：2026-09-26
 适用固件：`firmware/gateway`
-状态：阶段 A 已完成。基础驱动类型与可复用 SSD1306 组件已落地；默认/实验构建通过，拆分后 5 次硬件通信 PASS。OLED 当前无 I2C ACK，且已确认重构前日志中同样无应答。
+状态：阶段 A/B 已完成。基础驱动类型、可复用 SSD1306 组件和 USB Serial/JTAG 传输组件已落地；默认/实验构建通过，拆分后硬件短测 PASS。OLED 当前无 I2C ACK，且已确认重构前日志中同样无应答。
 
 ## 1. 背景与目标
 
@@ -220,3 +220,20 @@ const iot_driver_t *iot_ssd1306_driver(void);
 - `firmware/gateway/log.cq-clean4h-gateway-20260925-072508.txt` 与 `log.cq-postflash-gateway-20260925-063840.txt` 在重构前已记录同样的“OLED not available”，因此该现象不是本次拆分引入；
 - 拆分后执行 5 次 raw APS 查询：5/5 accepted、REPORT、COMPLETE，5 条 confirm 均为 status=0，`ESP_ERR_NO_MEM=0`，无复位；
 - C/C++ 复审初版 BLOCK（2 个空指针风险），修复后复审 APPROVE。
+
+
+## 8. USB Serial/JTAG 传输组件实施记录（2026-09-26）
+
+新增 `firmware/common/iot_usb_serial_jtag`，负责驱动安装、启动、停止以及任务上下文阻塞读写。命令行编辑、`help`、`rf query`、`rf set`、`rf auto` 的解析和 RF 业务动作仍留在应用层。
+
+组件明确区分两类状态：
+
+- 本实例安装驱动：`driver_owned=true`，停止时允许卸载；
+- 底层驱动已由外部安装：`driver_owned=false`，停止时只解除本实例状态，不执行卸载。
+
+最终构建结果：
+
+- 默认 OFF：`firmware/gateway/build/iot-home-gateway.bin`，`1441920 / 0x160080`，SHA256 `2B848925087EBB5A241CC6E232D6A43895BA29625E44049C4FBB6CB7F5BBBA67`；
+- 实验 ON：`firmware/gateway/build-cq/iot-home-gateway.bin`，`1459552 / 0x164560`，SHA256 `43D8FCD048936077787F244459CAB9F40DE1757BA368FB4DBE97BCD5C324F09720975`。
+
+硬件结果：实验 ON 只写入 COM6 应用区 `0x10000`；稳定在线状态下通过该传输层执行 5 次 raw APS 查询，5/5 accepted、REPORT、COMPLETE，confirm status=0×5，`ESP_ERR_NO_MEM=0`，无复位。C/C++ 复审 **APPROVE**。

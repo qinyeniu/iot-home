@@ -5,6 +5,7 @@ cmake_minimum_required(VERSION 3.16)
 list(APPEND EXTRA_COMPONENT_DIRS "../common/iot_product_config"
                              "../common/iot_driver_base"
                              "../common/iot_ssd1306"
+                             "../common/iot_usb_serial_jtag"
                              "../common/iot_provisioning_session"
                              "../common/iot_provisioning_command"
                              "../common/iot_provisioning_wifi_owner"

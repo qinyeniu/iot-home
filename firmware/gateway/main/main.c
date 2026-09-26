@@ -38,7 +38,7 @@
 #include "rf_background_dispatch_plan.h"
 #include "rf_background_status_plan.h"
 #include "iot_provisioning_recovery_quiesce.h"
-#include "driver/usb_serial_jtag.h"
+#include "iot_usb_serial_jtag.h"
 #endif
 
 #include "esp_sleep.h"
@@ -2647,6 +2647,8 @@ static bool rf_power_queued_set_auto(const char *request_id)
 #define LOCAL_RF_CONSOLE_LINE_SIZE 64u
 #define LOCAL_RF_CONSOLE_STACK     4096u
 
+static iot_usb_serial_jtag_t s_local_rf_console_io;
+
 static char *local_rf_console_trim(char *line)
 {
     char *start = line;
@@ -2671,8 +2673,8 @@ static void local_rf_console_write(const char *text)
     size_t len = strlen(text);
 
     while (len > 0U) {
-        int written = usb_serial_jtag_write_bytes(
-            text, len, pdMS_TO_TICKS(1000));
+        int written = iot_usb_serial_jtag_write(
+            &s_local_rf_console_io, text, len, 1000U);
         if (written <= 0) {
             return;
         }
@@ -2775,8 +2777,8 @@ static void local_rf_console_task(void *arg)
     local_rf_console_write("\r\nExperimental local RF console ready; type help\r\n> ");
 
     for (;;) {
-        int read = usb_serial_jtag_read_bytes(&byte, sizeof(byte),
-                                              pdMS_TO_TICKS(100));
+        int read = iot_usb_serial_jtag_read(&s_local_rf_console_io,
+                                            &byte, sizeof(byte), 100U);
         if (read != (int)sizeof(byte)) {
             continue;
         }
@@ -2800,8 +2802,8 @@ static void local_rf_console_task(void *arg)
         } else if (isprint(byte) || byte == '\t') {
             if (pos < sizeof(line) - 1U) {
                 line[pos++] = (char)byte;
-                (void)usb_serial_jtag_write_bytes(&byte, sizeof(byte),
-                                                  pdMS_TO_TICKS(1000));
+                (void)iot_usb_serial_jtag_write(&s_local_rf_console_io,
+                                                &byte, sizeof(byte), 1000U);
             } else {
                 pos = 0U;
                 memset(line, 0, sizeof(line));
@@ -2813,23 +2815,22 @@ static void local_rf_console_task(void *arg)
 
 static esp_err_t local_rf_console_start(void)
 {
-    usb_serial_jtag_driver_config_t config = {
+    const iot_usb_serial_jtag_config_t config = {
         .tx_buffer_size = 256,
         .rx_buffer_size = 256,
     };
-    bool driver_owned = false;
-    esp_err_t err = usb_serial_jtag_driver_install(&config);
+    esp_err_t err = iot_usb_serial_jtag_init(&s_local_rf_console_io, &config);
+    if (err != ESP_OK) {
+        return err;
+    }
 
-    if (err == ESP_OK) {
-        driver_owned = true;
-    } else if (err != ESP_ERR_INVALID_STATE) {
+    err = iot_usb_serial_jtag_start(&s_local_rf_console_io);
+    if (err != ESP_OK) {
         return err;
     }
     if (xTaskCreate(local_rf_console_task, "local-rf",
                     LOCAL_RF_CONSOLE_STACK, NULL, 4, NULL) != pdTRUE) {
-        if (driver_owned) {
-            (void)usb_serial_jtag_driver_uninstall();
-        }
+        (void)iot_usb_serial_jtag_stop(&s_local_rf_console_io);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;

@@ -22,6 +22,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_mac.h"
 #include "esp_random.h"
@@ -53,6 +54,7 @@
 #include "wifi_secrets.h"
 #include "mqtt_secrets.h"
 #include "iot_product_config.h"
+#include "iot_provisioning_wifi_owner.h"
 #include "cJSON.h"
 #include "zcl/esp_zigbee_zcl_on_off.h"
 
@@ -3681,6 +3683,91 @@ static void boot_restart_count_set(int v)
 static int s_rf_empty_scans = 0;
 static bool s_rf_environment_alive = false;
 
+/*
+ * Provisioning owner gate. I3 only installs the gate and initializes normal
+ * ownership. No code can acquire provision ownership yet, so current Wi-Fi
+ * recovery behavior remains enabled. The mutex is a normal FreeRTOS mutex and
+ * only protects this small RAM state; it is never held while calling Wi-Fi.
+ */
+static SemaphoreHandle_t s_provisioning_lock;
+static StaticSemaphore_t s_provisioning_lock_storage;
+static iot_wifi_owner_state_t s_wifi_owner;
+static bool s_wifi_owner_ready;
+static bool s_wifi_owner_skip_logged;
+
+static bool provisioning_lock_take(void)
+{
+    return s_provisioning_lock != NULL &&
+           xSemaphoreTake(s_provisioning_lock, portMAX_DELAY) == pdTRUE;
+}
+
+static void provisioning_lock_give(void)
+{
+    if (s_provisioning_lock != NULL) {
+        (void)xSemaphoreGive(s_provisioning_lock);
+    }
+}
+
+static bool wifi_owner_gate_allows(const char *action)
+{
+    bool allowed = true;
+    bool should_log_skip = false;
+
+    if (!provisioning_lock_take()) {
+        return true;
+    }
+    allowed = iot_wifi_owner_normal_recovery_allowed(&s_wifi_owner);
+    if (allowed) {
+        s_wifi_owner_skip_logged = false;
+    } else {
+        should_log_skip = !s_wifi_owner_skip_logged;
+        s_wifi_owner_skip_logged = true;
+    }
+    provisioning_lock_give();
+    if (should_log_skip) {
+        ESP_LOGI(TAG, "Provision owner active; skip %s", action);
+    }
+    return allowed;
+}
+
+static bool wifi_owner_sta_start_connect_allowed(void)
+{
+    bool allowed = true;
+    bool should_log_skip = false;
+
+    if (!provisioning_lock_take()) {
+        return true;
+    }
+    allowed = iot_wifi_owner_sta_start_connect_allowed(&s_wifi_owner);
+    if (allowed) {
+        s_wifi_owner_skip_logged = false;
+    } else {
+        should_log_skip = !s_wifi_owner_skip_logged;
+        s_wifi_owner_skip_logged = true;
+    }
+    provisioning_lock_give();
+    if (should_log_skip) {
+        ESP_LOGI(TAG, "Provision owner active; skip STA_START auto-connect");
+    }
+    return allowed;
+}
+
+static void wifi_owner_runtime_init(void)
+{
+    iot_wifi_owner_result_t owner_result;
+
+    if (s_wifi_owner_ready) {
+        return;
+    }
+
+    s_provisioning_lock = xSemaphoreCreateMutexStatic(&s_provisioning_lock_storage);
+    configASSERT(s_provisioning_lock != NULL);
+
+    owner_result = iot_wifi_owner_init(&s_wifi_owner);
+    configASSERT(owner_result == IOT_WIFI_OWNER_OK);
+    s_wifi_owner_ready = true;
+}
+
 // A normal router outage still leaves many neighboring 2.4GHz APs visible. If
 // an active scan sees zero APs repeatedly, the Wi-Fi/RF subsystem is wedged in
 // the state observed on 2026-09-10: esp_restart()/RTS did not recover it, but
@@ -3778,6 +3865,11 @@ static void wifi_reconnect_task(void *arg)
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // wait for first disconnect
         while (!s_wifi_ok) {
+            if (!wifi_owner_gate_allows("Wi-Fi reconnect loop")) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+
             int shift = s_wifi_retry < 6 ? s_wifi_retry : 6;
             int delay = WIFI_RETRY_BASE_MS * (1 << shift);
             if (delay > WIFI_RETRY_MAX_MS) delay = WIFI_RETRY_MAX_MS;
@@ -3786,14 +3878,16 @@ static void wifi_reconnect_task(void *arg)
             // Check the whole 2.4GHz environment, not only the target SSID:
             // neighbors visible + target absent means wait for the router;
             // zero APs repeatedly means the local RF needs a deep power reset.
-            if ((s_wifi_retry >= 2 && s_wifi_retry <= 4) ||
-                (s_wifi_retry >= 8 && (s_wifi_retry % 4) == 0)) {
+            if (((s_wifi_retry >= 2 && s_wifi_retry <= 4) ||
+                 (s_wifi_retry >= 8 && (s_wifi_retry % 4) == 0)) &&
+                wifi_owner_gate_allows("RF health scan")) {
                 wifi_rf_health_scan();
             }
 
             // Boot watchdog: if the radio never associated since power-on
             // (cold-boot RF glitch), perform a warm reboot like pressing RST.
-            if (!s_wifi_ever_connected &&
+            if (wifi_owner_gate_allows("Wi-Fi boot watchdog") &&
+                !s_wifi_ever_connected &&
                 (int64_t)esp_timer_get_time() / 1000 > WIFI_BOOT_GRACE_MS) {
                 int cnt = boot_restart_count_get();
                 if (s_rf_environment_alive) {
@@ -3814,19 +3908,28 @@ static void wifi_reconnect_task(void *arg)
             if (!s_wifi_ok) {
                 // Clear a possibly stuck association first, otherwise
                 // esp_wifi_connect() can fail with "sta is connecting".
+                if (!wifi_owner_gate_allows("manual Wi-Fi disconnect")) {
+                    continue;
+                }
                 esp_wifi_disconnect();
                 vTaskDelay(pdMS_TO_TICKS(100));
+                if (!wifi_owner_gate_allows("manual Wi-Fi connect")) {
+                    continue;
+                }
                 esp_err_t err = esp_wifi_connect();
                 if (err != ESP_OK) {
                     ESP_LOGW(TAG, "WiFi connect returned: %s", esp_err_to_name(err));
                 }
                 s_wifi_retry++;
                 // Periodically recycle the WiFi state machine if it is wedged.
-                if ((s_wifi_retry % 5) == 0) {
+                if ((s_wifi_retry % 5) == 0 &&
+                    wifi_owner_gate_allows("Wi-Fi stop before recovery")) {
                     ESP_LOGW(TAG, "WiFi recovery: stop/start");
                     esp_wifi_stop();
                     vTaskDelay(pdMS_TO_TICKS(500));
-                    esp_wifi_start();  // STA_START event triggers connect again
+                    if (wifi_owner_gate_allows("Wi-Fi start after stop")) {
+                        esp_wifi_start();  // STA_START event triggers connect again
+                    }
                 }
             }
         }
@@ -3836,34 +3939,44 @@ static void wifi_reconnect_task(void *arg)
 static void wifi_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        if (wifi_owner_sta_start_connect_allowed()) {
+            esp_wifi_connect();
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)data;
         ESP_LOGW(TAG, "WiFi disconnected: reason=%d rssi=%d", disc->reason, disc->rssi);
         // Never block here: this callback runs in the system event loop task,
-        // which also delivers Zigbee ZDO signals. Hand off to a reconnect task.
-        s_wifi_ok = false;
-        if (s_wifi_reconn_task) {
-            xTaskNotifyGive(s_wifi_reconn_task);
+        // which also delivers Zigbee ZDO signals. In normal ownership, hand
+        // off to the reconnect task; provisioning events belong to that task.
+        if (wifi_owner_gate_allows("STA_DISCONNECTED reconnect handoff")) {
+            s_wifi_ok = false;
+            if (s_wifi_reconn_task) {
+                xTaskNotifyGive(s_wifi_reconn_task);
+            }
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = data;
-        snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
-        ESP_LOGI(TAG, "WiFi OK, IP: %s", s_ip);
-        s_wifi_retry = 0;
-        s_rf_empty_scans = 0;
-        s_rf_environment_alive = true;
-        s_wifi_ok = true;
-        if (!s_wifi_ever_connected) {
-            s_wifi_ever_connected = true;
-            boot_restart_count_set(0);   // success: allow watchdog again next cold boot
+        if (!wifi_owner_gate_allows("STA_GOT_IP normal state update")) {
+            ESP_LOGI(TAG, "Provision owner active; ignore normal STA GOT_IP");
+        } else {
+            snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
+            ESP_LOGI(TAG, "WiFi OK, IP: %s", s_ip);
+            s_wifi_retry = 0;
+            s_rf_empty_scans = 0;
+            s_rf_environment_alive = true;
+            s_wifi_ok = true;
+            if (!s_wifi_ever_connected) {
+                s_wifi_ever_connected = true;
+                boot_restart_count_set(0);   // success: allow watchdog again next cold boot
+            }
+            xEventGroupSetBits(s_event_group, WIFI_CONNECTED_BIT);
         }
-        xEventGroupSetBits(s_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
 static void wifi_start(void)
 {
+    wifi_owner_runtime_init();
     xTaskCreate(wifi_reconnect_task, "wifi-reconn", 5120, NULL, 4, &s_wifi_reconn_task);
     s_event_group = xEventGroupCreate();
     esp_netif_init();

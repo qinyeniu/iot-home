@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 10:31（Asia/Shanghai；I1 配网任务生命周期内核完成，4 小时长测运行中）
+更新时间：2026-09-26 10:44（Asia/Shanghai；I3 配网 owner gate 接入普通 Wi‑Fi 路径，4 小时长测运行中）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -221,6 +221,10 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 8. S2 设计已完成并复审 Approve（C/H/M/L=0）：见 `docs/PROVISIONING_WIFI_TEST_INTEGRATION_DESIGN.md` 和 `docs/PROVISIONING_WIFI_INTEGRATION_REVIEW_20260926.md`；会话 QUEUED 状态、静态命令队列、Wi‑Fi owner gate、event adapter 和 phase/timeout 均离线完成；下一步按 I1–I8 小阶段集成；真实 `/commit` 必须等待 A/B Bundle 硬件验证。
 9. I1 已完成：新增 `firmware/common/iot_provisioning_worker`，用 RAM-only 状态机管理未来 provisioning-task 的 STOPPED/STARTING/RUNNING/STOPPING；当前不创建任务、不接入 `main.c`、不启动 SoftAP、不调用 Wi‑Fi/MQTT、不写 NVS。
 10. I1 已通过主机 GCC analyzer、`-DNDEBUG`、cppcheck 和独立复审；复审提出的加锁契约已补入接口。默认 OFF/实验 ON 固件大小保持 `0x15f540`/`0x162150`。
+11. I3 已完成：在普通 Wi‑Fi 路径中接入静态 mutex 和 `iot_wifi_owner_state_t`；owner 固定初始化为 NORMAL，当前没有路径 acquire PROVISION。
+12. I3 已在 reconnect loop、RF health scan、boot watchdog、手动 disconnect/connect、Wi‑Fi stop/start、STA_START、STA_DISCONNECTED 和 STA_GOT_IP 前加入闸门；默认现网行为保持。
+13. I3 默认 OFF 固件大小 `0x15fa80`，实验 ON `0x162660`，均剩余 4% 应用分区；独立代码复审 Approve。
+14. 进入 I4 前必须先实现普通恢复操作 in-flight/quiesce 协议，避免长时 RF health scan 与 owner acquire 竞争；未完成前不启用 PROVISION owner acquire。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；

@@ -39,6 +39,12 @@ esp_err_t iot_wifi_sta_configure(const iot_wifi_sta_config_t *config);
 /** Start the configured station. */
 esp_err_t iot_wifi_sta_start(void);
 
+/**
+ * Stop if needed and release Wi-Fi/netif objects owned by this component.
+ * Application event handlers and connection services must be removed first.
+ */
+esp_err_t iot_wifi_sta_deinitialize(void);
+
 /** Set default station scan timing after the station has started. */
 esp_err_t iot_wifi_sta_set_scan_timing(uint16_t active_max_ms,
                                        uint16_t home_chan_dwell_ms);

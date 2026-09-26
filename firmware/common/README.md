@@ -13,5 +13,6 @@
 - `iot_driver_base`：统一最小驱动生命周期（init/start/stop/deinit/poll），未使用回调可为空；
 - `iot_ssd1306`：SSD1306 文本屏驱动，支持 128x32/128x64 配置；实例、framebuffer 和 GRAM scratch 由调用方静态提供，驱动内部不做动态分配；
 - `iot_wifi_sta`：ESP-IDF Wi‑Fi STA 基础连接驱动，封装 netif/event loop 复用、Wi‑Fi 初始化、RAM-only 配置、国家码、省电模式、启动和扫描参数，事件回调与重连策略仍由应用层持有；
+- `iot_wifi_connection`：普通 Wi‑Fi 连接服务，接管事件处理、连接状态、指数退避和重连任务，并通过回调与配网、射频健康、MQTT/Zigbee/OLED 策略解耦；
 - `iot_usb_serial_jtag`：USB Serial/JTAG 传输驱动，统一安装、启动、停止和阻塞读写，命令解析仍属于应用层；
 - 具体业务仍应优先使用强类型驱动 API，`iot_driver_t` 用于统一装配、启动和轮询。

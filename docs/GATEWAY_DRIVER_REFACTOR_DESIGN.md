@@ -2,7 +2,7 @@
 
 日期：2026-09-26
 适用固件：`firmware/gateway`
-状态：阶段 A/B/C 已完成（阶段 C 随本次提交入库）。基础驱动类型、可复用 SSD1306 组件、USB Serial/JTAG 传输组件和 Wi‑Fi STA 基础连接组件已落地；默认/实验构建通过，拆分后默认固件 75 秒硬件短测 PASS。事件回调与重连策略仍暂留在应用层。
+状态：阶段 A/B/C/D 已完成（阶段 C/D 随本次提交入库）。基础驱动类型、可复用 SSD1306 组件、USB Serial/JTAG 传输组件、Wi‑Fi STA 基础连接组件和普通 Wi‑Fi 连接服务已落地；默认/实验构建通过，最终默认固件 75 秒硬件短测 PASS。
 
 ## 1. 背景与目标
 
@@ -399,3 +399,129 @@ SHA256：B8272A3D93707DCE7208613C9D2EFEBBDF8BD793712BB66A1F6FBB69A0731C96
 ### 10.7 后续步骤
 
 下一阶段再评估是否把 Wi‑Fi 事件处理和重连任务迁入 `iot_wifi_connection` 服务。该服务会通过回调或事件接口与 MQTT/Zigbee 解耦，不和本阶段的基础 STA 驱动混在同一次改动中。
+
+## 11. 阶段 D：普通 Wi‑Fi 连接服务（2026-09-26）
+
+### 11.1 拆分边界
+
+在阶段 C 的 `iot_wifi_sta` 基础上，新增 `iot_wifi_connection`：
+
+```text
+firmware/common/iot_wifi_connection/
+├── CMakeLists.txt
+├── include/iot_wifi_connection.h
+└── iot_wifi_connection.c
+```
+
+该服务接管：
+
+- `WIFI_EVENT` / `IP_EVENT` 事件处理注册；
+- STA_START 自动连接；
+- STA_DISCONNECTED 后的连接状态更新与任务通知；
+- GOT_IP 后的连接状态和事件位更新；
+- 指数退避重连；
+- 周期性 `esp_wifi_stop()/start()` 恢复；
+- `is_up()` 与 `wait_connected()` 接口。
+
+仍保留在应用层：
+
+- provisioning owner gate；
+- RF health scan 和目标 SSID 判断；
+- 冷启动 boot watchdog；
+- deep sleep 射频强复位；
+- MQTT、Zigbee、OLED 的状态联动。
+
+### 11.2 回调接口
+
+服务通过回调与应用策略解耦：
+
+- `action_allowed`：按动作询问应用是否允许普通连接恢复；
+- `on_disconnected`：应用记录 reason/rssi；
+- `on_got_ip`：应用更新 IP、射频环境状态；
+- `on_first_connected`：应用清除启动看门狗计数；
+- `on_retry`：应用在特定重试次数执行 RF health scan 和 boot watchdog。
+
+这样服务本身不依赖 provisioning、MQTT、Zigbee、OLED 或产品配置组件。
+
+### 11.3 加固点
+
+- 初始化状态防重入；
+- event group、任务和事件处理器创建失败时回滚；
+- 退避延迟按 64 位计算，避免复用配置较大时溢出；
+- 校验任务优先级、任务栈和退避参数；
+- 连接状态使用 `volatile`，跨事件任务、连接任务和调用方共享；
+- 断开时清除连接事件位；
+- 提供 `iot_wifi_connection_deinitialize()`：先注销 IP/Wi‑Fi 事件，再删除连接任务和 event group，并复位回调与连接状态；
+- 提供 `iot_wifi_sta_deinitialize()`：必要时 stop/deinit Wi‑Fi，再释放该组件拥有的默认 STA netif、默认事件循环和 netif；
+- 应用层 `wifi_start()` 用阶段标记保证失败时按“连接服务 → STA 基础驱动”的顺序逆序清理；
+- CMake 把 `esp_wifi`、`esp_event`、`esp_netif`、`freertos` 和 `log` 作为服务私有依赖。
+
+### 11.4 构建结果
+
+默认 OFF：
+
+```text
+firmware/gateway/build/iot-home-gateway.bin
+大小：1445616 / 0x160ef0
+SHA256：6F99D8CFBA0860E72D0CF259E8FA5A35C3249FE5D080CB407F20A7CE2FF45B72
+```
+
+实验 ON：
+
+```text
+firmware/gateway/build-cq/iot-home-gateway.bin
+大小：1463232 / 0x1653c0
+SHA256：49A7B1D9407E2FD32543180CCE09B9D05A9D5131B57A3210D7AC78C49EA4FB42
+```
+
+### 11.5 硬件短测
+
+最终默认 OFF 固件仅写入 COM6 应用区：
+
+```text
+address：0x10000
+result：Hash of data verified
+Zigbee NVRAM：未擦除
+bootloader：未刷写
+分区表：未刷写
+```
+
+最终提交版本的确认日志：
+
+```text
+backups/hw-postrefactor-20260926/wifi-connection-final-confirm-gateway-75.log
+```
+
+结果：
+
+```text
+取得 IP：1（29.2 秒，192.168.137.140）
+MQTT connected：1（31.1 秒）
+节点入网：1（约 40.0 秒，短地址 0x82cb）
+RF sample：15（14 普通 + 1 RF power report）
+cached report：14
+MQTT telemetry publish：4
+RF power confirm：1
+异常复位：0
+Guru Meditation：0
+abort：0
+```
+
+启动前 30 秒热点触发了 3 次 beacon timeout；连接服务自动重新关联并继续完成 IP/MQTT/Zigbee 全链路。日志中有一次 `i2c: clear bus error`，之后采集和刷新继续执行，未见持续显示或总线故障。
+
+在最终边界修正之前，还执行过一次 100 秒干净启动测试：
+
+```text
+backups/hw-postrefactor-20260926/wifi-connection-deinit-cleanboot-gateway-100.log
+节点 18.6 秒入网，28 条 RF sample，27 条 cached report，9 条 MQTT telemetry，无异常复位。
+```
+
+测试期间也出现过一次目标热点可见但关联较慢的情况，随后设备自恢复。结合多次结果，当前判断 Windows 热点与 Zigbee 共存时会出现偶发关联/信标波动；阶段 D 的拆分没有阻断自动恢复。夜间长测继续重点观察该模式是否高频复发。
+
+### 11.6 最终复审
+
+最终加固版独立复审：**APPROVE**，Critical/High/Medium/Low 均为 0。复审确认反初始化顺序、失败路径资源所有权、重复初始化能力、FreeRTOS 优先级边界和正常启动路径均无阻塞问题。
+
+### 11.7 后续方向
+
+下一阶段再评估是否把 RF health scan、boot watchdog 和 deep sleep 进一步抽象为可替换的连接恢复策略；仍应保持小步提交，避免一次性把 provisioning 和正常连接状态机合并。

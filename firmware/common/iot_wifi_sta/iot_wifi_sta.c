@@ -21,7 +21,10 @@ static esp_netif_t *s_sta_netif;
 static void iot_wifi_sta_rollback(bool deinit_wifi)
 {
     if (deinit_wifi) {
-        esp_wifi_deinit();
+        if (s_started) {
+            (void)esp_wifi_stop();
+        }
+        (void)esp_wifi_deinit();
     }
     if (s_owns_sta_netif && s_sta_netif != NULL) {
         esp_netif_destroy_default_wifi(s_sta_netif);
@@ -193,4 +196,37 @@ esp_err_t iot_wifi_sta_set_scan_timing(uint16_t active_max_ms,
         .home_chan_dwell_time = home_chan_dwell_ms,
     };
     return esp_wifi_set_scan_parameters(&scan_params);
+}
+
+esp_err_t iot_wifi_sta_deinitialize(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t result = ESP_OK;
+    if (s_started) {
+        result = esp_wifi_stop();
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "WiFi stop during deinitialize failed: %s",
+                     esp_err_to_name(result));
+        }
+    }
+
+    const esp_err_t deinit_result = esp_wifi_deinit();
+    if (deinit_result != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi deinit failed: %s",
+                 esp_err_to_name(deinit_result));
+        return deinit_result;
+    }
+
+    iot_wifi_sta_rollback(false);
+    s_initialized = false;
+    s_configured = false;
+    s_started = false;
+    s_owns_netif = false;
+    s_owns_event_loop = false;
+    s_owns_sta_netif = false;
+    s_sta_netif = NULL;
+    return result == ESP_OK ? ESP_OK : result;
 }

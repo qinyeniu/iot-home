@@ -58,13 +58,13 @@
 #include "iot_product_config.h"
 #include "iot_ssd1306.h"
 #include "iot_wifi_sta.h"
+#include "iot_wifi_connection.h"
 #include "iot_provisioning_wifi_owner.h"
 #include "cJSON.h"
 #include "zcl/esp_zigbee_zcl_on_off.h"
 
 // ==================== Configuration ====================
 
-#define WIFI_RETRY_MAX          1000    // ~8 hours of retries
 #define WIFI_RETRY_BASE_MS      1000
 #define WIFI_RETRY_MAX_MS       60000
 #define WIFI_BOOT_GRACE_MS      25000   // if not associated this long after boot,
@@ -141,15 +141,7 @@ void mqtt_pub_retained(const char *topic_suffix, const char *data, bool retain);
 
 static const char *TAG = "iot-gw";
 
-#define WIFI_CONNECTED_BIT  BIT0
-#define MQTT_CONNECTED_BIT  BIT2
-
-static EventGroupHandle_t s_event_group;
-static int s_wifi_retry = 0;
-static TaskHandle_t s_wifi_reconn_task = NULL;
-static volatile bool s_wifi_ever_connected = false;
 static esp_mqtt_client_handle_t s_mqtt = NULL;
-static bool s_wifi_ok = false;
 static bool s_mqtt_ok = false;
 
 // Product runtime configuration. The defaults come from the local lab build
@@ -3573,6 +3565,7 @@ static void boot_restart_count_set(int v)
 
 static int s_rf_empty_scans = 0;
 static bool s_rf_environment_alive = false;
+static bool s_wifi_ever_connected = false;
 
 /*
  * Provisioning owner gate. I3 only installs the gate and initializes normal
@@ -3856,136 +3849,137 @@ static bool wifi_rf_health_scan(void)
     return false;
 }
 
-// Dedicated WiFi reconnect task with exponential backoff.
-// Kept out of the system event loop so Zigbee signals are never blocked.
-static void wifi_reconnect_task(void *arg)
+static const char *wifi_connection_action_name(
+    iot_wifi_connection_action_t action)
 {
-    while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // wait for first disconnect
-        while (!s_wifi_ok) {
-            if (!wifi_owner_gate_allows("Wi-Fi reconnect loop")) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                continue;
-            }
+    switch (action) {
+    case IOT_WIFI_CONNECTION_ACTION_DISCONNECTED_HANDOFF:
+        return "STA_DISCONNECTED reconnect handoff";
+    case IOT_WIFI_CONNECTION_ACTION_GOT_IP:
+        return "STA_GOT_IP normal state update";
+    case IOT_WIFI_CONNECTION_ACTION_RECONNECT_LOOP:
+        return "Wi-Fi reconnect loop";
+    case IOT_WIFI_CONNECTION_ACTION_MANUAL_DISCONNECT:
+        return "manual Wi-Fi disconnect";
+    case IOT_WIFI_CONNECTION_ACTION_MANUAL_CONNECT:
+        return "manual Wi-Fi connect";
+    case IOT_WIFI_CONNECTION_ACTION_STOP_BEFORE_RECOVERY:
+        return "Wi-Fi stop before recovery";
+    case IOT_WIFI_CONNECTION_ACTION_START_AFTER_STOP:
+        return "Wi-Fi start after stop";
+    case IOT_WIFI_CONNECTION_ACTION_STA_START_CONNECT:
+        return "STA_START auto-connect";
+    default:
+        return "Wi-Fi recovery";
+    }
+}
 
-            int shift = s_wifi_retry < 6 ? s_wifi_retry : 6;
-            int delay = WIFI_RETRY_BASE_MS * (1 << shift);
-            if (delay > WIFI_RETRY_MAX_MS) delay = WIFI_RETRY_MAX_MS;
-            ESP_LOGW(TAG, "WiFi lost, retry %d in %dms", s_wifi_retry, delay);
+static bool wifi_connection_action_allowed(
+    iot_wifi_connection_action_t action, void *arg)
+{
+    (void)arg;
+    if (action == IOT_WIFI_CONNECTION_ACTION_STA_START_CONNECT) {
+        return wifi_owner_sta_start_connect_allowed();
+    }
+    return wifi_owner_gate_allows(wifi_connection_action_name(action));
+}
 
-            // Check the whole 2.4GHz environment, not only the target SSID:
-            // neighbors visible + target absent means wait for the router;
-            // zero APs repeatedly means the local RF needs a deep power reset.
-            if (((s_wifi_retry >= 2 && s_wifi_retry <= 4) ||
-                 (s_wifi_retry >= 8 && (s_wifi_retry % 4) == 0)) &&
-                wifi_owner_gate_allows("RF health scan")) {
-                wifi_rf_health_scan();
-            }
+static void wifi_connection_on_retry(uint32_t retry_count,
+                                     uint32_t delay_ms, void *arg)
+{
+    (void)arg;
+    ESP_LOGW(TAG, "WiFi lost, retry %lu in %lums",
+             (unsigned long)retry_count, (unsigned long)delay_ms);
 
-            // Boot watchdog: if the radio never associated since power-on
-            // (cold-boot RF glitch), perform a warm reboot like pressing RST.
-            if (wifi_owner_gate_allows("Wi-Fi boot watchdog") &&
-                !s_wifi_ever_connected &&
-                (int64_t)esp_timer_get_time() / 1000 > WIFI_BOOT_GRACE_MS) {
-                int cnt = boot_restart_count_get();
-                if (s_rf_environment_alive) {
-                    ESP_LOGI(TAG,
-                             "Boot watchdog hold: nearby APs are visible; target SSID absent or association pending, no reboot");
-                } else if (cnt < WIFI_BOOT_MAX_RESTARTS) {
-                    boot_restart_count_set(cnt + 1);
-                    ESP_LOGW(TAG, "WiFi boot watchdog: warm reboot %d/%d",
-                             cnt + 1, WIFI_BOOT_MAX_RESTARTS);
-                    vTaskDelay(pdMS_TO_TICKS(200));
-                    esp_restart();
-                } else {
-                    ESP_LOGE(TAG, "WiFi still down after %d warm reboots; keep retrying", cnt);
-                }
-            }
+    // Check the whole 2.4GHz environment, not only the target SSID:
+    // neighbors visible + target absent means wait for the router;
+    // zero APs repeatedly means the local RF needs a deep power reset.
+    if (((retry_count >= 2U && retry_count <= 4U) ||
+         (retry_count >= 8U && (retry_count % 4U) == 0U)) &&
+        wifi_owner_gate_allows("RF health scan")) {
+        wifi_rf_health_scan();
+    }
 
-            vTaskDelay(pdMS_TO_TICKS(delay));
-            if (!s_wifi_ok) {
-                // Clear a possibly stuck association first, otherwise
-                // esp_wifi_connect() can fail with "sta is connecting".
-                if (!wifi_owner_gate_allows("manual Wi-Fi disconnect")) {
-                    continue;
-                }
-                esp_wifi_disconnect();
-                vTaskDelay(pdMS_TO_TICKS(100));
-                if (!wifi_owner_gate_allows("manual Wi-Fi connect")) {
-                    continue;
-                }
-                esp_err_t err = esp_wifi_connect();
-                if (err != ESP_OK) {
-                    ESP_LOGW(TAG, "WiFi connect returned: %s", esp_err_to_name(err));
-                }
-                s_wifi_retry++;
-                // Periodically recycle the WiFi state machine if it is wedged.
-                if ((s_wifi_retry % 5) == 0 &&
-                    wifi_owner_gate_allows("Wi-Fi stop before recovery")) {
-                    ESP_LOGW(TAG, "WiFi recovery: stop/start");
-                    esp_wifi_stop();
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    if (wifi_owner_gate_allows("Wi-Fi start after stop")) {
-                        esp_wifi_start();  // STA_START event triggers connect again
-                    }
-                }
-            }
+    // Boot watchdog: if the radio never associated since power-on
+    // (cold-boot RF glitch), perform a warm reboot like pressing RST.
+    if (wifi_owner_gate_allows("Wi-Fi boot watchdog") &&
+        !s_wifi_ever_connected &&
+        (int64_t)esp_timer_get_time() / 1000 > WIFI_BOOT_GRACE_MS) {
+        const int cnt = boot_restart_count_get();
+        if (s_rf_environment_alive) {
+            ESP_LOGI(TAG,
+                     "Boot watchdog hold: nearby APs are visible; target SSID absent or association pending, no reboot");
+        } else if (cnt < WIFI_BOOT_MAX_RESTARTS) {
+            boot_restart_count_set(cnt + 1);
+            ESP_LOGW(TAG, "WiFi boot watchdog: warm reboot %d/%d",
+                     cnt + 1, WIFI_BOOT_MAX_RESTARTS);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_restart();
+        } else {
+            ESP_LOGE(TAG, "WiFi still down after %d warm reboots; keep retrying", cnt);
         }
     }
 }
 
-static void wifi_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
+static void wifi_connection_on_disconnected(int reason, int rssi, void *arg)
 {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        if (wifi_owner_sta_start_connect_allowed()) {
-            esp_wifi_connect();
-        }
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)data;
-        ESP_LOGW(TAG, "WiFi disconnected: reason=%d rssi=%d", disc->reason, disc->rssi);
-        // Never block here: this callback runs in the system event loop task,
-        // which also delivers Zigbee ZDO signals. In normal ownership, hand
-        // off to the reconnect task; provisioning events belong to that task.
-        if (wifi_owner_gate_allows("STA_DISCONNECTED reconnect handoff")) {
-            s_wifi_ok = false;
-            if (s_wifi_reconn_task) {
-                xTaskNotifyGive(s_wifi_reconn_task);
-            }
-        }
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *ev = data;
-        if (!wifi_owner_gate_allows("STA_GOT_IP normal state update")) {
-            ESP_LOGI(TAG, "Provision owner active; ignore normal STA GOT_IP");
-        } else {
-            snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
-            ESP_LOGI(TAG, "WiFi OK, IP: %s", s_ip);
-            s_wifi_retry = 0;
-            s_rf_empty_scans = 0;
-            s_rf_environment_alive = true;
-            s_wifi_ok = true;
-            if (!s_wifi_ever_connected) {
-                s_wifi_ever_connected = true;
-                boot_restart_count_set(0);   // success: allow watchdog again next cold boot
-            }
-            xEventGroupSetBits(s_event_group, WIFI_CONNECTED_BIT);
-        }
-    }
+    (void)arg;
+    ESP_LOGW(TAG, "WiFi disconnected: reason=%d rssi=%d", reason, rssi);
+}
+
+static void wifi_connection_on_got_ip(uint32_t ip_address, void *arg)
+{
+    (void)arg;
+    const esp_ip4_addr_t ip = { .addr = ip_address };
+    snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ip));
+    ESP_LOGI(TAG, "WiFi OK, IP: %s", s_ip);
+    s_rf_empty_scans = 0;
+    s_rf_environment_alive = true;
+}
+
+static void wifi_connection_on_first_connected(void *arg)
+{
+    (void)arg;
+    s_wifi_ever_connected = true;
+    boot_restart_count_set(0);   // success: allow watchdog again next cold boot
 }
 
 static void wifi_start(void)
 {
+    bool sta_initialized = false;
+    bool connection_initialized = false;
+
     wifi_owner_runtime_init();
-    xTaskCreate(wifi_reconnect_task, "wifi-reconn", 5120, NULL, 4, &s_wifi_reconn_task);
-    s_event_group = xEventGroupCreate();
+
+    const iot_wifi_connection_callbacks_t callbacks = {
+        .action_allowed = wifi_connection_action_allowed,
+        .on_disconnected = wifi_connection_on_disconnected,
+        .on_got_ip = wifi_connection_on_got_ip,
+        .on_first_connected = wifi_connection_on_first_connected,
+        .on_retry = wifi_connection_on_retry,
+    };
+    const iot_wifi_connection_config_t connection_config = {
+        .callbacks = &callbacks,
+        .retry_base_ms = WIFI_RETRY_BASE_MS,
+        .retry_max_ms = WIFI_RETRY_MAX_MS,
+        .task_stack_size = 5120,
+        .task_priority = 4,
+    };
 
     esp_err_t err = iot_wifi_sta_initialize();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WiFi initialize failed: %s", esp_err_to_name(err));
         return;
     }
+    sta_initialized = true;
 
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_cb, NULL, NULL);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_cb, NULL, NULL);
+    err = iot_wifi_connection_initialize(&connection_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi connection initialize failed: %s",
+                 esp_err_to_name(err));
+        goto cleanup;
+    }
+    connection_initialized = true;
 
     const iot_wifi_sta_config_t sta_config = {
         .ssid = product_wifi_ssid(),
@@ -3995,23 +3989,41 @@ static void wifi_start(void)
     err = iot_wifi_sta_configure(&sta_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WiFi configure failed: %s", esp_err_to_name(err));
-        return;
+        goto cleanup;
     }
 
     err = iot_wifi_sta_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WiFi start failed: %s", esp_err_to_name(err));
-        return;
+        goto cleanup;
     }
 
     // The STA must be started before changing default scan timing. A longer
     // active scan helps in crowded 2.4GHz environments and on channels 12/13.
     err = iot_wifi_sta_set_scan_timing(300, 30);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi set scan parameters failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "WiFi set scan parameters failed: %s",
+                 esp_err_to_name(err));
     }
 
     ESP_LOGI(TAG, "WiFi starting: %s", product_wifi_ssid());
+    return;
+
+cleanup:
+    if (connection_initialized) {
+        const esp_err_t connection_err = iot_wifi_connection_deinitialize();
+        if (connection_err != ESP_OK) {
+            ESP_LOGW(TAG, "WiFi connection deinitialize failed: %s",
+                     esp_err_to_name(connection_err));
+        }
+    }
+    if (sta_initialized) {
+        const esp_err_t sta_err = iot_wifi_sta_deinitialize();
+        if (sta_err != ESP_OK) {
+            ESP_LOGW(TAG, "WiFi STA deinitialize failed: %s",
+                     esp_err_to_name(sta_err));
+        }
+    }
 }
 
 // ==================== MQTT ====================
@@ -4474,7 +4486,7 @@ static void oled_task(void *arg)
             iot_ssd1306_draw_text(&s_oled, 0, 18, line);
 
             snprintf(line, sizeof(line), "WIFI:%s MQTT:%s",
-                     s_wifi_ok ? "OK" : "NO",
+                     iot_wifi_connection_is_up() ? "OK" : "NO",
                      s_mqtt_ok ? "OK" : "NO");
             iot_ssd1306_draw_text(&s_oled, 0, 30, line);
 
@@ -5162,7 +5174,7 @@ void app_main(void)
 #if !ZB_ONLY_RF_DIAG && !ZB_JOIN_BEFORE_WIFI
     // WiFi
     wifi_start();
-    xEventGroupWaitBits(s_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
+    (void)iot_wifi_connection_wait_connected(30000U);
 
     // MQTT
     mqtt_start();
@@ -5235,7 +5247,7 @@ void app_main(void)
     }
 
     wifi_start();
-    xEventGroupWaitBits(s_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
+    (void)iot_wifi_connection_wait_connected(30000U);
     mqtt_start();
 #endif
     

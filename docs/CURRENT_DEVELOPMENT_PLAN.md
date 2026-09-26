@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 10:28（Asia/Shanghai；电池低功耗方案已修订，4 小时长测运行中）
+更新时间：2026-09-26 10:35（Asia/Shanghai；低功耗上报方案已修正，4 小时长测运行中）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -278,6 +278,7 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 - MQTT 安全部署、TLS/WSS 和 VPN 暂不自动执行；
 - 服务器资源需要保留余量，避免后端、MySQL、MQTT、Grafana 或日志占满磁盘/CPU；
 - 所有部署必须准备回退步骤，并避开用户使用网络的时间。
+
 
 
 

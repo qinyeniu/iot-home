@@ -99,15 +99,19 @@ Zigbee Sleepy End Device（SED）
 - 使用独立板入网并跑至少 10 个周期；
 - 获取真实平均电流，不凭开发板标称值判断。
 
-### P1：减少上报次数
+### P1：减少上报次数（产品方向需用户确认）
 
-当前温湿度、湿度、光照分三条 ZCL report，射频事务较多。后续应改为**一条多属性 ZCL report**：
+当前温湿度、湿度、光照分三条标准 ZCL report，射频事务较多。需要注意：这三个值属于三个不同 ZCL cluster，**标准 ZCL 不能跨 cluster 合为一条多属性 report**。
 
-```text
-一个 ZCL frame 内包含 temperature + humidity + illuminance
-```
+可选方案：
 
-目标：减少 APS 请求、CPU 唤醒和射频发射次数。改动前必须确认网关现有 ZCL report 解析器支持同一帧多个属性，并用主机定向测试覆盖。
+| 方案 | 优点 | 代价 |
+|---|---|---|
+| 保持三条标准 report | 标准兼容、网关改动小 | 三次 APS/射频事务，能耗较高 |
+| 拉长采样周期 | 改动最小，显著降低平均电流 | 数据实时性下降 |
+| 新增自定义 sensor telemetry cluster | 一条 APS 帧携带三项数据和电池状态，最省电 | 网关需自定义解析；降低标准互操作性 |
+
+建议先完成电流实测。若三条 report 的能耗占比不高，优先保持标准兼容；若确认射频事务是主要消耗，再离线设计和评审自定义 sensor telemetry cluster，不与其他改动混做。
 
 ### P2：硬件电源域
 
@@ -162,4 +166,5 @@ deep sleep 版本的唤醒流程应固定为：
 - 不刷 bootloader/分区表，不擦 Zigbee NVRAM；
 - 不启用 Secure Boot、Flash encryption 或 NVS encryption；
 - 不在没有电流实测前承诺电池续航。
+
 

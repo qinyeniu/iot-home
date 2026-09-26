@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 10:05（Asia/Shanghai；S2 Wi‑Fi phase/timeout 已完成，CQ-4e 等待上行热点恢复）
+更新时间：2026-09-26 10:08（Asia/Shanghai；4 小时长测运行中，CQ-4e 等待上行热点恢复）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -9,7 +9,7 @@
 
 系统是三层架构：Zigbee 节点 → ESP32-C6 网关 → Wi‑Fi/MQTT → FastAPI/MySQL/Grafana。
 
-> 10:05 状态：S2 配网命令队列、Wi‑Fi owner gate、event adapter 和 phase/timeout 已完成离线验证；实验网关已只烧应用区，节点已 rejoin。因电脑热点未广播，用户 QUERY/SET 序列等待网络恢复后继续。
+> 10:08 状态：4 小时双端长测运行中；S2 配网命令队列、owner gate、event adapter 和 phase/timeout 已完成离线验证。因电脑热点未广播，用户 QUERY/SET 序列等待网络恢复后继续。
 
 ### 1.1 已经验证的主链路
 
@@ -278,6 +278,7 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 - MQTT 安全部署、TLS/WSS 和 VPN 暂不自动执行；
 - 服务器资源需要保留余量，避免后端、MySQL、MQTT、Grafana 或日志占满磁盘/CPU；
 - 所有部署必须准备回退步骤，并避开用户使用网络的时间。
+
 
 
 

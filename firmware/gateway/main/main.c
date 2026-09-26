@@ -57,6 +57,7 @@
 #include "mqtt_secrets.h"
 #include "iot_product_config.h"
 #include "iot_ssd1306.h"
+#include "iot_wifi_sta.h"
 #include "iot_provisioning_wifi_owner.h"
 #include "cJSON.h"
 #include "zcl/esp_zigbee_zcl_on_off.h"
@@ -3976,83 +3977,36 @@ static void wifi_start(void)
     wifi_owner_runtime_init();
     xTaskCreate(wifi_reconnect_task, "wifi-reconn", 5120, NULL, 4, &s_wifi_reconn_task);
     s_event_group = xEventGroupCreate();
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-    
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_err_t err = esp_wifi_init(&cfg);
+
+    esp_err_t err = iot_wifi_sta_initialize();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "WiFi initialize failed: %s", esp_err_to_name(err));
+        return;
     }
 
-    
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_cb, NULL, NULL);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_cb, NULL, NULL);
-    
-    // Keep Wi-Fi credentials/config in RAM instead of NVS. The home router may
-    // change 2.4G channel (observed ch13 -> ch7), and stale cached BSSID/channel
-    // data must not steer scans toward an old AP location.
-    esp_err_t storage_err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    if (storage_err != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi set RAM storage failed: %s", esp_err_to_name(storage_err));
-    }
 
-    // Scan every 2.4G channel before each association rather than using fast
-    // scan. This tolerates router channel changes and transient AP restarts.
-    wifi_config_t wcfg = {
-        .sta = {
-            .scan_method = WIFI_ALL_CHANNEL_SCAN,
-            .bssid_set = false,
-            .channel = 0,
-            .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
-            .failure_retry_cnt = 3,
-            .threshold = {
-                .rssi = -127,
-                .authmode = WIFI_AUTH_WPA2_PSK,
-            },
-        },
+    const iot_wifi_sta_config_t sta_config = {
+        .ssid = product_wifi_ssid(),
+        .password = product_wifi_password(),
+        .power_save = WIFI_PS_MIN_MODEM,
     };
-    // Runtime values live in RAM-backed product config. Copy them into the IDF
-    // arrays after initialization because designated initializers cannot copy
-    // char arrays from pointer-returning accessors.
-    strlcpy((char *)wcfg.sta.ssid, product_wifi_ssid(),
-            sizeof(wcfg.sta.ssid));
-    strlcpy((char *)wcfg.sta.password, product_wifi_password(),
-            sizeof(wcfg.sta.password));
-    esp_wifi_set_mode(WIFI_MODE_STA);
-
-    // Chinese home routers may select channel 12/13. The IDF default [01]
-    // scans only 1-11; explicitly allow the CN 2.4GHz channel range.
-    wifi_country_t country = {
-        .cc = {'C', 'N'},
-        .schan = 1,
-        .nchan = 13,
-        .policy = WIFI_COUNTRY_POLICY_MANUAL,
-    };
-    err = esp_wifi_set_country(&country);
+    err = iot_wifi_sta_configure(&sta_config);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi set country failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "WiFi configure failed: %s", esp_err_to_name(err));
+        return;
     }
 
-    // Balance Windows-hotspot stability with the active 802.15.4 coordinator.
-    // NONE starves Zigbee association, while MAX_MODEM can leave the Wi-Fi
-    // protocol task poorly served on this hotspot; use the lighter MIN_MODEM.
-    err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    err = iot_wifi_sta_start();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi set power save failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "WiFi start failed: %s", esp_err_to_name(err));
+        return;
     }
-    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
-    esp_wifi_start();
 
     // The STA must be started before changing default scan timing. A longer
     // active scan helps in crowded 2.4GHz environments and on channels 12/13.
-    wifi_scan_default_params_t scan_params = {
-        .scan_time.active.min = 0,
-        .scan_time.active.max = 300,
-        .home_chan_dwell_time = 30,
-    };
-    err = esp_wifi_set_scan_parameters(&scan_params);
+    err = iot_wifi_sta_set_scan_timing(300, 30);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "WiFi set scan parameters failed: %s", esp_err_to_name(err));
     }

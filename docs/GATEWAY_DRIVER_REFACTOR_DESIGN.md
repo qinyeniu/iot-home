@@ -2,7 +2,7 @@
 
 日期：2026-09-26
 适用固件：`firmware/gateway`
-状态：阶段 A/B 已完成。基础驱动类型、可复用 SSD1306 组件和 USB Serial/JTAG 传输组件已落地；默认/实验构建通过，拆分后硬件短测 PASS。当前面板经用户确认按 128x64、vertical addressing 整帧刷新，显示正常。
+状态：阶段 A/B/C 已完成（阶段 C 随本次提交入库）。基础驱动类型、可复用 SSD1306 组件、USB Serial/JTAG 传输组件和 Wi‑Fi STA 基础连接组件已落地；默认/实验构建通过，拆分后默认固件 75 秒硬件短测 PASS。事件回调与重连策略仍暂留在应用层。
 
 ## 1. 背景与目标
 
@@ -309,3 +309,93 @@ I2C transaction timeout=1000 ms
 - 用户确认 OLED 显示恢复正常。
 
 复审：初次复审 APPROVE（指出 1 个 M、3 个 L 的加固建议）；完成加固后的增量复审 APPROVE，C/H/M/L=0。
+
+## 10. 阶段 C：Wi‑Fi STA 基础连接驱动（2026-09-26）
+
+### 10.1 拆分边界
+
+本阶段新增通用组件 `iot_wifi_sta`，只封装稳定的 ESP-IDF Wi‑Fi STA 底层动作：
+
+- `esp_netif` 初始化、默认事件循环复用和默认 STA netif 创建；
+- `esp_wifi_init()` 与 RAM-only Wi‑Fi storage；
+- STA 扫描方式、凭据、国家码、省电模式和连接参数；
+- 启动 STA；
+- 设置默认主动扫描时长和 home channel dwell time。
+
+本阶段**不移动**：
+
+- `wifi_cb()`：仍由应用层处理 Wi‑Fi/IP 事件；
+- `wifi_reconnect_task()`：重连和 RF 健康恢复仍保留在 `main.c`；
+- provisioning owner gate、recovery quiesce：它们属于服务/策略层，后续单独拆分。
+
+### 10.2 接口形状
+
+组件使用全局 Wi‑Fi 单例，但不隐藏事件注册：
+
+```c
+esp_err_t iot_wifi_sta_initialize(void);
+esp_err_t iot_wifi_sta_configure(const iot_wifi_sta_config_t *config);
+esp_err_t iot_wifi_sta_start(void);
+esp_err_t iot_wifi_sta_set_scan_timing(uint16_t active_max_ms,
+                                       uint16_t home_chan_dwell_ms);
+```
+
+应用层仍在 initialize 之后、start 之前注册 `WIFI_EVENT` 和 `IP_EVENT`，以保证事件回调能继续使用现有 MQTT、Zigbee、OLED 和状态位。
+
+### 10.3 行为约束
+
+- 不引入动态分配；
+- 不改变 SSID/password 的来源，仍由产品配置访问器提供；
+- 国家码继续固定为 CN，允许 1..13 信道；
+- 省电模式通过配置传入，当前网关使用 `WIFI_PS_MIN_MODEM`；
+- 凭据继续只存在于 RAM，不写入文档；
+- 本阶段完成后必须保持默认 OFF 与实验 ON 均可构建。
+
+### 10.4 实现加固
+
+第一次复审后，在提交前补充了以下防护：
+
+- 使用 `s_initialized / s_configured / s_started` 区分生命周期，避免重复初始化、重复配置或重复启动；
+- 记录组件是否拥有全局 netif、默认事件循环和默认 STA netif；初始化失败时按创建顺序回滚；
+- `esp_wifi_set_storage(WIFI_STORAGE_RAM)` 失败时中止初始化，不把组件标记为可用；
+- 显式校验 SSID 非空且不超过 IDF 数组容量，WPA2 密码长度为 8..63，拒绝 64 字节输入造成静默截断；
+- 先设置 STA mode、CN 国家码和省电模式，再把密码放入栈上 `wifi_config_t`；
+- `esp_wifi_set_config()` 返回后立即清零栈上凭据结构；
+- CMake 只公开 `esp_wifi`，把 `esp_event`、`esp_netif` 和 `log` 作为私有依赖。
+
+### 10.5 验证结果
+
+默认 OFF：
+
+```text
+firmware/gateway/build/iot-home-gateway.bin
+大小：1443664 / 0x160750
+SHA256：D8A55421B6928D0CFACAD3F7313B00BF32FDE112F719298AD2CD287232B7A4C2
+```
+
+实验 ON：
+
+```text
+firmware/gateway/build-cq/iot-home-gateway.bin
+大小：1461280 / 0x164C20
+SHA256：B8272A3D93707DCE7208613C9D2EFEBBDF8BD793712BB66A1F6FBB69A0731C96
+```
+
+硬件短测：
+
+- COM6 仅写入应用区 `0x10000`，未擦 Zigbee NVRAM，未刷 bootloader/分区表，写入哈希校验通过；
+- 日志：`backups/hw-postrefactor-20260926/wifi-sta-refactor-hardened-gateway-75.log`；
+- 节点约 20.2 秒入网，短地址 `0x82cb`；
+- 采集到 19 条 RF sample、18 条 cached report、6 条 MQTT telemetry 发布；
+- RF power confirm 正常；
+- 异常复位、Guru Meditation 和 abort 均为 0。
+
+此前冷启动阶段出现过一次 Interrupt Watchdog 重启；重构前日志中已有相同调用栈，最终加固版 75 秒短测未复现，当前不判定为本阶段拆分引入。
+
+### 10.6 最终复审
+
+最终加固版独立复审：**APPROVE**，Critical/High/Medium/Low 均为 0。复审确认生命周期状态、失败回滚、全局 netif/event loop 复用、凭据边界、ESP-IDF API 顺序、运行时行为和 CMake 依赖均无阻塞问题。
+
+### 10.7 后续步骤
+
+下一阶段再评估是否把 Wi‑Fi 事件处理和重连任务迁入 `iot_wifi_connection` 服务。该服务会通过回调或事件接口与 MQTT/Zigbee 解耦，不和本阶段的基础 STA 驱动混在同一次改动中。

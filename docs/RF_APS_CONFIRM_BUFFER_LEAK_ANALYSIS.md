@@ -83,3 +83,16 @@ esp_zb_aps_data_confirm_handler_register(aps_data_confirm_cb);
 3. 先做硬件短测，确认发送后可见 APS confirm，且节点 REPORT 关联仍正常；
 4. 后续再安排缩短周期或长测，要求成功发送数显著超过此前 32–33 次阈值且不再出现 `ESP_ERR_NO_MEM`；
 5. 不擦 Zigbee NVRAM，不刷 bootloader/分区表，不 push。
+
+## 6. 修复后硬件短测结果（2026-09-26）
+
+仅烧录 COM6 网关应用区 `0x10000`，未擦 Zigbee NVRAM，未刷 bootloader/分区表。修复后累计完成 81 次 raw APS 发送：1 次链路临时异常探测、40 次快速查询、40 次 3 秒间隔查询。
+
+关键结果：
+
+- 快速 40 次：40/40 accepted、REPORT、COMPLETE；日志内 39 条 APS confirm；`ESP_ERR_NO_MEM=0`；
+- 慢速 40 次：40/40 accepted、REPORT、COMPLETE；日志内 40 条 APS confirm，其中 39 条 status=0、1 条 status=89；`ESP_ERR_NO_MEM=0`；
+- 标准 Zigbee 遥测继续到达，未出现 Guru Meditation、abort 或异常复位；
+- 慢速中的 status=89 在发送后约 12 秒返回，仍进入 confirm wrapper，因此原始 buffer 被释放。
+
+结论：修复后成功发送次数已明显超过旧阈值 32–33 次，硬件短测 **PASS**。后续仍需安排修复后的 4 小时长测，并单独关注偶发 APS confirm status=89 所代表的弱链路/共存问题。

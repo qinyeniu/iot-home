@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 10:35（Asia/Shanghai；低功耗上报方案已修正，4 小时长测运行中）
+更新时间：2026-09-26 10:31（Asia/Shanghai；I1 配网任务生命周期内核完成，4 小时长测运行中）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -219,6 +219,8 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 6. 组件非线程安全，真实 HTTP 集成必须单任务调用或加锁；
 7. 默认 OFF bin 仍为 `0x15f540`，实验 ON bin 仍为 `0x162150`；
 8. S2 设计已完成并复审 Approve（C/H/M/L=0）：见 `docs/PROVISIONING_WIFI_TEST_INTEGRATION_DESIGN.md` 和 `docs/PROVISIONING_WIFI_INTEGRATION_REVIEW_20260926.md`；会话 QUEUED 状态、静态命令队列、Wi‑Fi owner gate、event adapter 和 phase/timeout 均离线完成；下一步按 I1–I8 小阶段集成；真实 `/commit` 必须等待 A/B Bundle 硬件验证。
+9. I1 已完成：新增 `firmware/common/iot_provisioning_worker`，用 RAM-only 状态机管理未来 provisioning-task 的 STOPPED/STARTING/RUNNING/STOPPING；当前不创建任务、不接入 `main.c`、不启动 SoftAP、不调用 Wi‑Fi/MQTT、不写 NVS。
+10. I1 已通过主机 GCC analyzer、`-DNDEBUG`、cppcheck 和独立复审；复审提出的加锁契约已补入接口。默认 OFF/实验 ON 固件大小保持 `0x15f540`/`0x162150`。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；

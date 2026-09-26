@@ -8,6 +8,7 @@ list(APPEND EXTRA_COMPONENT_DIRS "../common/iot_product_config"
                              "../common/iot_provisioning_wifi_owner"
                              "../common/iot_provisioning_wifi_event"
                              "../common/iot_provisioning_wifi_phase"
+                             "../common/iot_provisioning_worker"
                              "../common/iot_provisioning_http")
 
 # Include the ESP-IDF CMake functions

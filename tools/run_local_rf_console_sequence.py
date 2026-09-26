@@ -102,7 +102,10 @@ def wait_for_transaction(
     accepted = None
 
     while time.monotonic() < deadline:
-        emit(ser.read(4096), log_file)
+        data = ser.read(4096)
+        if data:
+            emit(data, log_file)
+            buffer.extend(data)
         if accepted is None:
             accepted_matches = list(ACCEPTED_RE.finditer(buffer))
             if accepted_matches:

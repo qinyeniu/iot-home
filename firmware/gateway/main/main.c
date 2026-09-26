@@ -2629,7 +2629,7 @@ static bool rf_power_queued_set_auto(const char *request_id)
 // MQTT so manufacturing/field tests can exercise the RF queue without changing
 // the host network configuration. Physical USB access is required.
 #define LOCAL_RF_CONSOLE_LINE_SIZE 64u
-#define LOCAL_RF_CONSOLE_STACK     3072u
+#define LOCAL_RF_CONSOLE_STACK     4096u
 
 static char *local_rf_console_trim(char *line)
 {

@@ -38,6 +38,7 @@
 #include "rf_background_dispatch_plan.h"
 #include "rf_background_status_plan.h"
 #include "iot_provisioning_recovery_quiesce.h"
+#include "driver/usb_serial_jtag.h"
 #endif
 
 #include "esp_sleep.h"
@@ -1431,6 +1432,12 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
             rf_power_publish_state(ind.src_short_addr, reported_power,
                                    reported_mode, publish_status_name,
                                    publish_request_id);
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+            if (publish_request_id != NULL) {
+                ESP_LOGI(TAG, "LOCAL_RF_COMPLETE request_id=%s",
+                         publish_request_id);
+            }
+#endif
         }
     } else if (reject_reason == RF_REJECT_UNSECURED) {
         ESP_LOGW(TAG, "RF power: reject unsecured frame cluster=0x%04x",
@@ -2364,7 +2371,7 @@ static void rf_power_submit_new_intent(const rf_dispatch_cmd_t *cmd)
     taskEXIT_CRITICAL(&s_rf_power_lock);
 }
 
-static void rf_power_queued_query(const char *request_id)
+static bool rf_power_queued_query(const char *request_id)
 {
     rf_dispatch_cmd_t cmd;
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
@@ -2377,14 +2384,14 @@ static void rf_power_queued_query(const char *request_id)
     if (rf_cq_build_user_query(rf_power_new_command_id(), request_id, now,
                                &cmd) != RF_CQ_OK) {
         ESP_LOGW(TAG, "RF power: reject queued QUERY");
-        return;
+        return false;
     }
 
     taskENTER_CRITICAL(&s_rf_power_lock);
     now = pdTICKS_TO_MS(xTaskGetTickCount());
     if (generation != s_rf_policy_generation) {
         taskEXIT_CRITICAL(&s_rf_power_lock);
-        return;
+        return false;
     }
     // A new QUERY may take over only after the previous waiting transaction is
     // actually due. Otherwise the old command's REPORT could be misattributed
@@ -2393,15 +2400,16 @@ static void rf_power_queued_query(const char *request_id)
         !rf_power_expire_waiting_if_due_locked(now)) {
         ESP_LOGW(TAG, "RF power: QUERY ignored while another report is pending");
         taskEXIT_CRITICAL(&s_rf_power_lock);
-        return;
+        return false;
     }
     rf_power_arm_user_intent_locked(&cmd, now);
     taskEXIT_CRITICAL(&s_rf_power_lock);
 
     rf_power_submit_new_intent(&cmd);
+    return true;
 }
 
-static void rf_power_queued_set_manual(
+static bool rf_power_queued_set_manual(
     int8_t target_power_dbm, const char *request_id)
 {
     rf_dispatch_cmd_t cmd;
@@ -2411,7 +2419,13 @@ static void rf_power_queued_set_manual(
     if (!rf_power_is_allowed_value(target_power_dbm)) {
         ESP_LOGW(TAG, "RF power: reject queued target=%d dBm",
                  (int)target_power_dbm);
-        return;
+        return false;
+    }
+    if (rf_cq_build_user_manual_set(rf_power_new_command_id(),
+                                   target_power_dbm, request_id, now,
+                                   &cmd) != RF_CQ_OK) {
+        ESP_LOGW(TAG, "RF power: reject queued MANUAL SET");
+        return false;
     }
 
     taskENTER_CRITICAL(&s_rf_power_lock);
@@ -2421,23 +2435,17 @@ static void rf_power_queued_set_manual(
 
     rf_power_policy_persist(RF_MODE_MANUAL, target_power_dbm);
 
-    now = pdTICKS_TO_MS(xTaskGetTickCount());
-    if (rf_cq_build_user_manual_set(rf_power_new_command_id(),
-                                   target_power_dbm, request_id, now,
-                                   &cmd) != RF_CQ_OK) {
-        ESP_LOGW(TAG, "RF power: reject queued MANUAL SET");
-        return;
-    }
-
     taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
     if (generation != s_rf_policy_generation) {
         taskEXIT_CRITICAL(&s_rf_power_lock);
-        return;
+        return false;
     }
     rf_power_arm_user_intent_locked(&cmd, now);
     taskEXIT_CRITICAL(&s_rf_power_lock);
 
     rf_power_submit_new_intent(&cmd);
+    return true;
 }
 
 static void rf_power_reconcile_pending_intent(void)
@@ -2578,7 +2586,7 @@ static void rf_power_reconcile_pending_intent(void)
     taskEXIT_CRITICAL(&s_rf_power_lock);
 }
 
-static void rf_power_queued_set_auto(const char *request_id)
+static bool rf_power_queued_set_auto(const char *request_id)
 {
     rf_dispatch_cmd_t cmd;
     int8_t manual_power_dbm = RF_POWER_AUTO_MIN_DBM;
@@ -2587,29 +2595,228 @@ static void rf_power_queued_set_auto(const char *request_id)
 
     taskENTER_CRITICAL(&s_rf_power_lock);
     manual_power_dbm = s_rf_manual_power_dbm;
+    taskEXIT_CRITICAL(&s_rf_power_lock);
+
+    if (rf_cq_build_user_auto_set(rf_power_new_command_id(),
+                                 manual_power_dbm, request_id, now,
+                                 &cmd) != RF_CQ_OK) {
+        ESP_LOGW(TAG, "RF power: reject queued AUTO SET");
+        return false;
+    }
+
+    taskENTER_CRITICAL(&s_rf_power_lock);
     rf_power_prepare_auto_policy_locked(request_id, now);
     generation = s_rf_policy_generation;
     taskEXIT_CRITICAL(&s_rf_power_lock);
 
     rf_power_policy_persist(RF_MODE_AUTO, manual_power_dbm);
 
-    now = pdTICKS_TO_MS(xTaskGetTickCount());
-    if (rf_cq_build_user_auto_set(rf_power_new_command_id(),
-                                 manual_power_dbm, request_id, now,
-                                 &cmd) != RF_CQ_OK) {
-        ESP_LOGW(TAG, "RF power: reject queued AUTO SET");
-        return;
-    }
-
     taskENTER_CRITICAL(&s_rf_power_lock);
+    now = pdTICKS_TO_MS(xTaskGetTickCount());
     if (generation != s_rf_policy_generation) {
         taskEXIT_CRITICAL(&s_rf_power_lock);
-        return;
+        return false;
     }
     rf_power_arm_user_intent_locked(&cmd, now);
     taskEXIT_CRITICAL(&s_rf_power_lock);
 
     rf_power_submit_new_intent(&cmd);
+    return true;
+}
+
+
+// Experimental local RF maintenance console. It is intentionally separate from
+// MQTT so manufacturing/field tests can exercise the RF queue without changing
+// the host network configuration. Physical USB access is required.
+#define LOCAL_RF_CONSOLE_LINE_SIZE 64u
+#define LOCAL_RF_CONSOLE_STACK     3072u
+
+static char *local_rf_console_trim(char *line)
+{
+    char *start = line;
+    size_t len;
+
+    while (isspace((unsigned char)*start)) {
+        ++start;
+    }
+    if (*start == '\0') {
+        return start;
+    }
+
+    len = strlen(start);
+    while (len > 0U && isspace((unsigned char)start[len - 1U])) {
+        start[--len] = '\0';
+    }
+    return start;
+}
+
+static void local_rf_console_write(const char *text)
+{
+    size_t len = strlen(text);
+
+    while (len > 0U) {
+        int written = usb_serial_jtag_write_bytes(
+            text, len, pdMS_TO_TICKS(1000));
+        if (written <= 0) {
+            return;
+        }
+        text += written;
+        len -= (size_t)written;
+    }
+}
+
+static void local_rf_console_help(void)
+{
+    local_rf_console_write(
+        "Experimental local RF console\r\n"
+        "Commands:\r\n"
+        "  help\r\n"
+        "  rf query\r\n"
+        "  rf set 0\r\n"
+        "  rf set -10\r\n"
+        "  rf auto\r\n");
+}
+
+static void local_rf_console_accepted(const char *operation,
+                                      const char *request_id)
+{
+    char response[64];
+    int len = snprintf(response, sizeof(response),
+                       "LOCAL_RF_ACCEPTED %s request_id=%s\r\n",
+                       operation, request_id);
+    if (len > 0) {
+        local_rf_console_write(response);
+    }
+}
+
+static void local_rf_console_busy(const char *operation)
+{
+    char response[64];
+    int len = snprintf(response, sizeof(response),
+                       "LOCAL_RF_BUSY %s\r\n", operation);
+    if (len > 0) {
+        local_rf_console_write(response);
+    }
+}
+
+static void local_rf_console_dispatch(const char *line)
+{
+    char request_id[RF_CQ_REQUEST_ID_SIZE] = {0};
+    int target_power = 0;
+    char extra = '\0';
+    int parsed = -1;
+
+    rf_power_generate_cq_request_id(request_id);
+
+    if (strcmp(line, "help") == 0) {
+        local_rf_console_help();
+        return;
+    }
+    if (strcmp(line, "rf query") == 0) {
+        if (rf_power_queued_query(request_id)) {
+            local_rf_console_accepted("query", request_id);
+        } else {
+            local_rf_console_busy("query");
+        }
+        return;
+    }
+    if (strcmp(line, "rf auto") == 0) {
+        if (rf_power_queued_set_auto(request_id)) {
+            local_rf_console_accepted("auto", request_id);
+        } else {
+            local_rf_console_busy("auto");
+        }
+        return;
+    }
+
+    parsed = sscanf(line, "rf set %d %c", &target_power, &extra);
+    if (parsed == 1 && target_power >= -128 && target_power <= 127) {
+        int8_t power = (int8_t)target_power;
+        if (rf_cq_supported_power(power)) {
+            char operation[24];
+            int len = snprintf(operation, sizeof(operation),
+                               "set %d", (int)power);
+            if (len > 0 &&
+                rf_power_queued_set_manual(power, request_id)) {
+                local_rf_console_accepted(operation, request_id);
+            } else {
+                local_rf_console_busy("set");
+            }
+            return;
+        }
+    }
+
+    local_rf_console_write("Unknown command; type help\r\n");
+}
+
+static void local_rf_console_task(void *arg)
+{
+    char line[LOCAL_RF_CONSOLE_LINE_SIZE] = {0};
+    size_t pos = 0U;
+    uint8_t byte = 0U;
+
+    (void)arg;
+    local_rf_console_write("\r\nExperimental local RF console ready; type help\r\n> ");
+
+    for (;;) {
+        int read = usb_serial_jtag_read_bytes(&byte, sizeof(byte),
+                                              pdMS_TO_TICKS(100));
+        if (read != (int)sizeof(byte)) {
+            continue;
+        }
+
+        if (byte == '\r' || byte == '\n') {
+            char *command;
+
+            local_rf_console_write("\r\n");
+            line[pos] = '\0';
+            command = local_rf_console_trim(line);
+            if (*command != '\0') {
+                local_rf_console_dispatch(command);
+            }
+            pos = 0U;
+            memset(line, 0, sizeof(line));
+            local_rf_console_write("> ");
+        } else if (byte == 0x03U) {
+            pos = 0U;
+            memset(line, 0, sizeof(line));
+            local_rf_console_write("\r\n> ");
+        } else if (isprint(byte) || byte == '\t') {
+            if (pos < sizeof(line) - 1U) {
+                line[pos++] = (char)byte;
+                (void)usb_serial_jtag_write_bytes(&byte, sizeof(byte),
+                                                  pdMS_TO_TICKS(1000));
+            } else {
+                pos = 0U;
+                memset(line, 0, sizeof(line));
+                local_rf_console_write("\r\nLine too long\r\n> ");
+            }
+        }
+    }
+}
+
+static esp_err_t local_rf_console_start(void)
+{
+    usb_serial_jtag_driver_config_t config = {
+        .tx_buffer_size = 256,
+        .rx_buffer_size = 256,
+    };
+    bool driver_owned = false;
+    esp_err_t err = usb_serial_jtag_driver_install(&config);
+
+    if (err == ESP_OK) {
+        driver_owned = true;
+    } else if (err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+    if (xTaskCreate(local_rf_console_task, "local-rf",
+                    LOCAL_RF_CONSOLE_STACK, NULL, 4, NULL) != pdTRUE) {
+        if (driver_owned) {
+            (void)usb_serial_jtag_driver_uninstall();
+        }
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 #endif
@@ -5369,6 +5576,13 @@ void app_main(void)
 #endif
     
     ESP_LOGI(TAG, "Gateway ready!");
+
+#if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
+    ret = local_rf_console_start();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Local RF console unavailable: %s", esp_err_to_name(ret));
+    }
+#endif
     
     // Main loop
     while (1) {

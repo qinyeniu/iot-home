@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 15:08（Asia/Shanghai；CQ-4e 本地 RF 硬件序列 PASS、拔节点不重启 PASS，待确认接回 secure rejoin）
+更新时间：2026-09-26 15:46（Asia/Shanghai；CQ-4e 本地 RF 序列、拔节点不重启和接回 secure rejoin 均已 PASS）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -12,6 +12,8 @@
 > 10:08 状态：4 小时双端长测运行中；S2 配网命令队列、owner gate、event adapter 和 phase/timeout 已完成离线验证。因电脑热点未广播，用户 QUERY/SET 序列等待网络恢复后继续。
 >
 > 15:08 状态：4 小时长测严格 FAIL（最后 5 次 RF 下发均为 ESP_ERR_NO_MEM）；但实验 ON 本地 RF 控制台 QUERY/SET 0/SET -10/AUTO 硬件序列 PASS，正常拔节点后网关不重启 PASS。节点接回后的 secure rejoin 尚待确认。
+>
+> 15:46 状态：节点已自动 secure rejoin 到 0x82cb，三项遥测恢复并持续 8 轮，CQ-4e 完成；后续重点回到长测中的 RF ESP_ERR_NO_MEM 对照分析。
 
 ### 1.1 已经验证的主链路
 
@@ -35,6 +37,7 @@
    - 后端 RF policy REST API 和 Grafana 功率/模式面板已完成，但公网后端仍未部署这部分 API；
    - 01:17 CQ-4d 已接入后台 timeout/send failure；硬件短测仍待 CQ-4e。
    - 15:08 CQ-4e：本地 RF 控制台 QUERY → SET 0 → SET -10 → AUTO 硬件序列全部匹配确认；正常拔掉节点后网关连续约 189 秒不重启。10:06 长测严格 FAIL：37 次 RF 下发中 5 次 `ESP_ERR_NO_MEM`，接回节点 secure rejoin 待确认。
+   - 15:46 节点接回后在网关 uptime 40901 ms 自动 secure rejoin 到 `0x82cb`，三项遥测恢复并持续 8 轮；CQ-4e 插拔恢复验证完成。
 
 4. **事务一致性**
    - 网关命令响应与节点主动 REPORT 序号边界已分离；

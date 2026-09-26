@@ -89,6 +89,7 @@ static iot_prov_command_result_t validate_command(
             if (!test_id_has_text(command->test_id) ||
                 command->owner_generation == 0U ||
                 (command->wifi_event != IOT_PROV_WIFI_EVENT_DISCONNECTED &&
+                 command->wifi_event != IOT_PROV_WIFI_EVENT_CONNECTED &&
                  command->wifi_event != IOT_PROV_WIFI_EVENT_GOT_IP)) {
                 return IOT_PROV_COMMAND_ERR_INVALID_ARG;
             }
@@ -297,3 +298,4 @@ bool iot_prov_command_is_stale(
     }
     return true;
 }
+

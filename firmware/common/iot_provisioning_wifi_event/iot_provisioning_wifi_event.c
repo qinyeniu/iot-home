@@ -31,6 +31,7 @@ static bool input_valid(const iot_prov_wifi_input_t *input)
     }
 
     switch (input->type) {
+        case IOT_PROV_WIFI_INPUT_CONNECTED:
         case IOT_PROV_WIFI_INPUT_GOT_IP:
             return true;
 
@@ -58,6 +59,9 @@ iot_prov_wifi_event_adapter_result_t iot_prov_wifi_event_build(
     if (input->type == IOT_PROV_WIFI_INPUT_GOT_IP) {
         event_type = IOT_PROV_WIFI_EVENT_GOT_IP;
         output->error = IOT_PROV_OK;
+    } else if (input->type == IOT_PROV_WIFI_INPUT_CONNECTED) {
+        event_type = IOT_PROV_WIFI_EVENT_CONNECTED;
+        output->error = IOT_PROV_OK;
     } else {
         event_type = IOT_PROV_WIFI_EVENT_DISCONNECTED;
         output->error = map_disconnect_reason(input->reason);
@@ -71,3 +75,4 @@ iot_prov_wifi_event_adapter_result_t iot_prov_wifi_event_build(
     }
     return IOT_PROV_WIFI_EVENT_ADAPTER_OK;
 }
+

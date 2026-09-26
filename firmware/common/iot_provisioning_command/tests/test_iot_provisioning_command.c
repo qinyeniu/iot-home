@@ -92,6 +92,10 @@ static void test_wifi_event_subtypes(void)
                                     &command) == IOT_PROV_COMMAND_OK);
     CHECK(command.wifi_event == IOT_PROV_WIFI_EVENT_DISCONNECTED);
     CHECK(iot_prov_make_wifi_event("tmp-0001", 3U,
+                                    IOT_PROV_WIFI_EVENT_CONNECTED,
+                                    &command) == IOT_PROV_COMMAND_OK);
+    CHECK(command.wifi_event == IOT_PROV_WIFI_EVENT_CONNECTED);
+    CHECK(iot_prov_make_wifi_event("tmp-0001", 3U,
                                     IOT_PROV_WIFI_EVENT_GOT_IP,
                                     &command) == IOT_PROV_COMMAND_OK);
     CHECK(command.wifi_event == IOT_PROV_WIFI_EVENT_GOT_IP);
@@ -270,3 +274,4 @@ int main(void)
     printf("all provisioning command queue checks passed\n");
     return 0;
 }
+

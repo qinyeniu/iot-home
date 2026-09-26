@@ -29,6 +29,21 @@ static void test_got_ip(void)
     CHECK(strcmp(output.command.test_id, "tmp-0001") == 0);
 }
 
+static void test_connected(void)
+{
+    iot_prov_wifi_input_t input = {
+        .type = IOT_PROV_WIFI_INPUT_CONNECTED,
+    };
+    iot_prov_wifi_event_output_t output;
+
+    CHECK(iot_prov_wifi_event_build("tmp-0001", 1U, &input, &output) ==
+          IOT_PROV_WIFI_EVENT_ADAPTER_OK);
+    CHECK(output.error == IOT_PROV_OK);
+    CHECK(output.command.type == IOT_PROV_COMMAND_WIFI_EVENT);
+    CHECK(output.command.wifi_event == IOT_PROV_WIFI_EVENT_CONNECTED);
+    CHECK(output.command.owner_generation == 1U);
+}
+
 static void test_disconnect_mapping(void)
 {
     static const struct {
@@ -109,6 +124,7 @@ static void test_invalid_args(void)
 int main(void)
 {
     test_got_ip();
+    test_connected();
     test_disconnect_mapping();
     test_invalid_args();
 
@@ -119,3 +135,4 @@ int main(void)
     printf("all provisioning wifi event adapter checks passed\n");
     return 0;
 }
+

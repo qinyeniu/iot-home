@@ -128,7 +128,7 @@ DISCONNECTED(reason)
 - TESTING/PASSED 取消：由 provisioning-task 停止候选连接、恢复原 STA/MQTT、释放 owner；
 - 取消全过程不写 NVS。
 
-## 6. 需要设计修订的一点
+## 6. 已完成的设计修订
 
 ESP-IDF 实际存在 `WIFI_EVENT_STA_CONNECTED`，它可作为确认关联、进入 WAITING_IP 的可靠信号。现有命令模型只定义了 GOT_IP/DISCONNECTED。
 
@@ -138,7 +138,7 @@ ESP-IDF 实际存在 `WIFI_EVENT_STA_CONNECTED`，它可作为确认关联、进
 新增 IOT_PROV_WIFI_EVENT_CONNECTED
 ```
 
-并在 event adapter 中把 `WIFI_EVENT_STA_CONNECTED` 映射为该命令。若不新增该命令，则只能在 GOT_IP 前保持 ASSOCIATING，无法准确区分关联失败与 DHCP 失败。
+并在 event adapter 中把 `WIFI_EVENT_STA_CONNECTED` 映射为该命令。新增该命令后，未来可在 STA_CONNECTED 后进入 WAITING_IP，准确区分关联失败与 DHCP 失败。
 
 ## 7. 建议的后续小阶段
 
@@ -161,3 +161,4 @@ ESP-IDF 实际存在 `WIFI_EVENT_STA_CONNECTED`，它可作为确认关联、进
 - 不刷 bootloader/分区表，不擦 Zigbee NVRAM；
 - 不启用 NVS encryption、Secure Boot 或 Flash encryption；
 - 不把 S2 的 `/commit` 与 NVS 写入提前混入当前阶段。
+

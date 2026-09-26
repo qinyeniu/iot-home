@@ -28,6 +28,7 @@ typedef enum {
 typedef enum {
     IOT_PROV_WIFI_EVENT_NONE = 0,
     IOT_PROV_WIFI_EVENT_DISCONNECTED = 1,
+    IOT_PROV_WIFI_EVENT_CONNECTED,
     IOT_PROV_WIFI_EVENT_GOT_IP,
 } iot_prov_wifi_event_t;
 
@@ -111,3 +112,4 @@ bool iot_prov_command_is_stale(
 #ifdef __cplusplus
 }
 #endif
+

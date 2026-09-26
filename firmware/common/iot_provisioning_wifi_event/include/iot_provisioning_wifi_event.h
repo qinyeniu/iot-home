@@ -1,8 +1,8 @@
 /*
  * IoT-Home provisioning Wi-Fi event adapter.
  *
- * Host-compatible RAM-only adapter that converts a raw Wi-Fi got-ip or
- * disconnected event into one WIFI_EVENT command for the provisioning queue.
+ * Host-compatible RAM-only adapter that converts raw Wi-Fi connected, got-ip or
+ * disconnected events into one WIFI_EVENT command for the provisioning queue.
  * It does not register event handlers, call Wi-Fi APIs or write NVS.
  */
 
@@ -29,6 +29,7 @@ typedef enum {
 
 typedef enum {
     IOT_PROV_WIFI_INPUT_DISCONNECTED = 1,
+    IOT_PROV_WIFI_INPUT_CONNECTED,
     IOT_PROV_WIFI_INPUT_GOT_IP,
 } iot_prov_wifi_input_type_t;
 
@@ -52,7 +53,7 @@ typedef enum {
 /*
  * Build a serialized WIFI_EVENT queue command.
  *
- * For GOT_IP, output.error is IOT_PROV_OK. For DISCONNECTED, it maps the raw
+ * For CONNECTED/GOT_IP, output.error is IOT_PROV_OK. For DISCONNECTED, it maps the raw
  * reason to WIFI_AUTH_FAILED, WIFI_ASSOC_TIMEOUT or INTERNAL. The caller must
  * still discard the command if its owner generation/test_id is stale.
  */
@@ -65,3 +66,5 @@ iot_prov_wifi_event_adapter_result_t iot_prov_wifi_event_build(
 #ifdef __cplusplus
 }
 #endif
+
+

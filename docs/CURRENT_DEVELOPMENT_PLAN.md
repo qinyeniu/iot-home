@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 10:44（Asia/Shanghai；I3 配网 owner gate 接入普通 Wi‑Fi 路径，4 小时长测运行中）
+更新时间：2026-09-26 10:58（Asia/Shanghai；完成普通恢复静默协调器，4 小时长测运行中）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -224,7 +224,9 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 11. I3 已完成：在普通 Wi‑Fi 路径中接入静态 mutex 和 `iot_wifi_owner_state_t`；owner 固定初始化为 NORMAL，当前没有路径 acquire PROVISION。
 12. I3 已在 reconnect loop、RF health scan、boot watchdog、手动 disconnect/connect、Wi‑Fi stop/start、STA_START、STA_DISCONNECTED 和 STA_GOT_IP 前加入闸门；默认现网行为保持。
 13. I3 默认 OFF 固件大小 `0x15fa80`，实验 ON `0x162660`，均剩余 4% 应用分区；独立代码复审 Approve。
-14. 进入 I4 前必须先实现普通恢复操作 in-flight/quiesce 协议，避免长时 RF health scan 与 owner acquire 竞争；未完成前不启用 PROVISION owner acquire。
+14. 已完成 I4 前置的普通恢复 in-flight/quiesce 协调器：`firmware/common/iot_provisioning_recovery_quiesce`，可阻止配网 owner 获取期间普通长时扫描或破坏性恢复动作介入。
+15. 协调器已覆盖操作登记、静默请求 BUSY/重试、破坏性尾部 fail-closed、取消、重置，以及 operation_id 全启动周期严格单调和不复用；独立复审 Approve。
+16. 当前协调器尚未接入 `main.c`，默认 OFF/实验 ON 固件大小保持 `0x15fa80`/`0x162660`；下一步按小阶段将其接入 RF health scan，再考虑 owner acquire。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；

@@ -1162,6 +1162,20 @@ static void rf_power_arm_user_intent_locked(
 }
 #endif
 
+// Runs in Zigbee stack context. Keep it short: only observe the raw APS result.
+// Registering this callback also installs the SDK's internal confirm wrapper,
+// which releases the sender buffer after this application callback returns.
+static void aps_data_confirm_cb(esp_zb_apsde_data_confirm_t confirm)
+{
+    ESP_LOGI(TAG,
+             "APS data confirm: status=%u dst_mode=%u dst_ep=%u src_ep=%u asdu_len=%lu",
+             (unsigned)confirm.status,
+             (unsigned)confirm.dst_addr_mode,
+             (unsigned)confirm.dst_endpoint,
+             (unsigned)confirm.src_endpoint,
+             (unsigned long)confirm.asdu_length);
+}
+
 static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
 {
     bool is_private = ind.cluster_id == RF_POWER_CLUSTER_ID;
@@ -3851,6 +3865,7 @@ static void zigbee_task(void *arg)
     }
     esp_zb_device_register(create_gateway_ep());
     esp_zb_core_action_handler_register(zb_action_handler);
+    esp_zb_aps_data_confirm_handler_register(aps_data_confirm_cb);
     esp_zb_aps_data_indication_handler_register(rf_power_aps_indication_cb);
 
     ESP_ERROR_CHECK(esp_zb_start(false));

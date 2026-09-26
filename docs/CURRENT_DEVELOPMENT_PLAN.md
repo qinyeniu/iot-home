@@ -1,6 +1,6 @@
 # IoT-Home 当前开发计划
 
-更新时间：2026-09-26 10:08（Asia/Shanghai；4 小时长测运行中，CQ-4e 等待上行热点恢复）
+更新时间：2026-09-26 10:15（Asia/Shanghai；4 小时长测运行中，S2 集成复核已完成）
 事实来源：`docs/HANDOFF_2026-09-26.md`、`docs/HANDOFF/_2026-09-26.md`、`docs/HANDOFF_2026-09-25.md`
 
 > 旧的 `docs/PROJECT_SUMMARY.md`、`docs/PROGRESS.md`、`docs/TODO_TOMORROW.md` 只作历史记录；新工作以本文件和最新交接为准。
@@ -218,7 +218,7 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 5. commit handler 未注册时返回 501；handler 失败时会话进入 `error`，不会伪装 committed；响应和日志不回显密码；
 6. 组件非线程安全，真实 HTTP 集成必须单任务调用或加锁；
 7. 默认 OFF bin 仍为 `0x15f540`，实验 ON bin 仍为 `0x162150`；
-8. S2 设计已完成并复审 Approve（C/H/M/L=0）：见 `docs/PROVISIONING_WIFI_TEST_INTEGRATION_DESIGN.md`；会话 QUEUED 状态、静态命令队列、Wi‑Fi owner gate、event adapter 和 phase/timeout 均离线完成；下一步做集成设计复核；真实 `/commit` 必须等待 A/B Bundle 硬件验证。
+8. S2 设计已完成并复审 Approve（C/H/M/L=0）：见 `docs/PROVISIONING_WIFI_TEST_INTEGRATION_DESIGN.md` 和 `docs/PROVISIONING_WIFI_INTEGRATION_REVIEW_20260926.md`；会话 QUEUED 状态、静态命令队列、Wi‑Fi owner gate、event adapter 和 phase/timeout 均离线完成；下一步按 I1–I8 小阶段集成；真实 `/commit` 必须等待 A/B Bundle 硬件验证。
 ### 阶段 B：验证 NVS A/B Bundle（需要硬件维护窗口）
 
 1. 只烧录网关应用区，不刷 bootloader/分区表，不擦 Zigbee NVRAM；
@@ -278,6 +278,7 @@ A/B bundle 与启动路径已离线编译，但尚未验证真实硬件上的 sa
 - MQTT 安全部署、TLS/WSS 和 VPN 暂不自动执行；
 - 服务器资源需要保留余量，避免后端、MySQL、MQTT、Grafana 或日志占满磁盘/CPU；
 - 所有部署必须准备回退步骤，并避开用户使用网络的时间。
+
 
 
 

@@ -352,3 +352,15 @@ main.c.20260910-oled-debug.bak
 7. 启动初期 OLED 出现 1 次刷新失败，随后本地 I2C/SSD1306 reset 自动恢复；未出现 `i2c: clear bus error`。
 8. 代码复审 APPROVE，Critical/High/Medium/Low 均为 0。
 9. P1-2 后续：packet codec 和 auto policy 已独立；下一块如需继续，可整理事务等待/QUERY 协调逻辑，但应单独设边界。
+## 12. 14:22 P1-2 第三步：RF transaction 组件已完成
+
+1. 新增纯逻辑组件 `firmware/common/iot_rf_transaction/`，集中链路过期、QUERY、等待 REPORT、超时重查、周期 reconcile 和 REPORT 字段匹配。
+2. 组件不依赖 ESP-IDF、Zigbee、FreeRTOS 或硬件；已提供 README 与主机 CTest，主机测试通过。
+3. 默认 OFF 固件构建通过：`1449904 bytes`，应用分区剩余 `57424 bytes`；实验 ON 固件构建通过：`1467200 bytes`，应用分区剩余 `40128 bytes`。
+4. COM6 已执行应用区短刷，未擦 Flash/NVRAM，未刷 bootloader/分区表。
+5. 第一轮 5 分钟短测启动 QUERY/REPORT 正常，但出现一次约 28 秒 MQTT 写入超时/断连并自动恢复；追加复测。
+6. 第二轮 5 分钟复测实际触发 periodic reconcile：QUERY seq=3、APS confirm、REPORT accepted 正常；节点 DATA/REPORT_SEND 各 28，网关 RF sample 85、cached report 83、MQTT telemetry 27。
+7. 第二轮无 MQTT 掉线、写入超时、复位、panic、watchdog、`ESP_ERR_NO_MEM`；节点 I2C 失败为 0。
+8. I2C clear bus 两轮共 3 次，但没有 OLED 刷新失败；继续作为既有硬件/总线观察项。
+9. 代码复审 APPROVE，Critical/High/Medium/Low 均为 0。
+10. P1-2 当前已形成 packet codec、power policy、transaction 三个可复用纯逻辑组件；下一步可安排本版本长测，或继续拆 Zigbee 应用事件/节点模型。

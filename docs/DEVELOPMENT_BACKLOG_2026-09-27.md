@@ -388,3 +388,11 @@ main.c.20260910-oled-debug.bak
 9. 代码复审 APPROVE；分析见 `backups/hw-p02-rejoin-quiet-20260928-retest/analysis.md`。
 10. 下一步：提交本阶段后，继续 P1 Wi‑Fi 恢复策略组件化，完成新增开发并提交后再安排夜间长测。
 
+## 15. 2026-09-28 01:36 P1 Wi‑Fi 恢复策略组件拆分已完成
+
+1. 新增 `firmware/common/iot_wifi_recovery_policy/`，纯逻辑覆盖 RF health scan 时机、空扫描计数、deep sleep 阈值、cold-boot watchdog warm reboot 决策。
+2. 组件不依赖 ESP-IDF、FreeRTOS、Wi‑Fi 或硬件；主机 CTest 通过。
+3. 默认 OFF 固件：1452832 bytes，应用区剩余 54496 bytes；实验 ON 固件：1470176 bytes，应用区剩余 37152 bytes。
+4. COM6 只刷应用区，最终版短测约 311 秒 PASS：RF sample 89、cached report 88、MQTT telemetry 27、Resource snapshots 10。
+5. 无 panic/watchdog、内存不足、MQTT 断连/写超时、Rejoin failure、I2C clear bus、OLED 刷新失败或异常重启。
+6. 代码复审两轮 APPROVE；本阶段提交后直接进入夜间长测，不再叠加新改动。

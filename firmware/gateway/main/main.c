@@ -60,6 +60,7 @@
 #include "iot_ssd1306.h"
 #include "iot_wifi_sta.h"
 #include "iot_wifi_connection.h"
+#include "iot_wifi_recovery_policy.h"
 #include "iot_rf_packet.h"
 #include "iot_rf_power_policy.h"
 #include "iot_rf_transaction.h"
@@ -3760,26 +3761,33 @@ static bool wifi_rf_health_scan(void)
     // coordinator lock. This prevents a provisioning request from completing
     // after scan end but before the destructive recovery starts.
     request_destructive_tail = ap_count == 0 &&
-        (s_rf_empty_scans + 1 >= WIFI_RF_EMPTY_LIMIT);
+        iot_wifi_recovery_empty_scan_will_reach_limit(
+            s_rf_empty_scans, WIFI_RF_EMPTY_LIMIT);
     if (!recovery_quiesce_end(operation_id, request_destructive_tail,
                               &destructive_tail_claimed)) {
         return false;
     }
 #endif
 
+    const iot_wifi_recovery_scan_result_t scan_result =
+        ap_count > 0 ? IOT_WIFI_RECOVERY_SCAN_OK
+                     : IOT_WIFI_RECOVERY_SCAN_EMPTY;
+    bool deep_sleep_due = false;
+    if (!iot_wifi_recovery_apply_scan_result(
+            scan_result, WIFI_RF_EMPTY_LIMIT, &s_rf_empty_scans,
+            &s_rf_environment_alive, &deep_sleep_due)) {
+        return false;
+    }
+
     if (ap_count > 0) {
-        s_rf_empty_scans = 0;
-        s_rf_environment_alive = true;
         ESP_LOGI(TAG, "RF health scan OK: %u AP(s), target %s",
                  ap_count, target_visible ? "VISIBLE" : "not visible");
         return true;
     }
 
-    s_rf_environment_alive = false;
-    s_rf_empty_scans++;
     ESP_LOGW(TAG, "RF health scan empty %d/%d (target router off would still show neighbors)",
              s_rf_empty_scans, WIFI_RF_EMPTY_LIMIT);
-    if (s_rf_empty_scans >= WIFI_RF_EMPTY_LIMIT) {
+    if (deep_sleep_due) {
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
         if (destructive_tail_claimed)
 #endif
@@ -3835,29 +3843,44 @@ static void wifi_connection_on_retry(uint32_t retry_count,
     // Check the whole 2.4GHz environment, not only the target SSID:
     // neighbors visible + target absent means wait for the router;
     // zero APs repeatedly means the local RF needs a deep power reset.
-    if (((retry_count >= 2U && retry_count <= 4U) ||
-         (retry_count >= 8U && (retry_count % 4U) == 0U)) &&
+    if (iot_wifi_recovery_health_scan_due(retry_count) &&
         wifi_owner_gate_allows("RF health scan")) {
         wifi_rf_health_scan();
     }
 
     // Boot watchdog: if the radio never associated since power-on
     // (cold-boot RF glitch), perform a warm reboot like pressing RST.
-    if (wifi_owner_gate_allows("Wi-Fi boot watchdog") &&
-        !s_wifi_ever_connected &&
-        (int64_t)esp_timer_get_time() / 1000 > WIFI_BOOT_GRACE_MS) {
-        const int cnt = boot_restart_count_get();
-        if (s_rf_environment_alive) {
-            ESP_LOGI(TAG,
-                     "Boot watchdog hold: nearby APs are visible; target SSID absent or association pending, no reboot");
-        } else if (cnt < WIFI_BOOT_MAX_RESTARTS) {
-            boot_restart_count_set(cnt + 1);
-            ESP_LOGW(TAG, "WiFi boot watchdog: warm reboot %d/%d",
-                     cnt + 1, WIFI_BOOT_MAX_RESTARTS);
-            vTaskDelay(pdMS_TO_TICKS(200));
-            esp_restart();
+    if (wifi_owner_gate_allows("Wi-Fi boot watchdog")) {
+        const iot_wifi_boot_input_t boot_input = {
+            .ever_connected = s_wifi_ever_connected,
+            .uptime_ms = (uint64_t)esp_timer_get_time() / 1000U,
+            .grace_ms = WIFI_BOOT_GRACE_MS,
+            .environment_alive = s_rf_environment_alive,
+            .previous_reboots = boot_restart_count_get(),
+            .max_reboots = WIFI_BOOT_MAX_RESTARTS,
+        };
+        iot_wifi_boot_decision_t boot_decision;
+        if (!iot_wifi_recovery_decide_boot(&boot_input, &boot_decision)) {
+            ESP_LOGW(TAG, "WiFi boot watchdog decision failed");
         } else {
-            ESP_LOGE(TAG, "WiFi still down after %d warm reboots; keep retrying", cnt);
+            switch (boot_decision.action) {
+            case IOT_WIFI_BOOT_ACTION_NONE:
+                break;
+            case IOT_WIFI_BOOT_ACTION_HOLD_TARGET_MISSING:
+                ESP_LOGI(TAG,
+                         "Boot watchdog hold: nearby APs are visible; target SSID absent or association pending, no reboot");
+                break;
+            case IOT_WIFI_BOOT_ACTION_REBOOT:
+                boot_restart_count_set(boot_decision.next_reboots);
+                ESP_LOGW(TAG, "WiFi boot watchdog: warm reboot %d/%d",
+                         boot_decision.next_reboots, WIFI_BOOT_MAX_RESTARTS);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                esp_restart();
+            case IOT_WIFI_BOOT_ACTION_REBOOT_LIMIT_REACHED:
+                ESP_LOGE(TAG, "WiFi still down after %d warm reboots; keep retrying",
+                         boot_decision.next_reboots);
+                break;
+            }
         }
     }
 }

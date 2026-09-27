@@ -63,6 +63,7 @@
 #include "iot_rf_packet.h"
 #include "iot_rf_power_policy.h"
 #include "iot_rf_transaction.h"
+#include "iot_zb_node_model.h"
 #include "iot_provisioning_wifi_owner.h"
 #include "cJSON.h"
 #include "zcl/esp_zigbee_zcl_on_off.h"
@@ -3262,31 +3263,13 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
 #define EP_GW                       10      // gateway endpoint (matches sensor nodes)
 #define MAX_ZB_NODES                10
-#define ZB_MASK_TEMP                0x01
-#define ZB_MASK_HUM                 0x02
-#define ZB_MASK_LUX                 0x04
-#define ZB_MASK_ALL                 (ZB_MASK_TEMP | ZB_MASK_HUM | ZB_MASK_LUX)
-#define ZB_TEMP_INVALID             ((int16_t)0x8000)
-#define ZB_VALUE_INVALID            0xFFFF
-#define ZB_REPORT_PARTIAL_DELAY_MS  30000
-#define ZB_TELEMETRY_DEDUP_MS       9000
+#define ZB_ONOFF_COMMAND_FRESH_MS   180000
 
-typedef struct {
-    uint16_t addr;          // 0 = free slot
-    int16_t  temp_raw;      // 0.01 C
-    uint16_t hum_raw;       // 0.01 %
-    uint16_t lux_raw;       // Zigbee log scale: 10000 * log10(lux + 1)
-    uint8_t  ieee[8];       // extended address, used for retained status
-    uint8_t  valid;         // fields ever received
-    uint8_t  dirty;         // fields updated since last MQTT publish
-    uint8_t  active;        // currently joined child
-    uint8_t  onoff_valid;   // On/Off state has been received
-    uint8_t  onoff_value;   // latest On/Off state (0=off, 1=on)
-    uint32_t first_dirty_ms;
-    uint32_t last_seen_ms;   // last join/announce or valid ZCL report
-} zb_node_t;
-
-static zb_node_t s_zb_nodes[MAX_ZB_NODES];
+static iot_zb_node_t s_zb_nodes[MAX_ZB_NODES];
+static const iot_zb_node_store_t s_zb_store = {
+    .nodes = s_zb_nodes,
+    .capacity = MAX_ZB_NODES,
+};
 static portMUX_TYPE s_zb_lock = portMUX_INITIALIZER_UNLOCKED;
 
 // Verify the report source independently from the short address in the frame.
@@ -3294,20 +3277,13 @@ static portMUX_TYPE s_zb_lock = portMUX_INITIALIZER_UNLOCKED;
 // s_rf_power_lock to avoid a lock nesting/deadlock.
 static bool rf_power_known_active_child(uint16_t addr)
 {
-    bool found = false;
+    bool active;
 
     portENTER_CRITICAL(&s_zb_lock);
-    for (uint8_t i = 0; i < MAX_ZB_NODES; ++i) {
-        if (s_zb_nodes[i].addr == addr && s_zb_nodes[i].active) {
-            found = true;
-            break;
-        }
-    }
+    active = iot_zb_node_is_active(&s_zb_store, addr);
     portEXIT_CRITICAL(&s_zb_lock);
-    return found;
+    return active;
 }
-
-#define ZB_ONOFF_COMMAND_FRESH_MS 180000
 
 // Standard On/Off commands actuate a physical endpoint. A child can disappear
 // without a Zigbee leave indication, so active alone is not enough in that
@@ -3317,17 +3293,13 @@ static bool rf_power_known_active_child(uint16_t addr)
 // is implemented.
 static bool gateway_onoff_target_ready(uint16_t addr)
 {
-    bool found = false;
+    bool found;
     uint32_t last_seen_ms = 0;
+    uint32_t now_ms;
+    uint32_t age_ms;
 
     portENTER_CRITICAL(&s_zb_lock);
-    for (uint8_t i = 0; i < MAX_ZB_NODES; ++i) {
-        if (s_zb_nodes[i].addr == addr && s_zb_nodes[i].active) {
-            found = true;
-            last_seen_ms = s_zb_nodes[i].last_seen_ms;
-            break;
-        }
-    }
+    found = iot_zb_node_get_last_seen(&s_zb_store, addr, &last_seen_ms);
     portEXIT_CRITICAL(&s_zb_lock);
 
     if (!found) {
@@ -3343,8 +3315,8 @@ static bool gateway_onoff_target_ready(uint16_t addr)
         return false;
     }
 
-    uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
-    uint32_t age_ms = now_ms - last_seen_ms;
+    now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+    age_ms = now_ms - last_seen_ms;
     if (age_ms > ZB_ONOFF_COMMAND_FRESH_MS) {
         ESP_LOGW(TAG,
                  "CMD: node=0x%04x on/off skipped: stale for %lu ms",
@@ -3355,20 +3327,6 @@ static bool gateway_onoff_target_ready(uint16_t addr)
 
     return true;
 }
-
-static zb_node_t *zb_node_get_or_create(uint16_t addr)
-{
-    zb_node_t *free_slot = NULL;
-    for (int i = 0; i < MAX_ZB_NODES; i++) {
-        if (s_zb_nodes[i].addr == addr) return &s_zb_nodes[i];
-        if (s_zb_nodes[i].addr == 0 && free_slot == NULL) free_slot = &s_zb_nodes[i];
-    }
-    if (free_slot) {
-        free_slot->addr = addr;
-    }
-    return free_slot;
-}
-
 // Unified ZCL core callback. ZBOSS may invoke this with preemption disabled,
 // so this function only validates and queues a small value. All logging, node
 // table mutation, and MQTT work happen in zb_forward_task().
@@ -3395,7 +3353,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     switch (m->cluster) {
     case ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT: {
         int16_t raw = *(const int16_t *)v;
-        if (raw == ZB_TEMP_INVALID) {
+        if (raw == IOT_ZB_TEMP_INVALID) {
             return ESP_OK;
         }
         event.raw = (uint16_t)raw;
@@ -3404,7 +3362,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT:
     case ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT: {
         uint16_t raw = *(const uint16_t *)v;
-        if (raw == ZB_VALUE_INVALID) {
+        if (raw == IOT_ZB_VALUE_INVALID) {
             return ESP_OK;
         }
         event.raw = raw;
@@ -4709,7 +4667,8 @@ static void zb_publish_gateway_status(const char *event)
     mqtt_pub_retained(MQTT_GW_STATUS_SUFFIX, msg, true);
 }
 
-static void zb_publish_node_status(const zb_node_t *node, const char *event, bool online)
+static void zb_publish_node_status(const iot_zb_node_t *node,
+                                   const char *event, bool online)
 {
     if (!mqtt_is_connected() || node == NULL || node->addr == 0) {
         return;
@@ -4729,46 +4688,42 @@ static void zb_publish_node_status(const zb_node_t *node, const char *event, boo
 
 static void zb_publish_known_statuses(void)
 {
-    zb_node_t snap[MAX_ZB_NODES];
-    int n_active = 0;
+    iot_zb_node_t snap[MAX_ZB_NODES];
+    uint8_t n_active;
 
     portENTER_CRITICAL(&s_zb_lock);
-    for (int i = 0; i < MAX_ZB_NODES; i++) {
-        if (s_zb_nodes[i].addr != 0 && s_zb_nodes[i].active) {
-            snap[n_active++] = s_zb_nodes[i];
-        }
-    }
+    n_active = iot_zb_node_snapshot_active(&s_zb_store, snap, MAX_ZB_NODES);
     portEXIT_CRITICAL(&s_zb_lock);
 
     zb_publish_gateway_status("status_resync");
-    for (int i = 0; i < n_active; i++) {
+    for (uint8_t i = 0; i < n_active; i++) {
         zb_publish_node_status(&snap[i], "status_resync", true);
     }
 }
 
 static void zb_handle_join_event(const zb_app_event_t *event)
 {
-    zb_node_t *node;
-    zb_node_t status_snap = {0};
+    iot_zb_node_result_t model_result = {0};
+    iot_zb_node_t status_snap = {0};
+    bool applied;
     bool is_new_child = false;
     uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
 
     portENTER_CRITICAL(&s_zb_lock);
-    node = zb_node_get_or_create(event->addr);
-    if (node != NULL) {
-        if (!node->active) {
-            node->active = true;
-            is_new_child = true;
+    applied = iot_zb_node_apply_join(&s_zb_store, event->addr, event->ieee,
+                                    now_ms, &model_result);
+    if (applied && model_result.found) {
+        is_new_child = model_result.became_active;
+        if (is_new_child) {
             s_zigbee_devices++;
         }
-        memcpy(node->ieee, event->ieee, sizeof(node->ieee));
-        node->last_seen_ms = now_ms;
-        status_snap = *node;
+        status_snap = s_zb_store.nodes[model_result.index];
     }
     portEXIT_CRITICAL(&s_zb_lock);
 
-    if (node == NULL) {
-        ESP_LOGW(TAG, "Zigbee: join event ignored, node table full addr=0x%04x", event->addr);
+    if (!applied || !model_result.found) {
+        ESP_LOGW(TAG, "Zigbee: join event ignored, node table full addr=0x%04x",
+                 event->addr);
         return;
     }
 
@@ -4779,29 +4734,27 @@ static void zb_handle_join_event(const zb_app_event_t *event)
         ESP_LOGI(TAG, "Zigbee: Device announced again! addr=0x%04x", event->addr);
     }
 
-    zb_publish_node_status(&status_snap, is_new_child ? "device_joined" : "device_announce", true);
+    zb_publish_node_status(&status_snap,
+                           is_new_child ? "device_joined" : "device_announce",
+                           true);
     rf_power_reset_for_announce(event->addr);
     rf_power_publish_querying(event->addr, NULL);
 }
 
 static void zb_handle_leave_event(const zb_app_event_t *event)
 {
-    zb_node_t snap;
+    iot_zb_node_result_t model_result = {0};
+    iot_zb_node_t snap;
+    bool processed;
     bool was_active = false;
 
+    memset(&snap, 0, sizeof(snap));
     portENTER_CRITICAL(&s_zb_lock);
-    for (int i = 0; i < MAX_ZB_NODES; i++) {
-        if (s_zb_nodes[i].addr != 0 &&
-            memcmp(s_zb_nodes[i].ieee, event->ieee, sizeof(event->ieee)) == 0) {
-            if (s_zb_nodes[i].active) {
-                snap = s_zb_nodes[i];
-                s_zb_nodes[i].active = false;
-                s_zb_nodes[i].dirty = 0;
-                s_zigbee_devices--;
-                was_active = true;
-            }
-            break;
-        }
+    processed = iot_zb_node_apply_leave(&s_zb_store, event->ieee, &model_result);
+    if (processed && model_result.was_active) {
+        was_active = true;
+        s_zigbee_devices--;
+        snap = s_zb_store.nodes[model_result.index];
     }
     portEXIT_CRITICAL(&s_zb_lock);
 
@@ -4817,7 +4770,7 @@ static void zb_handle_leave_event(const zb_app_event_t *event)
     }
 }
 
-static void zb_publish_node_switch_state(const zb_node_t *node)
+static void zb_publish_node_switch_state(const iot_zb_node_t *node)
 {
     char topic_suffix[40];
     char payload[64];
@@ -4834,63 +4787,55 @@ static void zb_publish_node_switch_state(const zb_node_t *node)
 
 static void zb_handle_report_event(const zb_app_event_t *event)
 {
+    iot_zb_node_result_t model_result = {0};
     bool became_active = false;
-    bool first_dirty = false;
     bool need_status = false;
     bool switch_state_changed = false;
-    zb_node_t status_snap = {0};
-    zb_node_t switch_snap = {0};
+    bool accepted = false;
+    iot_zb_node_t status_snap = {0};
+    iot_zb_node_t switch_snap = {0};
+    uint8_t field_mask = 0;
+    bool onoff_event = false;
     uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
 
+    if (event->cluster == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT) {
+        field_mask = IOT_ZB_MASK_TEMP;
+    } else if (event->cluster == ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT) {
+        field_mask = IOT_ZB_MASK_HUM;
+    } else if (event->cluster == ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT) {
+        field_mask = IOT_ZB_MASK_LUX;
+    } else if (event->cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
+        onoff_event = true;
+    } else {
+        return;
+    }
+
     portENTER_CRITICAL(&s_zb_lock);
-    zb_node_t *node = zb_node_get_or_create(event->addr);
-    if (node) {
-        // A successful report proves the child is present even if an announce was dropped.
-        if (!node->active) {
-            node->active = true;
-            became_active = true;
-            s_zigbee_devices++;
-        }
-        first_dirty = (node->dirty == 0);
+    // A successful report proves the child is present even if an announce was dropped.
+    if (onoff_event) {
+        accepted = iot_zb_node_apply_onoff(&s_zb_store, event->addr, event->value,
+                                           now_ms, &model_result);
+    } else {
+        accepted = iot_zb_node_apply_measurement(
+            &s_zb_store, event->addr, field_mask, event->raw, now_ms,
+            &model_result);
+    }
 
-        switch (event->cluster) {
-        case ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT:
-            node->temp_raw = (int16_t)event->raw;
-            node->valid |= ZB_MASK_TEMP;
-            node->dirty |= ZB_MASK_TEMP;
-            break;
-        case ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT:
-            node->hum_raw = event->raw;
-            node->valid |= ZB_MASK_HUM;
-            node->dirty |= ZB_MASK_HUM;
-            break;
-        case ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT:
-            node->lux_raw = event->raw;
-            node->valid |= ZB_MASK_LUX;
-            node->dirty |= ZB_MASK_LUX;
-            break;
-        case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF:
-            node->onoff_value = event->value;
-            node->onoff_valid = true;
-            switch_snap = *node;
-            switch_state_changed = true;
-            break;
-        default:
-            break;
-        }
-
+    if (accepted && model_result.found) {
+        became_active = model_result.became_active;
         if (became_active) {
-            status_snap = *node;
+            s_zigbee_devices++;
+            status_snap = s_zb_store.nodes[model_result.index];
             need_status = true;
         }
-        if (first_dirty) {
-            node->first_dirty_ms = now_ms;
+        if (onoff_event) {
+            switch_snap = s_zb_store.nodes[model_result.index];
+            switch_state_changed = true;
         }
-        node->last_seen_ms = now_ms;
     }
     portEXIT_CRITICAL(&s_zb_lock);
 
-    if (node) {
+    if (accepted) {
         if (became_active) {
             ESP_LOGI(TAG, "Zigbee: Device active by report addr=0x%04x", event->addr);
             zb_persist_child_seen();
@@ -4911,10 +4856,6 @@ static void zb_handle_report_event(const zb_app_event_t *event)
                  (unsigned long)s_zb_report_events);
     }
 }
-
-static uint32_t s_zb_last_telemetry_ms[MAX_ZB_NODES];
-static char s_zb_last_telemetry_payload[MAX_ZB_NODES][128];
-
 static void zb_handle_signal_event(const zb_app_event_t *event)
 {
     esp_err_t status = (esp_err_t)event->status;
@@ -4968,8 +4909,18 @@ static void zb_handle_signal_event(const zb_app_event_t *event)
     }
 }
 
+#define ZB_REPORT_PARTIAL_DELAY_MS  30000
+#define ZB_TELEMETRY_DEDUP_MS       9000
+
+static uint32_t s_zb_last_telemetry_ms[MAX_ZB_NODES];
+static char s_zb_last_telemetry_payload[MAX_ZB_NODES][128];
+
 static void zb_forward_pending(void)
 {
+    iot_zb_dirty_node_t due[MAX_ZB_NODES];
+    uint8_t n_dirty;
+    uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
+
     if (!mqtt_is_connected()) {
         return;
     }
@@ -4977,54 +4928,23 @@ static void zb_forward_pending(void)
     // Wait for a complete temperature/humidity/light sample to avoid duplicate
     // MQTT messages; sleepy-end-device reports can arrive more than 10s apart.
     // A longer partial timeout still publishes incomplete/legacy sensors.
-    zb_node_t snap[MAX_ZB_NODES];
-    uint8_t snap_slot[MAX_ZB_NODES];
-    int n_dirty = 0;
-    uint32_t now_ms = pdTICKS_TO_MS(xTaskGetTickCount());
     portENTER_CRITICAL(&s_zb_lock);
-    for (int i = 0; i < MAX_ZB_NODES; i++) {
-        zb_node_t *node = &s_zb_nodes[i];
-        if (node->addr == 0 || !node->active || node->dirty == 0) {
-            continue;
-        }
-        bool complete = (node->dirty & ZB_MASK_ALL) == ZB_MASK_ALL;
-        uint32_t age_ms = now_ms - node->first_dirty_ms;
-        if (complete || age_ms >= ZB_REPORT_PARTIAL_DELAY_MS) {
-            snap_slot[n_dirty] = (uint8_t)i;
-            snap[n_dirty++] = *node;
-            node->dirty = 0;
-        }
-    }
+    n_dirty = iot_zb_node_take_due(&s_zb_store, now_ms,
+                                   ZB_REPORT_PARTIAL_DELAY_MS, due,
+                                   MAX_ZB_NODES);
     portEXIT_CRITICAL(&s_zb_lock);
 
-    for (int msg = 0; msg < n_dirty; msg++) {
-        zb_node_t *n = &snap[msg];
-        uint8_t slot = snap_slot[msg];
+    for (uint8_t msg = 0; msg < n_dirty; msg++) {
+        const iot_zb_node_t *n = &due[msg].node;
+        uint8_t slot = due[msg].index;
         char topic_suffix[40];
-        snprintf(topic_suffix, sizeof(topic_suffix), "nodes/zb-%04x/telemetry", n->addr);
-
         char payload[160];
-        int pos = snprintf(payload, sizeof(payload), "{\"data\":{");
-        if (n->valid & ZB_MASK_TEMP) {
-            pos += snprintf(payload + pos, sizeof(payload) - pos,
-                            "\"temperature\":%.1f,", n->temp_raw / 100.0f);
+
+        snprintf(topic_suffix, sizeof(topic_suffix),
+                 "nodes/zb-%04x/telemetry", n->addr);
+        if (!iot_zb_node_build_telemetry(n, payload, sizeof(payload))) {
+            continue;
         }
-        if (n->valid & ZB_MASK_HUM) {
-            pos += snprintf(payload + pos, sizeof(payload) - pos,
-                            "\"humidity\":%.1f,", n->hum_raw / 100.0f);
-        }
-        if (n->valid & ZB_MASK_LUX) {
-            // raw = 10000 * log10(lux + 1)  ->  lux = 10^(raw/10000) - 1
-            float lux = powf(10.0f, (float)n->lux_raw / 10000.0f) - 1.0f;
-            pos += snprintf(payload + pos, sizeof(payload) - pos,
-                            "\"lux\":%.1f,", lux);
-        }
-        if (n->onoff_valid) {
-            pos += snprintf(payload + pos, sizeof(payload) - pos,
-                            "\"on_off\":%u,", (unsigned)n->onoff_value);
-        }
-        if (payload[pos - 1] == ',') pos--;
-        snprintf(payload + pos, sizeof(payload) - pos, "}}");
 
         uint32_t telemetry_age_ms = now_ms - s_zb_last_telemetry_ms[slot];
         bool duplicate_telemetry =
@@ -5048,13 +4968,14 @@ static void zb_forward_pending(void)
 #if !ZB_ONLY_RF_DIAG && ZB_JOIN_BEFORE_WIFI
 static bool zb_have_full_active_sample(void)
 {
+    iot_zb_node_t active[MAX_ZB_NODES];
+    uint8_t n_active;
     bool ready = false;
 
     portENTER_CRITICAL(&s_zb_lock);
-    for (int i = 0; i < MAX_ZB_NODES; i++) {
-        if (s_zb_nodes[i].addr != 0 &&
-            s_zb_nodes[i].active &&
-            (s_zb_nodes[i].valid & ZB_MASK_ALL) == ZB_MASK_ALL) {
+    n_active = iot_zb_node_snapshot_active(&s_zb_store, active, MAX_ZB_NODES);
+    for (uint8_t i = 0; i < n_active; ++i) {
+        if ((active[i].valid & IOT_ZB_MASK_ALL) == IOT_ZB_MASK_ALL) {
             ready = true;
             break;
         }
@@ -5063,7 +4984,6 @@ static bool zb_have_full_active_sample(void)
     return ready;
 }
 #endif
-
 static void zb_handle_app_event(const zb_app_event_t *event)
 {
     if (event->type == ZB_APP_EVENT_JOIN) {

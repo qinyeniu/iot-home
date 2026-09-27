@@ -19,6 +19,7 @@ node_modules/
 
 # ===== ESP-IDF / ESP32 固件 =====
 firmware/**/build/
+firmware/**/build-host*/
 firmware/**/managed_components/
 # dependencies.lock files are tracked for reproducible component versions
 firmware/**/sdkconfig

@@ -364,3 +364,13 @@ main.c.20260910-oled-debug.bak
 8. I2C clear bus 两轮共 3 次，但没有 OLED 刷新失败；继续作为既有硬件/总线观察项。
 9. 代码复审 APPROVE，Critical/High/Medium/Low 均为 0。
 10. P1-2 当前已形成 packet codec、power policy、transaction 三个可复用纯逻辑组件；下一步可安排本版本长测，或继续拆 Zigbee 应用事件/节点模型。
+## 13. 2026-09-28 00:20 P1-3 Zigbee 节点模型组件已完成
+
+1. 新增纯逻辑组件 `firmware/common/iot_zb_node_model/`，集中节点表、Join/Leave/Report 更新、遥测样本选择和 JSON 组装。
+2. 组件不依赖 Zigbee 协议栈、FreeRTOS、MQTT 或硬件；主机测试通过。
+3. 默认 OFF 固件：`1451136 bytes`，应用分区剩余 `56192 bytes`；实验 ON 固件：`1468432 bytes`，应用分区剩余 `38896 bytes`。
+4. COM6 已执行应用区短刷，未擦 Flash/NVRAM，未刷 bootloader/分区表。
+5. 第一次 5 分钟测试节点未能在窗口内稳定 rejoin；失败位于 Zigbee 网络层，未进入新模型。追加双端干净启动复测。
+6. 复测节点约 16 秒入网；DATA/REPORT_SEND 各 27；网关 RF sample 82、cached report 81、MQTT telemetry 27；启动 QUERY/REPORT accepted 和自动功率 keep 正常。
+7. 复测无 MQTT 掉线、写入超时、内存不足、I2C clear bus、OLED 失败、panic/watchdog；节点 APS/queue failure 无增量。
+8. 下一步优先级调整：先做 P0-2 父链路抖动和网关重启后 rejoin 耗时治理，再继续 Wi‑Fi 恢复策略或事件队列组件化。

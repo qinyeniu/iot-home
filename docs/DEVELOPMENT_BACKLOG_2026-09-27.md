@@ -329,3 +329,14 @@ main.c.20260910-oled-debug.bak
 2. P1-1 MQTT 客户端服务拆分已完成，最终 5 分钟硬件短测通过，随下一提交入库。
 3. 当前默认 OFF 固件：`1448784 bytes`，应用分区剩余 `58544 bytes`；实验 ON 固件：`1466352 bytes`，应用分区剩余 `40976 bytes`。
 4. 后续选择：若继续驱动复用，先做 P1-2 RF packet 纯逻辑编解码；若优先稳定性，先做 P0-2 Zigbee 父链路抖动治理。
+## 10. 10:49 P1-2 第一步：RF packet codec 已完成
+
+1. 新增纯逻辑组件 `firmware/common/iot_rf_packet/`，集中私有 RF 包的 magic、version、command、sequence、signed power、V2 mode 和 reserved 校验。
+2. 组件不依赖 ESP-IDF、Zigbee、FreeRTOS 或硬件；已提供 `firmware/common/iot_rf_packet/README.md` 和主机侧 CTest。
+3. 主机测试通过，覆盖 V1/V2 round-trip、负功率、版本/长度不匹配、非法命令/模式/保留字节、空指针和输出缓冲不足。
+4. 默认 OFF 固件构建通过：`1449168 bytes`，应用分区剩余 `58160 bytes`；实验 ON 固件构建通过：`1466736 bytes`，应用分区剩余 `40592 bytes`。
+5. 10:42:34–10:47:30 硬件 5 分钟短测：节点 DATA/REPORT_SEND 各 28；网关 RF sample 85、cached report 84、MQTT telemetry 28；1 次私有 QUERY 成功并被节点 REPORT 接受。
+6. 无 Wi‑Fi/MQTT 掉线、MQTT 写入超时、重启、panic、watchdog、`ESP_ERR_NO_MEM`；节点传感器 I2C 失败为 0。
+7. 网关出现 1 次 `i2c: clear bus error`，未触发 OLED 本地恢复；继续作为既有偶发观察项，不构成本次回归。
+8. 代码复审 APPROVE，Critical/High/Medium/Low 均为 0。
+9. P1-2 后续步骤：在 packet codec 稳定后，再拆分 `iot_rf_power_policy`，本阶段不搬功率策略和命令队列。

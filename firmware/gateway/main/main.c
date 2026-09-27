@@ -60,6 +60,7 @@
 #include "iot_ssd1306.h"
 #include "iot_wifi_sta.h"
 #include "iot_wifi_connection.h"
+#include "iot_rf_packet.h"
 #include "iot_provisioning_wifi_owner.h"
 #include "cJSON.h"
 #include "zcl/esp_zigbee_zcl_on_off.h"
@@ -88,17 +89,6 @@
 #define OLED_UPDATE_MS          1000
 
 #define RF_POWER_CLUSTER_ID     0xFC10
-#define RF_PACKET_MAGIC0        0x52
-#define RF_PACKET_MAGIC1        0x46
-#define RF_PACKET_VERSION       2
-#define RF_PACKET_V1_LEN        6
-#define RF_PACKET_LEN           8
-#define RF_CMD_QUERY            1
-#define RF_CMD_SET              2
-#define RF_CMD_REPORT           3
-#define RF_MODE_AUTO            0
-#define RF_MODE_MANUAL          1
-#define RF_MODE_UNKNOWN         0xFF
 #define RF_POWER_UNKNOWN_DBM       (-128)
 // One-time installation bounds. Values must exist in s_rf_power_table below.
 // The controller still starts/reconciles from the node and does not use
@@ -446,7 +436,7 @@ static int s_rf_lqi_ema = -1;
 static uint8_t s_rf_lqi_samples;
 static uint32_t s_rf_last_rx_ms;
 static int8_t s_rf_node_power_dbm = RF_POWER_UNKNOWN_DBM;
-static uint8_t s_rf_node_mode = RF_MODE_UNKNOWN;
+static uint8_t s_rf_node_mode = IOT_RF_MODE_UNKNOWN;
 static uint8_t s_rf_packet_sequence;
 static uint32_t s_rf_policy_generation;
 static uint32_t s_rf_last_eval_ms;
@@ -455,7 +445,7 @@ static uint8_t s_rf_lqi_high_windows;
 static bool s_rf_report_waiting;
 static uint8_t s_rf_expected_report_seq;
 static int8_t s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-static uint8_t s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+static uint8_t s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
 static bool s_rf_last_report_seq_valid;
 static uint8_t s_rf_last_report_seq;
 static uint32_t s_rf_wait_started_ms;
@@ -592,10 +582,10 @@ static uint8_t rf_power_max_index(void)
 
 static const char *rf_power_mode_name(uint8_t mode)
 {
-    if (mode == RF_MODE_MANUAL) {
+    if (mode == IOT_RF_MODE_MANUAL) {
         return "manual";
     }
-    if (mode == RF_MODE_AUTO) {
+    if (mode == IOT_RF_MODE_AUTO) {
         return "auto";
     }
     return "unknown";
@@ -603,7 +593,7 @@ static const char *rf_power_mode_name(uint8_t mode)
 
 static bool rf_power_policy_values_valid(uint8_t mode, int8_t manual_power_dbm)
 {
-    return (mode == RF_MODE_AUTO || mode == RF_MODE_MANUAL) &&
+    return (mode == IOT_RF_MODE_AUTO || mode == IOT_RF_MODE_MANUAL) &&
            rf_power_is_allowed_value(manual_power_dbm);
 }
 
@@ -616,7 +606,7 @@ static void rf_power_policy_persist(uint8_t mode, int8_t manual_power_dbm)
         return;
     }
 
-    uint8_t stored_mode = RF_MODE_UNKNOWN;
+    uint8_t stored_mode = IOT_RF_MODE_UNKNOWN;
     int8_t stored_manual_power = RF_POWER_UNKNOWN_DBM;
     esp_err_t mode_err = nvs_get_u8(handle, "mode", &stored_mode);
     esp_err_t power_err = nvs_get_i8(handle, "mpwr", &stored_manual_power);
@@ -659,12 +649,12 @@ static void rf_policy_bump_generation_locked(void)
 
 static void rf_power_policy_init(void)
 {
-    uint8_t mode = RF_MODE_AUTO;
+    uint8_t mode = IOT_RF_MODE_AUTO;
     int8_t manual_power_dbm = RF_POWER_AUTO_MIN_DBM;
     nvs_handle_t handle;
 
     if (nvs_open(RF_POLICY_NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
-        uint8_t stored_mode = RF_MODE_AUTO;
+        uint8_t stored_mode = IOT_RF_MODE_AUTO;
         int8_t stored_manual_power = RF_POWER_AUTO_MIN_DBM;
         esp_err_t mode_err = nvs_get_u8(handle, "mode", &stored_mode);
         esp_err_t power_err = nvs_get_i8(handle, "mpwr", &stored_manual_power);
@@ -712,13 +702,13 @@ static void rf_power_forget_node(uint16_t addr)
         s_rf_lqi_samples = 0;
         s_rf_last_rx_ms = 0;
         s_rf_node_power_dbm = RF_POWER_UNKNOWN_DBM;
-        s_rf_node_mode = RF_MODE_UNKNOWN;
+        s_rf_node_mode = IOT_RF_MODE_UNKNOWN;
         s_rf_lqi_low_windows = 0;
         s_rf_lqi_high_windows = 0;
         s_rf_report_waiting = false;
         s_rf_expected_report_seq = 0;
         s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-        s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+        s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
         s_rf_last_report_seq_valid = false;
         s_rf_last_report_seq = 0;
         s_rf_wait_started_ms = 0;
@@ -758,20 +748,20 @@ static void rf_power_reset_for_announce(uint16_t addr)
     s_rf_lqi_samples = 0;
     s_rf_last_rx_ms = now;
     s_rf_node_power_dbm = RF_POWER_UNKNOWN_DBM;
-    s_rf_node_mode = RF_MODE_UNKNOWN;
+    s_rf_node_mode = IOT_RF_MODE_UNKNOWN;
     s_rf_lqi_low_windows = 0;
     s_rf_lqi_high_windows = 0;
     s_rf_report_waiting = false;
     s_rf_expected_report_seq = 0;
     s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-    s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+    s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
     s_rf_last_report_seq_valid = false;
     s_rf_last_report_seq = 0;
     s_rf_wait_started_ms = 0;
     s_rf_power_confirmed_ms = 0;
     rf_tx_clear_backoff_locked();
     s_rf_policy_apply_pending = s_rf_policy_user_transaction ||
-                                 (s_rf_mode == RF_MODE_MANUAL);
+                                 (s_rf_mode == IOT_RF_MODE_MANUAL);
     s_rf_expected_user_transaction = false;
     s_rf_expected_request_id[0] = '\0';
     if (!s_rf_policy_user_transaction) {
@@ -864,7 +854,7 @@ static void rf_power_publish_state(uint16_t addr, int8_t power_dbm,
 static void rf_power_publish_querying(uint16_t addr, const char *request_id)
 {
     rf_power_publish_state(addr, RF_POWER_UNKNOWN_DBM,
-                           RF_MODE_UNKNOWN, "querying", request_id);
+                           IOT_RF_MODE_UNKNOWN, "querying", request_id);
 }
 
 static bool rf_power_request_id_valid(const char *request_id)
@@ -905,7 +895,7 @@ static void rf_power_clear_waiting_locked(void)
     s_rf_report_waiting = false;
     s_rf_expected_report_seq = 0;
     s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-    s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+    s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
     s_rf_expected_user_transaction = false;
     s_rf_expected_request_id[0] = '\0';
     s_rf_wait_started_ms = 0;
@@ -1050,7 +1040,7 @@ static bool rf_power_handle_background_terminal_locked(
     status_state.command = s_rf_background_command;
     status_state.event = event;
     status_state.reported_power_dbm = RF_POWER_UNKNOWN_DBM;
-    status_state.reported_mode = RF_MODE_UNKNOWN;
+    status_state.reported_mode = IOT_RF_MODE_UNKNOWN;
     status_state.matched_transaction = false;
     status_state.node_initiated_report = false;
     status_state.policy_apply_pending = s_rf_policy_apply_pending;
@@ -1137,7 +1127,7 @@ static void rf_power_publish_background_terminal_notice(void)
                                       ? "failed"
                                       : "timeout";
         rf_power_publish_state(addr, RF_POWER_UNKNOWN_DBM,
-                               RF_MODE_UNKNOWN, status_name, NULL);
+                               IOT_RF_MODE_UNKNOWN, status_name, NULL);
     }
 }
 
@@ -1186,13 +1176,12 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
     bool is_private = ind.cluster_id == RF_POWER_CLUSTER_ID;
     bool power_report = false;
     bool accept_report = false;
-    bool packet_v1 = false;
     bool packet_v2 = false;
     int8_t reported_power = 0;
-    uint8_t reported_mode = RF_MODE_UNKNOWN;
+    uint8_t reported_mode = IOT_RF_MODE_UNKNOWN;
     uint8_t report_seq = 0;
     uint8_t expected_seq = 0;
-    uint8_t expected_mode = RF_MODE_UNKNOWN;
+    uint8_t expected_mode = IOT_RF_MODE_UNKNOWN;
     int8_t expected_power = RF_POWER_UNKNOWN_DBM;
     uint8_t last_seq = 0;
     bool expected_user = false;
@@ -1231,34 +1220,26 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
             return true;
         }
 
-        packet_v1 = ind.asdu_length == RF_PACKET_V1_LEN &&
-                    ind.asdu[2] == 1;
-        packet_v2 = ind.asdu_length == RF_PACKET_LEN &&
-                    ind.asdu[2] == RF_PACKET_VERSION;
+        iot_rf_packet_t private_packet;
 
-        if ((!packet_v1 && !packet_v2) ||
-            ind.asdu[0] != RF_PACKET_MAGIC0 ||
-            ind.asdu[1] != RF_PACKET_MAGIC1) {
+        if (!iot_rf_packet_decode(ind.asdu, ind.asdu_length,
+                                  &private_packet)) {
             reject_reason = RF_REJECT_MALFORMED;
             return true;
         }
 
-        report_seq = ind.asdu[4];
-        if (ind.asdu[3] == RF_CMD_REPORT) {
-            reported_power = (int8_t)ind.asdu[5];
-            power_report = true;
-            if (packet_v2) {
-                reported_mode = ind.asdu[6];
-                if ((reported_mode != RF_MODE_AUTO &&
-                     reported_mode != RF_MODE_MANUAL) ||
-                    ind.asdu[7] != 0) {
-                    reject_reason = RF_REJECT_MALFORMED;
-                    return true;
-                }
-            }
-        } else {
+        packet_v2 = private_packet.version == IOT_RF_PACKET_V2_VERSION;
+        report_seq = private_packet.sequence;
+
+        if (private_packet.command != IOT_RF_CMD_REPORT) {
             reject_reason = RF_REJECT_UNEXPECTED_CMD;
             return true;
+        }
+
+        reported_power = private_packet.power_dbm;
+        power_report = true;
+        if (packet_v2) {
+            reported_mode = private_packet.mode;
         }
     }
 
@@ -1305,12 +1286,12 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
                         RF_CQ_COMMAND_SET &&
                     ((s_rf_background_command.desired_mode ==
                           RF_CQ_MODE_MANUAL &&
-                      reported_mode == RF_MODE_MANUAL &&
+                      reported_mode == IOT_RF_MODE_MANUAL &&
                       reported_power ==
                           s_rf_background_command.desired_power_dbm) ||
                      (s_rf_background_command.desired_mode ==
                           RF_CQ_MODE_AUTO &&
-                      reported_mode == RF_MODE_AUTO));
+                      reported_mode == IOT_RF_MODE_AUTO));
             }
 #endif
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
@@ -1325,7 +1306,7 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
                 report_seq == expected_seq &&
                 (expected_power == RF_POWER_UNKNOWN_DBM ||
                  reported_power == expected_power) &&
-                (expected_mode == RF_MODE_UNKNOWN ||
+                (expected_mode == IOT_RF_MODE_UNKNOWN ||
                  reported_mode == expected_mode)) {
                 accept_report = true;
                 matched_transaction = expected_user;
@@ -1340,7 +1321,7 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
                 s_rf_expected_request_id[0] = '\0';
                 s_rf_report_waiting = false;
                 s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-                s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+                s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
                 s_rf_wait_started_ms = 0;
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
             } else if (report_seq >= 0x80 && !spontaneous_report_is_new) {
@@ -1358,7 +1339,7 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
 
     if (accept_report) {
         s_rf_node_power_dbm = reported_power;
-        s_rf_node_mode = packet_v2 ? reported_mode : RF_MODE_UNKNOWN;
+        s_rf_node_mode = packet_v2 ? reported_mode : IOT_RF_MODE_UNKNOWN;
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
         background_active = s_rf_background_active;
         background_report_handled =
@@ -1380,11 +1361,11 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
 #else
         if (!s_rf_policy_user_transaction && packet_v2 &&
 #endif
-            ((s_rf_mode == RF_MODE_MANUAL &&
-              reported_mode == RF_MODE_MANUAL &&
+            ((s_rf_mode == IOT_RF_MODE_MANUAL &&
+              reported_mode == IOT_RF_MODE_MANUAL &&
               reported_power == s_rf_manual_power_dbm) ||
-             (s_rf_mode == RF_MODE_AUTO &&
-              reported_mode == RF_MODE_AUTO))) {
+             (s_rf_mode == IOT_RF_MODE_AUTO &&
+              reported_mode == IOT_RF_MODE_AUTO))) {
             s_rf_policy_apply_pending = false;
             s_rf_policy_request_id[0] = '\0';
         }
@@ -1496,7 +1477,7 @@ static esp_err_t rf_power_send_to_node(uint8_t command, int8_t power_dbm,
     uint16_t addr = 0;
     bool generation_stale = false;
 
-    if (mode != RF_MODE_AUTO && mode != RF_MODE_MANUAL) {
+    if (mode != IOT_RF_MODE_AUTO && mode != IOT_RF_MODE_MANUAL) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1520,16 +1501,21 @@ static esp_err_t rf_power_send_to_node(uint8_t command, int8_t power_dbm,
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t asdu[RF_PACKET_LEN] = {
-        RF_PACKET_MAGIC0,
-        RF_PACKET_MAGIC1,
-        RF_PACKET_VERSION,
-        command,
-        seq,
-        (uint8_t)power_dbm,
-        mode,
-        0,
+    uint8_t asdu[IOT_RF_PACKET_V2_LEN];
+    const iot_rf_packet_t outgoing_packet = {
+        .version = IOT_RF_PACKET_V2_VERSION,
+        .command = command,
+        .sequence = seq,
+        .power_dbm = power_dbm,
+        .mode = mode,
     };
+    size_t encoded_len = 0U;
+
+    if (!iot_rf_packet_encode(&outgoing_packet, asdu, sizeof(asdu),
+                              &encoded_len) ||
+        encoded_len != IOT_RF_PACKET_V2_LEN) {
+        return ESP_FAIL;
+    }
     esp_zb_apsde_data_req_t req = {
         .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
         .dst_addr.addr_short = addr,
@@ -1634,13 +1620,13 @@ static void rf_power_remote_query(const char *request_id)
 
     uint8_t sent_seq = 0;
     rf_power_publish_querying(addr, request_id);
-    if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq,
+    if (rf_power_send_to_node(IOT_RF_CMD_QUERY, 0, IOT_RF_MODE_AUTO, &sent_seq,
                                   RF_POLICY_GENERATION_ANY) == ESP_OK) {
         taskENTER_CRITICAL(&s_rf_power_lock);
         s_rf_report_waiting = true;
         s_rf_expected_report_seq = sent_seq;
         s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-        s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+        s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
         s_rf_expected_user_transaction = true;
         s_rf_wait_started_ms = now;
         taskEXIT_CRITICAL(&s_rf_power_lock);
@@ -1663,13 +1649,13 @@ static void rf_power_remote_set_manual(int8_t target_power_dbm, const char *requ
     }
 
     taskENTER_CRITICAL(&s_rf_power_lock);
-    s_rf_mode = RF_MODE_MANUAL;
+    s_rf_mode = IOT_RF_MODE_MANUAL;
     s_rf_manual_power_dbm = target_power_dbm;
     s_rf_policy_apply_pending = true;
     s_rf_report_waiting = false;
     s_rf_expected_report_seq = 0;
     s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-    s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+    s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
     s_rf_expected_user_transaction = false;
     s_rf_expected_request_id[0] = '\0';
     s_rf_wait_started_ms = 0;
@@ -1684,7 +1670,7 @@ static void rf_power_remote_set_manual(int8_t target_power_dbm, const char *requ
     current_power_dbm = s_rf_node_power_dbm;
     taskEXIT_CRITICAL(&s_rf_power_lock);
 
-    rf_power_policy_persist(RF_MODE_MANUAL, target_power_dbm);
+    rf_power_policy_persist(IOT_RF_MODE_MANUAL, target_power_dbm);
 
     if (addr == 0) {
         ESP_LOGI(TAG, "RF power: manual policy saved; apply when node joins");
@@ -1692,13 +1678,13 @@ static void rf_power_remote_set_manual(int8_t target_power_dbm, const char *requ
     }
     if (current_power_dbm == RF_POWER_UNKNOWN_DBM) {
         uint8_t sent_seq = 0;
-        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq,
+        if (rf_power_send_to_node(IOT_RF_CMD_QUERY, 0, IOT_RF_MODE_AUTO, &sent_seq,
                                   RF_POLICY_GENERATION_ANY) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
             s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-            s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+            s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
             s_rf_expected_user_transaction = false;
             s_rf_expected_request_id[0] = '\0';
             s_rf_wait_started_ms = now;
@@ -1708,13 +1694,13 @@ static void rf_power_remote_set_manual(int8_t target_power_dbm, const char *requ
     }
 
     uint8_t sent_seq = 0;
-    if (rf_power_send_to_node(RF_CMD_SET, target_power_dbm, RF_MODE_MANUAL, &sent_seq,
+    if (rf_power_send_to_node(IOT_RF_CMD_SET, target_power_dbm, IOT_RF_MODE_MANUAL, &sent_seq,
                               RF_POLICY_GENERATION_ANY) == ESP_OK) {
         taskENTER_CRITICAL(&s_rf_power_lock);
         s_rf_report_waiting = true;
         s_rf_expected_report_seq = sent_seq;
         s_rf_expected_report_power = target_power_dbm;
-        s_rf_expected_report_mode = RF_MODE_MANUAL;
+        s_rf_expected_report_mode = IOT_RF_MODE_MANUAL;
         s_rf_expected_user_transaction = s_rf_policy_user_transaction;
         strlcpy(s_rf_expected_request_id, s_rf_policy_request_id, sizeof(s_rf_expected_request_id));
         s_rf_policy_user_transaction = false;
@@ -1731,12 +1717,12 @@ static void rf_power_remote_set_auto(const char *request_id)
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
 
     taskENTER_CRITICAL(&s_rf_power_lock);
-    s_rf_mode = RF_MODE_AUTO;
+    s_rf_mode = IOT_RF_MODE_AUTO;
     s_rf_policy_apply_pending = true;
     s_rf_report_waiting = false;
     s_rf_expected_report_seq = 0;
     s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-    s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+    s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
     s_rf_expected_user_transaction = false;
     s_rf_expected_request_id[0] = '\0';
     s_rf_wait_started_ms = 0;
@@ -1751,7 +1737,7 @@ static void rf_power_remote_set_auto(const char *request_id)
     current_power_dbm = s_rf_node_power_dbm;
     taskEXIT_CRITICAL(&s_rf_power_lock);
 
-    rf_power_policy_persist(RF_MODE_AUTO, s_rf_manual_power_dbm);
+    rf_power_policy_persist(IOT_RF_MODE_AUTO, s_rf_manual_power_dbm);
     ESP_LOGI(TAG, "RF power: automatic policy enabled");
 
     if (addr == 0) {
@@ -1760,13 +1746,13 @@ static void rf_power_remote_set_auto(const char *request_id)
     }
     if (current_power_dbm == RF_POWER_UNKNOWN_DBM) {
         uint8_t sent_seq = 0;
-        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO, &sent_seq,
+        if (rf_power_send_to_node(IOT_RF_CMD_QUERY, 0, IOT_RF_MODE_AUTO, &sent_seq,
                                   RF_POLICY_GENERATION_ANY) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
             s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-            s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+            s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
             s_rf_expected_user_transaction = false;
             s_rf_expected_request_id[0] = '\0';
             s_rf_wait_started_ms = now;
@@ -1776,13 +1762,13 @@ static void rf_power_remote_set_auto(const char *request_id)
     }
 
     uint8_t sent_seq = 0;
-    if (rf_power_send_to_node(RF_CMD_SET, current_power_dbm, RF_MODE_AUTO, &sent_seq,
+    if (rf_power_send_to_node(IOT_RF_CMD_SET, current_power_dbm, IOT_RF_MODE_AUTO, &sent_seq,
                               RF_POLICY_GENERATION_ANY) == ESP_OK) {
         taskENTER_CRITICAL(&s_rf_power_lock);
         s_rf_report_waiting = true;
         s_rf_expected_report_seq = sent_seq;
         s_rf_expected_report_power = current_power_dbm;
-        s_rf_expected_report_mode = RF_MODE_AUTO;
+        s_rf_expected_report_mode = IOT_RF_MODE_AUTO;
         s_rf_expected_user_transaction = s_rf_policy_user_transaction;
         strlcpy(s_rf_expected_request_id, s_rf_policy_request_id, sizeof(s_rf_expected_request_id));
         s_rf_policy_user_transaction = false;
@@ -1907,7 +1893,7 @@ static void rf_power_background_controller_periodic(void)
             if (timeout_publish) {
                 rf_power_publish_state(
                     timeout_addr, RF_POWER_UNKNOWN_DBM,
-                    RF_MODE_UNKNOWN, "timeout", NULL);
+                    IOT_RF_MODE_UNKNOWN, "timeout", NULL);
             }
             return;
         }
@@ -1981,16 +1967,21 @@ static const char *rf_power_normalize_cq_request_id(
 
 static esp_err_t rf_power_execute_plan(const rf_dispatch_plan_t *plan)
 {
-    uint8_t asdu[RF_PACKET_LEN] = {
-        RF_PACKET_MAGIC0,
-        RF_PACKET_MAGIC1,
-        RF_PACKET_VERSION,
-        plan->command,
-        plan->seq,
-        (uint8_t)plan->power_dbm,
-        plan->mode,
-        0,
+    uint8_t asdu[IOT_RF_PACKET_V2_LEN];
+    const iot_rf_packet_t outgoing_packet = {
+        .version = IOT_RF_PACKET_V2_VERSION,
+        .command = plan->command,
+        .sequence = plan->seq,
+        .power_dbm = plan->power_dbm,
+        .mode = plan->mode,
     };
+    size_t encoded_len = 0U;
+
+    if (!iot_rf_packet_encode(&outgoing_packet, asdu, sizeof(asdu),
+                              &encoded_len) ||
+        encoded_len != IOT_RF_PACKET_V2_LEN) {
+        return ESP_FAIL;
+    }
     esp_zb_apsde_data_req_t req = {
         .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
         .dst_addr.addr_short = plan->node_addr,
@@ -2033,7 +2024,7 @@ static void rf_power_prepare_manual_policy_locked(
 {
     rf_power_clear_waiting_locked();
     rf_power_clear_background_locked();
-    s_rf_mode = RF_MODE_MANUAL;
+    s_rf_mode = IOT_RF_MODE_MANUAL;
     s_rf_manual_power_dbm = target_power_dbm;
     s_rf_policy_apply_pending = true;
     s_rf_last_eval_ms = now;
@@ -2047,7 +2038,7 @@ static void rf_power_prepare_auto_policy_locked(
 {
     rf_power_clear_waiting_locked();
     rf_power_clear_background_locked();
-    s_rf_mode = RF_MODE_AUTO;
+    s_rf_mode = IOT_RF_MODE_AUTO;
     s_rf_policy_apply_pending = true;
     s_rf_last_eval_ms = now;
     s_rf_policy_user_transaction = true;
@@ -2319,7 +2310,7 @@ static void rf_power_send_background_command(const rf_dispatch_cmd_t *cmd)
                                       ? "timeout"
                                       : "failed";
         rf_power_publish_state(terminal_addr, RF_POWER_UNKNOWN_DBM,
-                               RF_MODE_UNKNOWN, status_name, NULL);
+                               IOT_RF_MODE_UNKNOWN, status_name, NULL);
     }
 }
 static void rf_power_dispatch_from_queue(const rf_dispatch_cmd_t *cmd)
@@ -2452,7 +2443,7 @@ static bool rf_power_queued_set_manual(
     generation = s_rf_policy_generation;
     taskEXIT_CRITICAL(&s_rf_power_lock);
 
-    rf_power_policy_persist(RF_MODE_MANUAL, target_power_dbm);
+    rf_power_policy_persist(IOT_RF_MODE_MANUAL, target_power_dbm);
 
     taskENTER_CRITICAL(&s_rf_power_lock);
     now = pdTICKS_TO_MS(xTaskGetTickCount());
@@ -2628,7 +2619,7 @@ static bool rf_power_queued_set_auto(const char *request_id)
     generation = s_rf_policy_generation;
     taskEXIT_CRITICAL(&s_rf_power_lock);
 
-    rf_power_policy_persist(RF_MODE_AUTO, manual_power_dbm);
+    rf_power_policy_persist(IOT_RF_MODE_AUTO, manual_power_dbm);
 
     taskENTER_CRITICAL(&s_rf_power_lock);
     now = pdTICKS_TO_MS(xTaskGetTickCount());
@@ -2856,8 +2847,8 @@ static void rf_power_controller_periodic(void)
     uint8_t samples = 0;
     int8_t current_power = 0;
     int8_t target_power = 0;
-    uint8_t mode = RF_MODE_AUTO;
-    uint8_t node_mode = RF_MODE_UNKNOWN;
+    uint8_t mode = IOT_RF_MODE_AUTO;
+    uint8_t node_mode = IOT_RF_MODE_UNKNOWN;
     int8_t manual_power = RF_POWER_AUTO_MIN_DBM;
     bool policy_pending = false;
     bool policy_user = false;
@@ -2904,11 +2895,11 @@ static void rf_power_controller_periodic(void)
         s_rf_lqi_ema = -1;
         s_rf_lqi_low_windows = 0;
         s_rf_lqi_high_windows = 0;
-        s_rf_node_mode = RF_MODE_UNKNOWN;
+        s_rf_node_mode = IOT_RF_MODE_UNKNOWN;
         s_rf_report_waiting = false;
         s_rf_expected_report_seq = 0;
         s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-        s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+        s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
         s_rf_expected_user_transaction = false;
         s_rf_expected_request_id[0] = '\0';
         s_rf_wait_started_ms = 0;
@@ -2922,13 +2913,13 @@ static void rf_power_controller_periodic(void)
                           now - wait_started_ms >= RF_POWER_SETTLE_MS;
     if (current_power == RF_POWER_UNKNOWN_DBM || wait_timed_out) {
         uint8_t sent_seq = 0;
-        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO,
+        if (rf_power_send_to_node(IOT_RF_CMD_QUERY, 0, IOT_RF_MODE_AUTO,
                                   &sent_seq, snapshot_generation) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
             s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-            s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+            s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
             s_rf_expected_user_transaction = false;
             s_rf_expected_request_id[0] = '\0';
             s_rf_wait_started_ms = now;
@@ -2940,13 +2931,13 @@ static void rf_power_controller_periodic(void)
         now - confirmed_ms >= RF_POWER_RECONCILE_MS) {
         uint8_t sent_seq = 0;
         ESP_LOGI(TAG, "RF power: periodic reconcile current=%d dBm", current_power);
-        if (rf_power_send_to_node(RF_CMD_QUERY, 0, RF_MODE_AUTO,
+        if (rf_power_send_to_node(IOT_RF_CMD_QUERY, 0, IOT_RF_MODE_AUTO,
                                   &sent_seq, snapshot_generation) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
             s_rf_expected_report_power = RF_POWER_UNKNOWN_DBM;
-            s_rf_expected_report_mode = RF_MODE_UNKNOWN;
+            s_rf_expected_report_mode = IOT_RF_MODE_UNKNOWN;
             s_rf_expected_user_transaction = false;
             s_rf_expected_request_id[0] = '\0';
             s_rf_wait_started_ms = now;
@@ -2960,8 +2951,8 @@ static void rf_power_controller_periodic(void)
         return;
     }
 
-    if (mode == RF_MODE_MANUAL) {
-        if (node_mode == RF_MODE_MANUAL &&
+    if (mode == IOT_RF_MODE_MANUAL) {
+        if (node_mode == IOT_RF_MODE_MANUAL &&
             current_power == manual_power) {
             bool already_confirmed = false;
             char response_request_id[17] = {0};
@@ -2971,9 +2962,9 @@ static void rf_power_controller_periodic(void)
                 bool state_still_matches =
                     s_rf_policy_apply_pending &&
                     s_rf_policy_user_transaction == policy_user &&
-                    s_rf_mode == RF_MODE_MANUAL &&
+                    s_rf_mode == IOT_RF_MODE_MANUAL &&
                     s_rf_node_addr == addr &&
-                    s_rf_node_mode == RF_MODE_MANUAL &&
+                    s_rf_node_mode == IOT_RF_MODE_MANUAL &&
                     s_rf_manual_power_dbm == manual_power &&
                     s_rf_node_power_dbm == manual_power;
 
@@ -3002,7 +2993,7 @@ static void rf_power_controller_periodic(void)
                 taskEXIT_CRITICAL(&s_rf_power_lock);
             }
             if (already_confirmed) {
-                rf_power_publish_state(addr, manual_power, RF_MODE_MANUAL,
+                rf_power_publish_state(addr, manual_power, IOT_RF_MODE_MANUAL,
                                        "confirmed", response_request_id);
             }
             return;
@@ -3012,7 +3003,7 @@ static void rf_power_controller_periodic(void)
                  rf_power_mode_name(node_mode), (int)current_power,
                  (int)manual_power);
         policy_pending = true;
-    } else if (mode == RF_MODE_AUTO && node_mode == RF_MODE_MANUAL) {
+    } else if (mode == IOT_RF_MODE_AUTO && node_mode == IOT_RF_MODE_MANUAL) {
         ESP_LOGW(TAG,
                  "RF power: node is manual but desired is automatic; reconcile");
         policy_pending = true;
@@ -3021,9 +3012,9 @@ static void rf_power_controller_periodic(void)
     if (policy_pending) {
         uint8_t sent_seq = 0;
 
-        if (mode == RF_MODE_MANUAL) {
+        if (mode == IOT_RF_MODE_MANUAL) {
             if (current_power == manual_power &&
-                node_mode == RF_MODE_MANUAL && !policy_user) {
+                node_mode == IOT_RF_MODE_MANUAL && !policy_user) {
                 taskENTER_CRITICAL(&s_rf_power_lock);
                 s_rf_policy_apply_pending = false;
                 s_rf_policy_user_transaction = false;
@@ -3032,14 +3023,14 @@ static void rf_power_controller_periodic(void)
                 return;
             }
             target_power = manual_power;
-            if (rf_power_send_to_node(RF_CMD_SET, target_power,
-                                      RF_MODE_MANUAL,
+            if (rf_power_send_to_node(IOT_RF_CMD_SET, target_power,
+                                      IOT_RF_MODE_MANUAL,
                                       &sent_seq, snapshot_generation) == ESP_OK) {
                 taskENTER_CRITICAL(&s_rf_power_lock);
                 s_rf_report_waiting = true;
                 s_rf_expected_report_seq = sent_seq;
                 s_rf_expected_report_power = target_power;
-                s_rf_expected_report_mode = RF_MODE_MANUAL;
+                s_rf_expected_report_mode = IOT_RF_MODE_MANUAL;
                 s_rf_expected_user_transaction = policy_user;
                 strlcpy(s_rf_expected_request_id, s_rf_policy_request_id, sizeof(s_rf_expected_request_id));
                 s_rf_policy_user_transaction = false;
@@ -3050,7 +3041,7 @@ static void rf_power_controller_periodic(void)
             return;
         }
 
-        if (node_mode == RF_MODE_AUTO && !policy_user) {
+        if (node_mode == IOT_RF_MODE_AUTO && !policy_user) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_policy_apply_pending = false;
             s_rf_policy_user_transaction = false;
@@ -3060,14 +3051,14 @@ static void rf_power_controller_periodic(void)
         }
 
         target_power = current_power;
-        if (rf_power_send_to_node(RF_CMD_SET, target_power,
-                                  RF_MODE_AUTO,
+        if (rf_power_send_to_node(IOT_RF_CMD_SET, target_power,
+                                  IOT_RF_MODE_AUTO,
                                   &sent_seq, snapshot_generation) == ESP_OK) {
             taskENTER_CRITICAL(&s_rf_power_lock);
             s_rf_report_waiting = true;
             s_rf_expected_report_seq = sent_seq;
             s_rf_expected_report_power = target_power;
-            s_rf_expected_report_mode = RF_MODE_AUTO;
+            s_rf_expected_report_mode = IOT_RF_MODE_AUTO;
             s_rf_expected_user_transaction = policy_user;
             strlcpy(s_rf_expected_request_id, s_rf_policy_request_id, sizeof(s_rf_expected_request_id));
             s_rf_policy_user_transaction = false;
@@ -3126,7 +3117,7 @@ static void rf_power_controller_periodic(void)
 
     target_power = s_rf_power_table[target_index];
     uint8_t sent_seq = 0;
-    if (rf_power_send_to_node(RF_CMD_SET, target_power, RF_MODE_AUTO,
+    if (rf_power_send_to_node(IOT_RF_CMD_SET, target_power, IOT_RF_MODE_AUTO,
                               &sent_seq, snapshot_generation) == ESP_OK) {
         // Queue acceptance is not proof. Accept only the node's encrypted
         // REPORT carrying this request sequence, requested power and mode.
@@ -3134,7 +3125,7 @@ static void rf_power_controller_periodic(void)
         s_rf_report_waiting = true;
         s_rf_expected_report_seq = sent_seq;
         s_rf_expected_report_power = target_power;
-        s_rf_expected_report_mode = RF_MODE_AUTO;
+        s_rf_expected_report_mode = IOT_RF_MODE_AUTO;
         s_rf_wait_started_ms = now;
         taskEXIT_CRITICAL(&s_rf_power_lock);
     }

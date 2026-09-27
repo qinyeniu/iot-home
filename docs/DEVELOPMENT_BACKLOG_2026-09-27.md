@@ -340,3 +340,15 @@ main.c.20260910-oled-debug.bak
 7. 网关出现 1 次 `i2c: clear bus error`，未触发 OLED 本地恢复；继续作为既有偶发观察项，不构成本次回归。
 8. 代码复审 APPROVE，Critical/High/Medium/Low 均为 0。
 9. P1-2 后续步骤：在 packet codec 稳定后，再拆分 `iot_rf_power_policy`，本阶段不搬功率策略和命令队列。
+
+## 11. 13:22 P1-2 第二步：自动功率策略组件已完成
+
+1. 新增纯逻辑组件 `firmware/common/iot_rf_power_policy/`，集中功率表、允许范围、LQI 阈值、样本门槛、good window 迟滞和降级目标决策。
+2. 组件不依赖 ESP-IDF、Zigbee、FreeRTOS 或硬件；已提供 README 与主机 CTest。
+3. 主机测试通过，覆盖阈值相等、样本不足、越界、连续 3 个好窗口、最低功率限制、计数器饱和和空参数。
+4. 默认 OFF 固件构建通过：`1449664 bytes`，应用分区剩余 `57664 bytes`；实验 ON 固件构建通过：`1467056 bytes`，应用分区剩余 `40272 bytes`。
+5. 13:16–13:21 硬件 5 分钟短测：节点 DATA 29、REPORT_SEND 28；网关 RF sample 84、cached report 83、MQTT telemetry 27；启动 QUERY 被接受，随后 4 次自动功率 keep。
+6. 无 Wi‑Fi/MQTT 掉线、MQTT 写入超时、重启、panic、watchdog、`ESP_ERR_NO_MEM`；节点传感器 I2C 失败为 0。
+7. 启动初期 OLED 出现 1 次刷新失败，随后本地 I2C/SSD1306 reset 自动恢复；未出现 `i2c: clear bus error`。
+8. 代码复审 APPROVE，Critical/High/Medium/Low 均为 0。
+9. P1-2 后续：packet codec 和 auto policy 已独立；下一块如需继续，可整理事务等待/QUERY 协调逻辑，但应单独设边界。

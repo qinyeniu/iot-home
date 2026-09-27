@@ -61,6 +61,7 @@
 #include "iot_wifi_sta.h"
 #include "iot_wifi_connection.h"
 #include "iot_rf_packet.h"
+#include "iot_rf_power_policy.h"
 #include "iot_provisioning_wifi_owner.h"
 #include "cJSON.h"
 #include "zcl/esp_zigbee_zcl_on_off.h"
@@ -430,6 +431,16 @@ static bool zb_nlme_diagnostic_allowed(void)
 
 static const int8_t s_rf_power_table[] = {-10, 0, 8, 14, 18, 20};
 #define RF_POWER_LEVEL_COUNT (sizeof(s_rf_power_table) / sizeof(s_rf_power_table[0]))
+static const iot_rf_power_policy_config_t s_rf_power_policy_config = {
+    .levels_dbm = s_rf_power_table,
+    .level_count = (uint8_t)RF_POWER_LEVEL_COUNT,
+    .min_power_dbm = RF_POWER_AUTO_MIN_DBM,
+    .max_power_dbm = RF_POWER_AUTO_MAX_DBM,
+    .lqi_good_threshold = RF_LQI_LOWER,
+    .good_windows_needed = RF_LQI_LOWER_WINDOWS,
+    .samples_needed = RF_POWER_SAMPLES_NEEDED,
+};
+
 
 static uint16_t s_rf_node_addr;
 static int s_rf_lqi_ema = -1;
@@ -482,7 +493,6 @@ static char s_rf_policy_request_id[17];
 static portMUX_TYPE s_rf_power_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static bool rf_power_known_active_child(uint16_t addr);
-static bool rf_power_is_table_value(int8_t power_dbm);
 static bool rf_power_request_id_valid(const char *request_id);
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
 static void rf_power_reconcile_pending_intent(void);
@@ -535,48 +545,6 @@ static void rf_tx_note_result_locked(esp_err_t err, uint32_t now)
     s_rf_tx_backoff_until_ms = now + delay_ms;
 }
 
-static bool rf_power_is_table_value(int8_t power_dbm)
-{
-    for (uint8_t i = 0; i < RF_POWER_LEVEL_COUNT; ++i) {
-        if (s_rf_power_table[i] == power_dbm) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool rf_power_is_allowed_value(int8_t power_dbm)
-{
-    return power_dbm >= RF_POWER_AUTO_MIN_DBM &&
-           power_dbm <= RF_POWER_AUTO_MAX_DBM &&
-           rf_power_is_table_value(power_dbm);
-}
-
-static uint8_t rf_power_nearest_index(int8_t power_dbm)
-{
-    uint8_t best = 0;
-    uint16_t best_delta = 0xFFFF;
-
-    for (uint8_t i = 0; i < RF_POWER_LEVEL_COUNT; ++i) {
-        int delta = (int)power_dbm - (int)s_rf_power_table[i];
-        uint16_t abs_delta = (uint16_t)(delta < 0 ? -delta : delta);
-        if (abs_delta < best_delta) {
-            best_delta = abs_delta;
-            best = i;
-        }
-    }
-    return best;
-}
-
-static uint8_t rf_power_min_index(void)
-{
-    return rf_power_nearest_index(RF_POWER_AUTO_MIN_DBM);
-}
-
-static uint8_t rf_power_max_index(void)
-{
-    return rf_power_nearest_index(RF_POWER_AUTO_MAX_DBM);
-}
 
 #define RF_POLICY_NVS_NAMESPACE     "rfpol"
 
@@ -594,7 +562,7 @@ static const char *rf_power_mode_name(uint8_t mode)
 static bool rf_power_policy_values_valid(uint8_t mode, int8_t manual_power_dbm)
 {
     return (mode == IOT_RF_MODE_AUTO || mode == IOT_RF_MODE_MANUAL) &&
-           rf_power_is_allowed_value(manual_power_dbm);
+           iot_rf_power_policy_value_allowed(&s_rf_power_policy_config, manual_power_dbm);
 }
 
 static void rf_power_policy_persist(uint8_t mode, int8_t manual_power_dbm)
@@ -1264,7 +1232,7 @@ static bool rf_power_aps_indication_cb(esp_zb_apsde_data_ind_t ind)
 
         if (!active_child) {
             reject_reason = RF_REJECT_UNKNOWN_CHILD;
-        } else if (!rf_power_is_allowed_value(reported_power)) {
+        } else if (!iot_rf_power_policy_value_allowed(&s_rf_power_policy_config, reported_power)) {
             reject_reason = RF_REJECT_INVALID_POWER;
         } else if (s_rf_report_waiting) {
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
@@ -1643,7 +1611,7 @@ static void rf_power_remote_set_manual(int8_t target_power_dbm, const char *requ
     int8_t current_power_dbm = RF_POWER_UNKNOWN_DBM;
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
 
-    if (!rf_power_is_allowed_value(target_power_dbm)) {
+    if (!iot_rf_power_policy_value_allowed(&s_rf_power_policy_config, target_power_dbm)) {
         ESP_LOGW(TAG, "RF power: reject remote target=%d dBm", (int)target_power_dbm);
         return;
     }
@@ -2426,7 +2394,7 @@ static bool rf_power_queued_set_manual(
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
     uint32_t generation;
 
-    if (!rf_power_is_allowed_value(target_power_dbm)) {
+    if (!iot_rf_power_policy_value_allowed(&s_rf_power_policy_config, target_power_dbm)) {
         ESP_LOGW(TAG, "RF power: reject queued target=%d dBm",
                  (int)target_power_dbm);
         return false;
@@ -2845,6 +2813,7 @@ static void rf_power_controller_periodic(void)
     uint32_t last_rx = 0;
     int link_lqi = -1;
     uint8_t samples = 0;
+    uint8_t high_windows = 0;
     int8_t current_power = 0;
     int8_t target_power = 0;
     uint8_t mode = IOT_RF_MODE_AUTO;
@@ -2873,6 +2842,7 @@ static void rf_power_controller_periodic(void)
     last_rx = s_rf_last_rx_ms;
     link_lqi = s_rf_lqi_ema;
     samples = s_rf_lqi_samples;
+    high_windows = s_rf_lqi_high_windows;
     current_power = s_rf_node_power_dbm;
     node_mode = s_rf_node_mode;
     mode = s_rf_mode;
@@ -3075,12 +3045,21 @@ static void rf_power_controller_periodic(void)
         return;
     }
 
-    uint8_t current_index = rf_power_nearest_index(current_power);
-    uint8_t min_index = rf_power_min_index();
-    uint8_t max_index = rf_power_max_index();
-    uint8_t target_index = current_index;
+    const iot_rf_power_policy_input_t policy_input = {
+        .samples = samples,
+        .lqi_ema = link_lqi,
+        .current_power_dbm = current_power,
+        .good_windows = high_windows,
+    };
+    iot_rf_power_policy_decision_t policy_decision;
 
-    if (current_index < min_index || current_index > max_index) {
+    if (!iot_rf_power_policy_decide_auto(&s_rf_power_policy_config,
+                                        &policy_input, &policy_decision)) {
+        ESP_LOGW(TAG, "RF power: automatic policy evaluation failed");
+        return;
+    }
+
+    if (!policy_decision.current_in_bounds) {
         ESP_LOGW(TAG, "RF power: current=%d dBm outside configured policy",
                  (int)current_power);
         return;
@@ -3088,34 +3067,17 @@ static void rf_power_controller_periodic(void)
 
     taskENTER_CRITICAL(&s_rf_power_lock);
     s_rf_lqi_low_windows = 0;
-    if (link_lqi > RF_LQI_LOWER) {
-        if (s_rf_lqi_high_windows < UINT8_MAX) {
-            s_rf_lqi_high_windows++;
-        }
-    } else {
-        s_rf_lqi_high_windows = 0;
-    }
-
-    if (s_rf_lqi_high_windows >= RF_LQI_LOWER_WINDOWS &&
-        current_index > min_index) {
-        target_index = current_index - 1;
-        s_rf_lqi_low_windows = 0;
-        s_rf_lqi_high_windows = 0;
-    }
+    s_rf_lqi_high_windows = policy_decision.good_windows;
     taskEXIT_CRITICAL(&s_rf_power_lock);
 
-    if (target_index == current_index) {
-        taskENTER_CRITICAL(&s_rf_power_lock);
-        uint8_t low_windows = s_rf_lqi_low_windows;
-        uint8_t high_windows = s_rf_lqi_high_windows;
-        taskEXIT_CRITICAL(&s_rf_power_lock);
+    if (policy_decision.action == IOT_RF_POWER_ACTION_NONE) {
         ESP_LOGI(TAG,
                  "RF power: keep %d dBm lqi_ema=%d low_windows=%u high_windows=%u",
-                 current_power, link_lqi, low_windows, high_windows);
+                 current_power, link_lqi, 0, policy_decision.good_windows);
         return;
     }
 
-    target_power = s_rf_power_table[target_index];
+    target_power = policy_decision.target_power_dbm;
     uint8_t sent_seq = 0;
     if (rf_power_send_to_node(IOT_RF_CMD_SET, target_power, IOT_RF_MODE_AUTO,
                               &sent_seq, snapshot_generation) == ESP_OK) {

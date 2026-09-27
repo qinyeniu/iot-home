@@ -56,6 +56,9 @@ bool iot_wifi_connection_is_up(void);
 /** Wait until the normal STA connection has obtained an IP address. */
 esp_err_t iot_wifi_connection_wait_connected(uint32_t timeout_ms);
 
+/** Return the connection task stack high-water mark in bytes; 0 if unavailable. */
+uint32_t iot_wifi_connection_task_stack_free_bytes(void);
+
 /** Unregister events, delete the task and release connection-service objects. */
 esp_err_t iot_wifi_connection_deinitialize(void);
 

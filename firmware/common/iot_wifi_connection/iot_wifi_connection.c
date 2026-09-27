@@ -246,6 +246,15 @@ esp_err_t iot_wifi_connection_wait_connected(uint32_t timeout_ms)
     return (bits & WIFI_CONNECTED_BIT) != 0U ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
+uint32_t iot_wifi_connection_task_stack_free_bytes(void)
+{
+    if (!s_initialized || s_task == NULL) {
+        return 0U;
+    }
+    return (uint32_t)uxTaskGetStackHighWaterMark(s_task) *
+           (uint32_t)sizeof(StackType_t);
+}
+
 esp_err_t iot_wifi_connection_deinitialize(void)
 {
     if (!s_initialized) {

@@ -31,6 +31,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #if defined(RF_COMMAND_QUEUE_ENABLED) && RF_COMMAND_QUEUE_ENABLED
 #include "rf_command_queue.h"
 #include "rf_dispatch_plan.h"
@@ -276,6 +277,11 @@ static bool s_zigbee_ok = false;
 static volatile int s_zigbee_devices = 0;
 static volatile bool s_zb_status_resync = false;
 static bool s_oled_available = false;
+
+static TaskHandle_t s_zigbee_task_handle;
+static TaskHandle_t s_oled_task_handle;
+static TaskHandle_t s_status_task_handle;
+static TaskHandle_t s_zb_forward_task_handle;
 
 // ZBOSS may deliver some signals with task preemption disabled.  Keep those
 // callbacks free of ESP_LOG/newlib/MQTT and hand a small copied event to a
@@ -3536,7 +3542,9 @@ static void zigbee_task(void *arg)
     // 1.6. Polling the deprecated one-shot iteration every 100 ms adds latency
     // to coordinator timers and child/rejoin responses under Wi-Fi traffic.
     esp_zb_stack_main_loop();
-    vTaskDelete(NULL);
+    ESP_LOGE(TAG, "Zigbee stack main loop returned; restarting gateway");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
 }
 
 // ==================== WiFi ====================
@@ -4592,18 +4600,108 @@ static void rf_power_health_check(void)
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
 }
+static const char *resource_reset_reason_name(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:
+        return "poweron";
+    case ESP_RST_EXT:
+        return "external";
+    case ESP_RST_SW:
+        return "software";
+    case ESP_RST_PANIC:
+        return "panic";
+    case ESP_RST_INT_WDT:
+        return "int_watchdog";
+    case ESP_RST_TASK_WDT:
+        return "task_watchdog";
+    case ESP_RST_WDT:
+        return "watchdog";
+    case ESP_RST_DEEPSLEEP:
+        return "deep_sleep";
+    case ESP_RST_BROWNOUT:
+        return "brownout";
+    case ESP_RST_SDIO:
+        return "sdio";
+    case ESP_RST_USB:
+        return "usb";
+    case ESP_RST_JTAG:
+        return "jtag";
+    case ESP_RST_EFUSE:
+        return "efuse";
+    case ESP_RST_PWR_GLITCH:
+        return "power_glitch";
+    case ESP_RST_CPU_LOCKUP:
+        return "cpu_lockup";
+    case ESP_RST_UNKNOWN:
+    default:
+        return "unknown";
+    }
+}
+
+static uint32_t resource_task_stack_free_bytes(TaskHandle_t task)
+{
+    if (task == NULL) {
+        return 0U;
+    }
+    return (uint32_t)uxTaskGetStackHighWaterMark(task) *
+           (uint32_t)sizeof(StackType_t);
+}
+
+static void resource_log_snapshot(void)
+{
+    ESP_LOGI(TAG,
+             "Resource: free=%lu min=%lu block=%u reset=%s "
+             "stack_free[zb=%u wifi=%u oled=%u status=%u fwd=%u]",
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)esp_get_minimum_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
+             resource_reset_reason_name(),
+             (unsigned)resource_task_stack_free_bytes(s_zigbee_task_handle),
+             (unsigned)iot_wifi_connection_task_stack_free_bytes(),
+             (unsigned)resource_task_stack_free_bytes(s_oled_task_handle),
+             (unsigned)resource_task_stack_free_bytes(s_status_task_handle),
+             (unsigned)resource_task_stack_free_bytes(s_zb_forward_task_handle));
+}
+
 static void status_task(void *arg)
 {
+    (void)arg;
+
     while (1) {
         rf_power_health_check();
         if (s_mqtt_ok) {
-            int64_t us = esp_timer_get_time() / 1000000;
-            char msg[128];
+            int64_t uptime_s = esp_timer_get_time() / 1000000;
+            const uint32_t free_heap = esp_get_free_heap_size();
+            const uint32_t min_free_heap =
+                esp_get_minimum_free_heap_size();
+            const uint32_t largest_block =
+                heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+            char msg[320];
             snprintf(msg, sizeof(msg),
-                     "{\"status\":\"online\",\"event\":\"heartbeat\",\"ip\":\"%s\",\"uptime\":%lld}",
-                     s_ip, us);
+                     "{\"status\":\"online\",\"event\":\"heartbeat\","
+                     "\"ip\":\"%s\",\"uptime\":%lld,"
+                     "\"mem\":{\"free\":%lu,\"min_free\":%lu,"
+                     "\"largest_block\":%lu,\"reset\":\"%s\"},"
+                     "\"stack_free\":{\"zb\":%u,\"wifi\":%u,"
+                     "\"oled\":%u,\"status\":%u,\"fwd\":%u}}",
+                     s_ip, uptime_s,
+                     (unsigned long)free_heap,
+                     (unsigned long)min_free_heap,
+                     (unsigned long)largest_block,
+                     resource_reset_reason_name(),
+                     (unsigned)resource_task_stack_free_bytes(
+                         s_zigbee_task_handle),
+                     (unsigned)iot_wifi_connection_task_stack_free_bytes(),
+                     (unsigned)resource_task_stack_free_bytes(
+                         s_oled_task_handle),
+                     (unsigned)resource_task_stack_free_bytes(
+                         s_status_task_handle),
+                     (unsigned)resource_task_stack_free_bytes(
+                         s_zb_forward_task_handle));
             mqtt_pub_retained(MQTT_GW_STATUS_SUFFIX, msg, true);
         }
+        resource_log_snapshot();
         vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
     }
 }
@@ -5200,11 +5298,33 @@ void app_main(void)
 
     // Tasks
     // Zigbee
-    xTaskCreate(zigbee_task, "zigbee", 16384, NULL, 5, NULL);
+    BaseType_t zigbee_task_ok =
+        xTaskCreate(zigbee_task, "zigbee", 16384, NULL, 5,
+                    &s_zigbee_task_handle);
+    if (zigbee_task_ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Zigbee task");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    }
 
-    xTaskCreate(oled_task, "oled", 4096, NULL, 5, NULL);
-    xTaskCreate(status_task, "status", 4096, NULL, 5, NULL);
-    xTaskCreate(zb_forward_task, "zb-fwd", 4096, NULL, 5, NULL);
+    BaseType_t oled_task_ok =
+        xTaskCreate(oled_task, "oled", 4096, NULL, 5,
+                    &s_oled_task_handle);
+    BaseType_t status_task_ok =
+        xTaskCreate(status_task, "status", 6144, NULL, 5,
+                    &s_status_task_handle);
+    BaseType_t forward_task_ok =
+        xTaskCreate(zb_forward_task, "zb-fwd", 5120, NULL, 5,
+                    &s_zb_forward_task_handle);
+    if (oled_task_ok != pdPASS || status_task_ok != pdPASS ||
+        forward_task_ok != pdPASS) {
+        ESP_LOGE(TAG,
+                 "Failed to create required task: oled=%d status=%d fwd=%d",
+                 (int)oled_task_ok, (int)status_task_ok,
+                 (int)forward_task_ok);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    }
 
 #if !ZB_ONLY_RF_DIAG && ZB_JOIN_BEFORE_WIFI
     // Give commissioning a contention-free 802.15.4 window. Once a node is

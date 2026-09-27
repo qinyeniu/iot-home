@@ -3117,13 +3117,12 @@ static iot_ssd1306_t s_oled;
 #define INSTALLCODE_POLICY_ENABLE   false
 #define ESP_ZB_CHANNEL_MASK         (1l << 26)  // Channel 26
 #define ZB_ONLY_RF_DIAG             0  // Temporary RF/coexistence diagnostic
-// Wi-Fi now coexists safely with Zigbee (dedicated stack loop and RF
-// priority fixes landed earlier). Waiting for a node before bringing up
-// Wi-Fi used to delay cloud reconnection by 3-5 minutes whenever no node
-// was present, so the commissioning-first path is disabled.
-#define ZB_JOIN_BEFORE_WIFI         0  // Bring Wi-Fi/MQTT up in parallel with Zigbee
-#define ZB_JOIN_FIRST_TIMEOUT_MS    180000
-#define ZB_REJOIN_FIRST_TIMEOUT_MS 300000
+// A gateway which has previously seen a child uses a short RF-quiet rejoin
+// window before starting Wi-Fi/MQTT. Gateways without a known child still
+// bring Wi-Fi up immediately, so cloud recovery is not delayed in normal
+// gateway-only operation.
+#define ZB_REJOIN_QUIET_TIMEOUT_MS           120000
+#define ZB_REJOIN_QUIET_SAMPLE_EXTRA_MS       30000
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 {
@@ -3257,6 +3256,15 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         ESP_LOGI(TAG, "Zigbee signal: %d", sig_type);
         break;
     }
+}
+
+static bool zb_rejoin_quiet_window_enabled(void)
+{
+#if ZB_ONLY_RF_DIAG
+    return false;
+#else
+    return s_child_seen;
+#endif
 }
 
 // ==================== ZCL sensor data aggregation ====================
@@ -3429,13 +3437,13 @@ static esp_zb_ep_list_t *create_gateway_ep(void)
 
 static void zigbee_task(void *arg)
 {
-#if ZB_JOIN_BEFORE_WIFI
-    // Wi-Fi is intentionally off during the clean RF commissioning/rejoin window.
-    vTaskDelay(pdMS_TO_TICKS(500));
-#else
-    ESP_LOGI(TAG, "Zigbee: Waiting 10s for WiFi to stabilize...");
-    vTaskDelay(pdMS_TO_TICKS(10000));
-#endif
+    if (zb_rejoin_quiet_window_enabled()) {
+        ESP_LOGI(TAG, "Zigbee: RF-quiet rejoin window; delay 500 ms before coordinator start");
+        vTaskDelay(pdMS_TO_TICKS(500));
+    } else {
+        ESP_LOGI(TAG, "Zigbee: Waiting 10s for WiFi to stabilize...");
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 
     ESP_LOGI(TAG, "Starting Zigbee coordinator...");
     
@@ -4646,11 +4654,22 @@ static void zb_persist_child_seen(void)
     s_child_seen = true;
 
     nvs_handle_t nvh;
-    if (nvs_open("gwzb", NVS_READWRITE, &nvh) == ESP_OK) {
-        nvs_set_u8(nvh, "child", 1);
-        nvs_commit(nvh);
-        nvs_close(nvh);
+    esp_err_t err = nvs_open("gwzb", NVS_READWRITE, &nvh);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Zigbee: child marker NVS open failed: %s",
+                 esp_err_to_name(err));
+        return;
     }
+
+    err = nvs_set_u8(nvh, "child", 1);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvh);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Zigbee: child marker persist failed: %s",
+                 esp_err_to_name(err));
+    }
+    nvs_close(nvh);
 }
 
 static void zb_publish_gateway_status(const char *event)
@@ -4965,7 +4984,7 @@ static void zb_forward_pending(void)
     }
 }
 
-#if !ZB_ONLY_RF_DIAG && ZB_JOIN_BEFORE_WIFI
+#if !ZB_ONLY_RF_DIAG
 static bool zb_have_full_active_sample(void)
 {
     iot_zb_node_t active[MAX_ZB_NODES];
@@ -5159,14 +5178,18 @@ void app_main(void)
     product_runtime_config_init();
 #endif
 
-#if !ZB_ONLY_RF_DIAG && !ZB_JOIN_BEFORE_WIFI
-    // WiFi
-    wifi_start();
-    (void)iot_wifi_connection_wait_connected(30000U);
+#if !ZB_ONLY_RF_DIAG
+    if (zb_rejoin_quiet_window_enabled()) {
+        ESP_LOGI(TAG, "Defer Wi-Fi/MQTT until Zigbee RF-quiet rejoin completes");
+    } else {
+        // WiFi
+        wifi_start();
+        (void)iot_wifi_connection_wait_connected(30000U);
 
-    // MQTT
-    mqtt_start();
-#elif ZB_ONLY_RF_DIAG
+        // MQTT
+        mqtt_start();
+    }
+#else
     ESP_LOGW(TAG, "ZB-only RF diagnostic: WiFi and MQTT not started");
 #endif
 
@@ -5216,49 +5239,52 @@ void app_main(void)
         esp_restart();
     }
 
-#if !ZB_ONLY_RF_DIAG && ZB_JOIN_BEFORE_WIFI
-    // Give commissioning a contention-free 802.15.4 window. Once a node is
-    // present, bring up Wi-Fi/MQTT and rely on balanced runtime coexistence.
-    const int join_first_timeout_ms =
-        s_child_seen ? ZB_REJOIN_FIRST_TIMEOUT_MS : ZB_JOIN_FIRST_TIMEOUT_MS;
-    ESP_LOGI(TAG, "Zigbee %s RF window before Wi-Fi: %d ms",
-             s_child_seen ? "rejoin" : "commissioning", join_first_timeout_ms);
+#if !ZB_ONLY_RF_DIAG
+    if (zb_rejoin_quiet_window_enabled()) {
+        ESP_LOGI(TAG,
+                 "Zigbee rejoin RF window: %d ms; up to %d ms before Wi-Fi start",
+                 ZB_REJOIN_QUIET_TIMEOUT_MS,
+                 ZB_REJOIN_QUIET_TIMEOUT_MS + ZB_REJOIN_QUIET_SAMPLE_EXTRA_MS);
 
-    int join_wait_ms = 0;
-    while (join_wait_ms < join_first_timeout_ms && s_zigbee_devices == 0) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        join_wait_ms += 500;
-    }
-    bool join_seen = (s_zigbee_devices > 0);
-    bool first_sample_ready = false;
-    if (join_seen) {
-        ESP_LOGI(TAG, "Zigbee join announced; keep Wi-Fi off until a full sensor sample");
-        while (join_wait_ms < join_first_timeout_ms) {
-            if (zb_have_full_active_sample()) {
-                first_sample_ready = true;
-                break;
-            }
+        int join_wait_ms = 0;
+        while (join_wait_ms < ZB_REJOIN_QUIET_TIMEOUT_MS &&
+               s_zigbee_devices == 0) {
             vTaskDelay(pdMS_TO_TICKS(500));
             join_wait_ms += 500;
         }
-    }
 
-    if (!join_seen) {
-        ESP_LOGW(TAG, "No Zigbee join in %d ms; start Wi-Fi anyway", join_first_timeout_ms);
-    } else if (first_sample_ready) {
-        ESP_LOGI(TAG, "Full Zigbee sample received at %d ms; start IP stack after cache window",
-                 join_wait_ms);
-        // Allow two 10-second node samples to receive APS confirmation before
-        // Wi-Fi association adds RF coexistence pressure during startup.
-        vTaskDelay(pdMS_TO_TICKS(12000));
-    } else {
-        ESP_LOGW(TAG, "Join seen but no full sample in %d ms; start Wi-Fi anyway",
-                 join_first_timeout_ms);
-    }
+        bool join_seen = (s_zigbee_devices > 0);
+        bool first_sample_ready = false;
+        if (join_seen) {
+            int sample_wait_limit_ms =
+                join_wait_ms + ZB_REJOIN_QUIET_SAMPLE_EXTRA_MS;
+            ESP_LOGI(TAG, "Zigbee join announced at %d ms; wait up to %d ms for a full sensor sample",
+                     join_wait_ms, sample_wait_limit_ms);
+            while (join_wait_ms < sample_wait_limit_ms) {
+                if (zb_have_full_active_sample()) {
+                    first_sample_ready = true;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(500));
+                join_wait_ms += 500;
+            }
+        }
 
-    wifi_start();
-    (void)iot_wifi_connection_wait_connected(30000U);
-    mqtt_start();
+        if (!join_seen) {
+            ESP_LOGW(TAG, "No Zigbee join in %d ms; start Wi-Fi anyway",
+                     ZB_REJOIN_QUIET_TIMEOUT_MS);
+        } else if (first_sample_ready) {
+            ESP_LOGI(TAG, "Full Zigbee sample ready at %d ms; start Wi-Fi/MQTT",
+                     join_wait_ms);
+        } else {
+            ESP_LOGW(TAG, "Join seen but no full sample by %d ms; start Wi-Fi anyway",
+                     join_wait_ms);
+        }
+
+        wifi_start();
+        (void)iot_wifi_connection_wait_connected(30000U);
+        mqtt_start();
+    }
 #endif
     
     ESP_LOGI(TAG, "Gateway ready!");

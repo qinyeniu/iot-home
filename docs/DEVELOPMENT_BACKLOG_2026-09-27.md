@@ -110,7 +110,7 @@ RAM 方面最明显的是 Zigbee、Wi‑Fi MAC 和 lwIP 的静态缓冲；当前
 | 优先级 | 任务 | 是否需要硬件 | 建议顺序 |
 | --- | --- | --- | ---: |
 | P0 | 加入运行时资源观测 | 短测需要 | 1 |
-| P0 | 分析并治理 Zigbee 父链路抖动 | 需要 | 2 |
+| P0 | ~~分析并治理 Zigbee 父链路抖动~~ 已完成 RF-quiet rejoin，短测 PASS | 需要 | 2 |
 | P1 | 拆分 MQTT 客户端服务 | 短测需要 | 3 |
 | P1 | 拆分 RF 私有协议编解码与功率策略 | 短测需要 | 4 |
 | P1 | 拆分 Wi‑Fi 恢复策略 | 短测需要 | 5 |
@@ -374,3 +374,17 @@ main.c.20260910-oled-debug.bak
 6. 复测节点约 16 秒入网；DATA/REPORT_SEND 各 27；网关 RF sample 82、cached report 81、MQTT telemetry 27；启动 QUERY/REPORT accepted 和自动功率 keep 正常。
 7. 复测无 MQTT 掉线、写入超时、内存不足、I2C clear bus、OLED 失败、panic/watchdog；节点 APS/queue failure 无增量。
 8. 下一步优先级调整：先做 P0-2 父链路抖动和网关重启后 rejoin 耗时治理，再继续 Wi‑Fi 恢复策略或事件队列组件化。
+
+## 14. 2026-09-28 00:55 P0-2 第一阶段完成
+
+1. 网关启动时若 NVS `gwzb/child=1`，先不启动 Wi-Fi/MQTT，给 Zigbee rejoin 一个 RF-quiet 窗口；没有历史子节点时保持 Wi-Fi 立即启动。
+2. 网关收到节点 rejoin 报告，并确认温/湿/光完整样本后才启动 Wi-Fi/MQTT；若未收到节点或样本，也有独立超时兜底，不会永久离线。
+3. 第一次 5 分钟运行业务稳定，但未进入 quiet 分支，推测旧 `child` 标记缺失；本次运行重新写入标记后，追加只复位网关的针对性复测。
+4. 针对性复测：431 ms 标记延迟联网，5001 ms 完整样本就绪并启动 Wi‑Fi，11021 ms 获取 IP/启动 MQTT，11461 ms MQTT 连接。
+5. 网关 210 秒：RF sample 60、cached report 60、MQTT telemetry 20；无 `ESP_ERR_NO_MEM`、panic/watchdog、I2C clear bus、OLED 失败、parent unavailable、Rejoin failure。
+6. 节点约 293 秒：REPORT_SEND 28，queue/APS failure 和 parent unavailable 均无增量。
+7. 默认 OFF 固件：1452464 bytes，应用分区剩余 54864 bytes，SHA256 `EB254E891D02CC8A477D828799660E2E99AA62196CDAB8DCAF5AF2986FAC9592`。
+8. 实验 ON 构建通过：1469760 bytes，应用分区剩余 37568 bytes，SHA256 `36B0F4B71E1409E76AAAB0AFB55FB20F687E1B9F79C714BC179715DBB0CE53BD`。
+9. 代码复审 APPROVE；分析见 `backups/hw-p02-rejoin-quiet-20260928-retest/analysis.md`。
+10. 下一步：提交本阶段后，继续 P1 Wi‑Fi 恢复策略组件化，完成新增开发并提交后再安排夜间长测。
+

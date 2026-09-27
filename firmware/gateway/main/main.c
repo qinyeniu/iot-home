@@ -45,7 +45,7 @@
 #include "esp_sleep.h"
 #include "nvs_flash.h"
 #include "nvs.h"
-#include "mqtt_client.h"
+#include "iot_mqtt_client.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "esp_zigbee_core.h"
@@ -142,8 +142,12 @@ void mqtt_pub_retained(const char *topic_suffix, const char *data, bool retain);
 
 static const char *TAG = "iot-gw";
 
-static esp_mqtt_client_handle_t s_mqtt = NULL;
-static bool s_mqtt_ok = false;
+static iot_mqtt_client_t *s_mqtt_client;
+
+static bool mqtt_is_connected(void)
+{
+    return iot_mqtt_client_is_connected(s_mqtt_client);
+}
 
 // Product runtime configuration. The defaults come from the local lab build
 // headers; if a valid NVS product configuration exists, it takes precedence.
@@ -4217,67 +4221,72 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
     cJSON_Delete(root);
 }
 
-static void mqtt_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
+static void mqtt_client_connected(void *arg)
 {
-    esp_mqtt_event_handle_t e = data;
-    switch (id) {
-    case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "MQTT connected");
-        s_mqtt_ok = true;
-        s_zb_status_resync = true;
-        char sub[64];
-        snprintf(sub, sizeof(sub), "%s/nodes/+/cmd", MQTT_TOPIC_PREFIX);
-        esp_mqtt_client_subscribe(s_mqtt, sub, 1);
-        break;
-    case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "MQTT disconnected");
-        s_mqtt_ok = false;
-        break;
-    case MQTT_EVENT_DATA:
-        ESP_LOGI(TAG, "MQTT rx: %.*s = %.*s", e->topic_len, e->topic, e->data_len, e->data);
-        {
-            char topic[128];
-            char payload[256];
-            int tlen = e->topic_len < (int)sizeof(topic) - 1 ? e->topic_len : (int)sizeof(topic) - 1;
-            int dlen = e->data_len < (int)sizeof(payload) - 1 ? e->data_len : (int)sizeof(payload) - 1;
-            memcpy(topic, e->topic, tlen);
-            topic[tlen] = '\0';
-            memcpy(payload, e->data, dlen);
-            payload[dlen] = '\0';
-            gateway_handle_node_cmd(topic, payload);
-        }
-        break;
-    default:
-        break;
+    char sub[64];
+
+    (void)arg;
+    s_zb_status_resync = true;
+    snprintf(sub, sizeof(sub), "%s/nodes/+/cmd", MQTT_TOPIC_PREFIX);
+
+    esp_err_t err = iot_mqtt_client_subscribe(s_mqtt_client, sub, 1);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "MQTT command subscription failed: %s",
+                 esp_err_to_name(err));
     }
+}
+
+static void mqtt_client_data(const char *topic,
+                             const char *data,
+                             void *arg)
+{
+    (void)arg;
+    gateway_handle_node_cmd(topic, data);
 }
 
 static void mqtt_start(void)
 {
     static const char gw_lwt_payload[] =
         "{\"status\":\"offline\",\"event\":\"lwt\"}";
-    esp_mqtt_client_config_t cfg = {
-        .broker.address.uri = product_mqtt_uri(),
-        .credentials.username = product_mqtt_username(),
-        .credentials.authentication.password = product_mqtt_password(),
-        .credentials.client_id = product_mqtt_client_id(),
-        .session.last_will = {
+    static const iot_mqtt_client_callbacks_t callbacks = {
+        .on_connected = mqtt_client_connected,
+        .on_data = mqtt_client_data,
+    };
+    const iot_mqtt_client_config_t cfg = {
+        .uri = product_mqtt_uri(),
+        .username = product_mqtt_username(),
+        .password = product_mqtt_password(),
+        .client_id = product_mqtt_client_id(),
+        .last_will = {
             .topic = MQTT_TOPIC_PREFIX "/" MQTT_GW_STATUS_SUFFIX,
-            .msg = gw_lwt_payload,
-            .msg_len = sizeof(gw_lwt_payload) - 1,
+            .message = gw_lwt_payload,
+            .message_len = sizeof(gw_lwt_payload) - 1,
             .qos = 1,
             .retain = true,
         },
     };
+
     if (s_mqtt_outbox == NULL) {
         s_mqtt_outbox = xQueueCreateStatic(
             MQTT_OUTBOX_LEN, sizeof(mqtt_outbox_msg_t),
             (uint8_t *)s_mqtt_outbox_storage, &s_mqtt_outbox_struct);
     }
 
-    s_mqtt = esp_mqtt_client_init(&cfg);
-    esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_cb, NULL);
-    esp_mqtt_client_start(s_mqtt);
+    esp_err_t err = iot_mqtt_client_create(
+        &cfg, &callbacks, NULL, &s_mqtt_client);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT client create failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = iot_mqtt_client_start(s_mqtt_client);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT client start failed: %s", esp_err_to_name(err));
+        iot_mqtt_client_destroy(s_mqtt_client);
+        s_mqtt_client = NULL;
+        return;
+    }
+
     char safe_uri[IOT_MQTT_URI_MAX_LEN + 1];
     ESP_LOGI(TAG, "MQTT starting: %s",
              product_mqtt_log_uri(safe_uri, sizeof(safe_uri)));
@@ -4393,11 +4402,9 @@ static bool mqtt_try_publish(const char *topic_suffix, const char *data,
                              bool retain)
 {
     char topic[128];
+
     snprintf(topic, sizeof(topic), "%s/%s", MQTT_TOPIC_PREFIX, topic_suffix);
-    // Returns message id (>0) when accepted, -1 when the client cannot send.
-    int msg_id = esp_mqtt_client_publish(s_mqtt, topic, data, 0, 1,
-                                         retain ? 1 : 0);
-    return msg_id >= 0;
+    return iot_mqtt_client_publish(s_mqtt_client, topic, data, 1, retain);
 }
 
 static void mqtt_outbox_store(const char *topic_suffix, const char *data)
@@ -4422,13 +4429,13 @@ void mqtt_pub_retained(const char *topic_suffix, const char *data, bool retain)
     // Retained status is republished by zb_publish_known_statuses() after a
     // reconnect, so it does not need to occupy the telemetry outbox.
     if (retain) {
-        if (s_mqtt_ok) {
+        if (mqtt_is_connected()) {
             mqtt_try_publish(topic_suffix, data, true);
         }
         return;
     }
 
-    if (s_mqtt_ok && uxQueueMessagesWaiting(s_mqtt_outbox) == 0) {
+    if (mqtt_is_connected() && uxQueueMessagesWaiting(s_mqtt_outbox) == 0) {
         if (mqtt_try_publish(topic_suffix, data, false)) {
             return;
         }
@@ -4450,7 +4457,7 @@ void mqtt_pub(const char *topic_suffix, const char *data)
 // the same message is retried on the next cycle.
 static void mqtt_outbox_flush(void)
 {
-    if (!s_mqtt_ok) {
+    if (!mqtt_is_connected()) {
         return;
     }
 
@@ -4495,7 +4502,7 @@ static void oled_task(void *arg)
 
             snprintf(line, sizeof(line), "WIFI:%s MQTT:%s",
                      iot_wifi_connection_is_up() ? "OK" : "NO",
-                     s_mqtt_ok ? "OK" : "NO");
+                     mqtt_is_connected() ? "OK" : "NO");
             iot_ssd1306_draw_text(&s_oled, 0, 30, line);
 
             snprintf(line, sizeof(line), "UP:%02d:%02d:%02d", h, m, sec);
@@ -4670,7 +4677,7 @@ static void status_task(void *arg)
 
     while (1) {
         rf_power_health_check();
-        if (s_mqtt_ok) {
+        if (mqtt_is_connected()) {
             int64_t uptime_s = esp_timer_get_time() / 1000000;
             const uint32_t free_heap = esp_get_free_heap_size();
             const uint32_t min_free_heap =
@@ -4727,7 +4734,7 @@ static void zb_persist_child_seen(void)
 
 static void zb_publish_gateway_status(const char *event)
 {
-    if (!s_mqtt_ok) {
+    if (!mqtt_is_connected()) {
         return;
     }
 
@@ -4741,7 +4748,7 @@ static void zb_publish_gateway_status(const char *event)
 
 static void zb_publish_node_status(const zb_node_t *node, const char *event, bool online)
 {
-    if (!s_mqtt_ok || node == NULL || node->addr == 0) {
+    if (!mqtt_is_connected() || node == NULL || node->addr == 0) {
         return;
     }
 
@@ -4852,7 +4859,7 @@ static void zb_publish_node_switch_state(const zb_node_t *node)
     char topic_suffix[40];
     char payload[64];
 
-    if (!s_mqtt_ok || node == NULL || !node->onoff_valid) {
+    if (!mqtt_is_connected() || node == NULL || !node->onoff_valid) {
         return;
     }
 
@@ -5000,7 +5007,7 @@ static void zb_handle_signal_event(const zb_app_event_t *event)
 
 static void zb_forward_pending(void)
 {
-    if (!s_mqtt_ok) {
+    if (!mqtt_is_connected()) {
         return;
     }
 
@@ -5131,7 +5138,7 @@ static void zb_forward_task(void *arg)
             }
         }
 
-        if (s_zb_status_resync && s_mqtt_ok) {
+        if (s_zb_status_resync && mqtt_is_connected()) {
             s_zb_status_resync = false;
             zb_publish_known_statuses();
         }
@@ -5383,7 +5390,7 @@ void app_main(void)
     // Main loop
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
-        if (s_mqtt_ok) {
+        if (mqtt_is_connected()) {
             char msg[64];
             snprintf(msg, sizeof(msg), "{\"gw\":\"online\"}");
             mqtt_pub("nodes/gw-001/telemetry", msg);

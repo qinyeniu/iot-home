@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+from collections import Counter
 from datetime import datetime
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,13 @@ CRITICAL_TERMS = [
     "OLED refresh failed",
 ]
 WARNING_TERMS = ["parent unavailable", "NLME status indication"]
+BOOT_MARKER = "ESP-ROM:esp32c6"
+PLANNED_DURATION_SEC = 28800
+
+
+def after_last_boot(text: str) -> str:
+    index = text.rfind(BOOT_MARKER)
+    return text[index:] if index >= 0 else text
 
 
 def read(path: Path) -> str:
@@ -34,6 +42,34 @@ def count(pattern, text):
 
 def term_hits(text, terms):
     return {term: text.count(term) for term in terms if text.count(term) > 0}
+
+
+def summarize_resources(rows):
+    if not rows:
+        return {}
+    tasks = ("zb", "wifi", "oled", "status", "fwd")
+    return {
+        "snapshots": len(rows),
+        "min_free": min(r["free"] for r in rows),
+        "final_free": rows[-1]["free"],
+        "min_reported_min": min(r["min"] for r in rows),
+        "min_largest_block": min(r["block"] for r in rows),
+        "final_largest_block": rows[-1]["block"],
+        "reset_reasons": dict(sorted(Counter(r["reset"] for r in rows).items())),
+        "min_stack": {
+            name: min((r[name] for r in rows if r[name] > 0), default=None)
+            for name in tasks
+        },
+        "final_stack": {name: rows[-1][name] for name in tasks},
+    }
+
+
+def file_span(path: Path):
+    try:
+        stat = path.stat()
+        return stat.st_mtime - stat.st_birthtime
+    except (OSError, AttributeError):
+        return None
 
 
 def parse_resources(gw):
@@ -61,12 +97,7 @@ def parse_resources(gw):
 
 def parse_node_stats(node):
     rows = []
-    fields = (
-        "rounds|attempts|queued|queue_fail|items_failed|aps_ok|aps_fail|unavail|"
-        "recovered|i2c_th_fail|i2c_lux_fail|i2c_resets|i2c_reinits|"
-        "probe_resteer|probe_aps_fail"
-    )
-    pat = re.compile(rf"({fields})=([0-9/]+)")
+    pat = re.compile(r"([A-Za-z][A-Za-z0-9_]*)=([0-9]+(?:/[0-9]+)?)")
     for line in node.splitlines():
         if "REPORT_STATS:" not in line:
             continue
@@ -108,10 +139,16 @@ def insert_after_title(path: Path, header: str, body: str):
 
 
 def main():
-    gw = read(GW_LOG)
-    node = read(NODE_LOG)
+    raw_gw = read(GW_LOG)
+    raw_node = read(NODE_LOG)
+    gw_boot_count = raw_gw.count(BOOT_MARKER)
+    node_boot_count = raw_node.count(BOOT_MARKER)
+    gw = after_last_boot(raw_gw)
+    node = after_last_boot(raw_node)
     gw_up = uptimes(gw)
     node_up = uptimes(node)
+    gw_file_span = file_span(GW_LOG)
+    node_file_span = file_span(NODE_LOG)
 
     gw_counts = {
         "RF sample": count(r"RF sample", gw),
@@ -123,6 +160,14 @@ def main():
         "RF power keep": count(r"RF power: keep", gw),
         "APS confirm OK": count(r"APS data confirm: status=0", gw),
         "NLME status": count(r"NLME status indication", gw),
+        "boot markers": gw_boot_count,
+        "OLED refresh failed": count(r"OLED refresh failed", gw),
+        "OLED recovered by reset": count(r"OLED recovered by", gw),
+        "OLED refresh recovered": count(r"OLED refresh recovered", gw),
+        "clear bus error": count(r"clear bus error", gw),
+        "MQTT disconnected events": count(r"MQTT disconnected", gw),
+        "MQTT write timeout events": count(r"MQTT write timeout", gw),
+        "Rejoin failure events": count(r"Rejoin failure", gw),
     }
     node_counts = {
         "DATA": count(r"zb-sensor: DATA:", node),
@@ -130,14 +175,22 @@ def main():
         "REPORT_STATS": count(r"REPORT_STATS:", node),
         "parent unavailable": count(r"parent unavailable event=", node),
         "parent recovered": count(r"parent unavailable resolved", node),
+        "boot markers": node_boot_count,
     }
 
     gw_critical = term_hits(gw, CRITICAL_TERMS)
     node_critical = term_hits(node, CRITICAL_TERMS)
-    gw_warnings = term_hits(gw, WARNING_TERMS)
-    node_warnings = term_hits(node, WARNING_TERMS)
+    gw_warnings = (
+        {"NLME status indication": gw_counts["NLME status"]}
+        if gw_counts["NLME status"] else {}
+    )
+    node_warnings = (
+        {"parent unavailable event": node_counts["parent unavailable"]}
+        if node_counts["parent unavailable"] else {}
+    )
     resources = parse_resources(gw)
     node_stats = parse_node_stats(node)
+    resource_summary = summarize_resources(resources)
 
     observed_ms = 0
     if gw_up:
@@ -157,7 +210,13 @@ def main():
         if gw_counts[name] < minimum
     }
 
-    if gw_critical or node_critical or low_counts:
+    unexpected_boots = {}
+    if gw_boot_count != 1:
+        unexpected_boots["gateway boot markers"] = gw_boot_count
+    if node_boot_count != 1:
+        unexpected_boots["node boot markers"] = node_boot_count
+
+    if gw_critical or node_critical or unexpected_boots or low_counts:
         verdict = "FAIL/WARN"
     elif gw_warnings or node_warnings:
         verdict = "PASS_WITH_WARNINGS"
@@ -186,6 +245,9 @@ def main():
         "",
         f"- 网关 uptime：{min(gw_up) if gw_up else 'N/A'} → {max(gw_up) if gw_up else 'N/A'} ms",
         f"- 节点 uptime：{min(node_up) if node_up else 'N/A'} → {max(node_up) if node_up else 'N/A'} ms",
+        f"- 网关实际文件采集时长：{gw_file_span:.1f} 秒" if gw_file_span is not None else "- 网关实际文件采集时长：N/A",
+        f"- 节点实际文件采集时长：{node_file_span:.1f} 秒" if node_file_span is not None else "- 节点实际文件采集时长：N/A",
+        f"- 计划时长：{PLANNED_DURATION_SEC} 秒 / {PLANNED_DURATION_SEC / 3600:.0f} 小时",
         f"- 可观测跨度：约 {observed_ms / 1000:.1f} 秒 / {observed_ms / 3600000:.2f} 小时",
         "",
         "## 网关计数",
@@ -210,9 +272,32 @@ def main():
             f"历史最低堆（资源日志）={min_heap}",
             "```",
         ]
+    if resource_summary:
+        lines += [
+            "", "## 全部资源快照统计", "", "```text",
+            f"snapshots={resource_summary['snapshots']}",
+            f"free heap: final={resource_summary['final_free']} min={resource_summary['min_free']}",
+            f"reported min heap: {resource_summary['min_reported_min']}",
+            f"largest block: final={resource_summary['final_largest_block']} min={resource_summary['min_largest_block']}",
+            f"reset_reasons={resource_summary['reset_reasons']}",
+            "min_stack_free["
+            f"zb={resource_summary['min_stack']['zb'] if resource_summary['min_stack']['zb'] is not None else 'N/A'} "
+            f"wifi={resource_summary['min_stack']['wifi'] if resource_summary['min_stack']['wifi'] is not None else 'N/A'} "
+            f"oled={resource_summary['min_stack']['oled'] if resource_summary['min_stack']['oled'] is not None else 'N/A'} "
+            f"status={resource_summary['min_stack']['status'] if resource_summary['min_stack']['status'] is not None else 'N/A'} "
+            f"fwd={resource_summary['min_stack']['fwd'] if resource_summary['min_stack']['fwd'] is not None else 'N/A'}]",
+            "final_stack_free["
+            f"zb={resource_summary['final_stack']['zb']} "
+            f"wifi={resource_summary['final_stack']['wifi']} "
+            f"oled={resource_summary['final_stack']['oled']} "
+            f"status={resource_summary['final_stack']['status']} "
+            f"fwd={resource_summary['final_stack']['fwd']}]",
+            "```",
+        ]
     lines += ["", "## 异常/警告", ""]
     lines.append(f"- 网关 critical: {gw_critical or '无'}")
     lines.append(f"- 节点 critical: {node_critical or '无'}")
+    lines.append(f"- 启动标记/意外重启: {unexpected_boots or '无'}")
     lines.append(f"- 网关 warning: {gw_warnings or '无'}")
     lines.append(f"- 节点 warning: {node_warnings or '无'}")
     lines.append(f"- 计数不足: {low_counts or '无'}")
@@ -231,6 +316,8 @@ def main():
 - cached report：`{gw_counts['cached report']}`
 - MQTT telemetry：`{gw_counts['MQTT telemetry']}`
 - Resource snapshots：`{gw_counts['Resource snapshots']}`
+- 最低 free heap：`{resource_summary.get('min_free', 'N/A')}`
+- OLED refresh failed：`{gw_counts['OLED refresh failed']}`
 - 网关 critical：`{gw_critical or '无'}`
 - 节点 critical：`{node_critical or '无'}`
 - 完整分析：`backups/long-test-20260928-default-8h/analysis.md`

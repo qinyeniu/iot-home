@@ -1,10 +1,11 @@
 param(
-    [int[]]$ProcessIds,
+    [string]$ProcessIds,
     [string]$Analyzer
 )
 
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$Root = Split-Path -Parent $PSScriptRoot
+$ProcessIdList = @($ProcessIds -split "," | ForEach-Object { [int]$_.Trim() })
 $Log = Join-Path $Root "backups/long-test-20260928-default-8h/supervisor.log"
 
 function Write-Log([string]$Message) {
@@ -12,8 +13,8 @@ function Write-Log([string]$Message) {
     Add-Content -LiteralPath $Log -Value $line
 }
 
-Write-Log "Supervisor started; waiting for PIDs: $($ProcessIds -join ',')"
-foreach ($processId in $ProcessIds) {
+Write-Log "Supervisor started; waiting for PIDs: $($ProcessIdList -join ',')"
+foreach ($processId in $ProcessIdList) {
     while ($true) {
         $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
         if ($null -eq $process) {

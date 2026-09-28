@@ -47,3 +47,17 @@
 2. 看一眼 OLED 是否仍有正常显示；若出现周期性黑屏/刷新异常请告诉我。
 3. 若长测期间设备掉线，请告诉我板子上的指示灯状态。
 4. 如果今天要外出，优先让我先完成长测结论和回退点，再移动设备。
+## 长测自动分析结果
+
+自动分析已完成，结论：**FAIL/WARN**。
+
+- 可观测跨度：约 `8.00` 小时
+- RF sample：`8230`
+- cached report：`8136`
+- MQTT telemetry：`853`
+- Resource snapshots：`960`
+- 最低 free heap：`157140`
+- OLED refresh failed：`6`
+- 网关 critical：`{'MQTT disconnected': 1235, 'clear bus error': 29, 'OLED refresh failed': 6}`
+- 节点 critical：`{'Rejoin failure': 990}`
+- 完整分析：`backups/long-test-20260928-default-8h/analysis.md`

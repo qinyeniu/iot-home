@@ -23,6 +23,12 @@
 - 当前警告：I2C clear bus error 5 次、OLED refresh failed 1 次且已恢复、NLME 4 次、parent unavailable 3 次且均快速恢复。
 - 截至当前无 panic/watchdog、`ESP_ERR_NO_MEM`、MQTT 断连/写超时或 Rejoin failure；最终结论待完整日志。
 
+## 事件拆分设计已提前完成
+
+- 等待长测期间已完成只读分析与实施蓝图：`docs/ZIGBEE_EVENT_QUEUE_SPLIT_PLAN_2026-09-28.md`。
+- 路线：P2-1 事件类型/构造/NLME 解析 → P2-2 队列投递封装 → P2-3 事件处理器（依赖注入）→ P2-4 forward task 收尾。
+- 预计 main.c 减少约 600-750 行；长测 PASS 且确认后从 P2-1 开始，FAIL 则先排障。
+
 ## 明早建议处理顺序
 
 1. 先确认两块板子仍供电、串口采集进程正常结束。

@@ -1,5 +1,18 @@
 # 2026-09-28 晨间任务清单
 
+## 2026-09-29 人工复核结论（最新，优先阅读）
+
+长测已正常结束并完成人工复核：**FAIL/WARN（非单一固件故障）**。
+
+1. 外部 PC 网卡/Windows 热点掉线：00:20 后 MQTT 异常，00:41 后 Wi-Fi AP 不可用，结束时仍未恢复；
+2. Zigbee 父链路不稳定：22:43 已首次 Rejoin failure；长测内 990 行 Rejoin failure、26 次 link lost，最长中断 19 分 45 秒；
+3. I2C/OLED：29 次 clear bus、6 次 OLED refresh failed，均本地恢复。
+
+关键计数：RF sample `8230`、cached report `8136`、MQTT telemetry `853`、MQTT duplicate suppressed `58`、Resource snapshots `960`；最低 free heap `157140`。无 panic/watchdog/`ESP_ERR_NO_MEM`/brownout/意外重启。
+
+下一步：保持当前固件；暂缓 Zigbee 事件队列拆分；先完成 OLED 接线/上拉/去耦，节点使用可靠数据线，再在稳定热点下做受控 8 小时复测。完整报告：`backups/long-test-20260928-default-8h/analysis.md`。
+
+
 ## 昨晚已经完成
 
 1. 完成 P0-2：网关重启后先给 Zigbee 子节点 RF-quiet rejoin 窗口，短测通过。

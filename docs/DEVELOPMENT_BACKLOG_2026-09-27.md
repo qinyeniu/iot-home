@@ -5,6 +5,26 @@
 固件：网关默认 OFF 构建  
 依据：`backups/long-test-20260927-default-4h/analysis.md`
 
+## 2026-09-29 长测复核后的优先级调整（最新）
+
+默认 OFF 8 小时夜间长测人工复核结论为 **FAIL/WARN（非单一固件故障）**：
+
+| 类别 | 现象 | 处理口径 |
+| --- | --- | --- |
+| 外部 PC 网卡/热点 | MQTT 从约 00:20 异常，Wi-Fi AP 从约 00:41 不可用，结束时未恢复 | 单独切分为外部网络事件，不计为纯固件故障 |
+| Zigbee 父链路 | 990 行 Rejoin failure、26 次 link lost、最长中断 19 分 45 秒；首次异常早于外网故障 | 作为可靠性问题保留，受控复测后继续定位 |
+| I2C/OLED | 29 次 clear bus、6 次 OLED refresh failed，均恢复 | 优先硬件整改：短接线、4.7 kΩ 上拉、VCC 100 nF 去耦 |
+| 资源 | 最低 free heap 157140、minimum heap 156888、最大块最低 139264 | 未见内存泄漏、panic、watchdog、brownout 或意外重启 |
+
+### 调整后的顺序
+
+1. **冻结当前默认 OFF 固件基线，不覆盖当前固件；**
+2. **暂缓 P2 Zigbee 应用事件队列/事件处理拆分**（`docs/ZIGBEE_EVENT_QUEUE_SPLIT_PLAN_2026-09-28.md` 仅保留为设计稿）；
+3. 节点改用确认可靠的 USB 数据线，排除供电/RF 裕度外部因素；
+4. 完成 OLED I2C 接线、上拉和去耦整改；
+5. 在 Windows 热点/外网持续稳定条件下安排受控 8 小时复测；
+6. 若复测仍有父链路异常，再只读分析并定位 ZBOSS polling/rejoin、child aging、coexistence 与供电，不先叠加新功能。
+
 ## 1. 当前资源快照
 
 ### 1.1 板卡与系统配置

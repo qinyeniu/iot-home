@@ -1,0 +1,9 @@
+{
+  "planned_start": "2026-09-29 23:50:52.230 +08:00",
+  "duration_seconds": 28800,
+  "planned_end": "2026-09-30 07:50:52.230 +08:00",
+  "gateway_pid": 14920,
+  "node_pid": 18988,
+  "python": "C:\\Users\\HJB\\AppData\\Local\\Python\\bin\\python.exe",
+  "condition": "OLED SDA/SCL shortened/fixed; external 4.7k pullups; reliable node USB data cable; no 100nF decoupling capacitor"
+}

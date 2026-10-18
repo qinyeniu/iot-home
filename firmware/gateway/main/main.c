@@ -55,6 +55,7 @@
 #include "iot_rf_power_policy.h"
 #include "iot_rf_transaction.h"
 #include "rf_power_controller.h"
+#include "local_control.h"
 #include "iot_zb_node_model.h"
 #include "iot_provisioning_wifi_owner.h"
 #include "cJSON.h"
@@ -86,6 +87,7 @@
 // Forward declarations
 void mqtt_pub(const char *topic_suffix, const char *data);
 void mqtt_pub_retained(const char *topic_suffix, const char *data, bool retain);
+bool gateway_send_onoff_cmd(uint16_t short_addr, const char *command);
 
 // ==================== Globals ====================
 
@@ -1399,29 +1401,47 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
         cJSON_Delete(root);
         return;
     }
-    if (!gateway_onoff_target_ready(short_addr)) {
+    if (!gateway_send_onoff_cmd(short_addr, command->valuestring)) {
         cJSON_Delete(root);
         return;
+    }
+    cJSON_Delete(root);
+}
+
+// Local-control bridge: send a ZCL On/Off command to a node by short address.
+// Used by both the MQTT command path and the local rotary/OLED UI. Returns true
+// if the request was handed to the Zigbee stack.
+bool gateway_send_onoff_cmd(uint16_t short_addr, const char *command)
+{
+    uint8_t cmd_id = 0xFF;
+    if (strcmp(command, "on") == 0) {
+        cmd_id = ESP_ZB_ZCL_CMD_ON_OFF_ON_ID;
+    } else if (strcmp(command, "off") == 0) {
+        cmd_id = ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID;
+    } else if (strcmp(command, "toggle") == 0) {
+        cmd_id = ESP_ZB_ZCL_CMD_ON_OFF_TOGGLE_ID;
+    } else {
+        return false;
+    }
+
+    if (!gateway_onoff_target_ready(short_addr)) {
+        return false;
     }
 
     esp_zb_zcl_on_off_cmd_t req = {
         .zcl_basic_cmd = {
             .dst_addr_u.addr_short = short_addr,
-            .dst_endpoint = EP_GW,  // node endpoint 10
+            .dst_endpoint = EP_GW,
             .src_endpoint = EP_GW,
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
         .on_off_cmd_id = cmd_id,
     };
     uint8_t zcl_seq = 0;
-
-    // MQTT callbacks run outside the Zigbee main loop; acquire the mandatory
-    // ZBOSS lock before issuing a standard ZCL On/Off request.
     if (!esp_zb_is_started()) {
         ESP_LOGW(TAG, "CMD fwd: node=0x%04x skipped: stack not started",
                  (unsigned)short_addr);
-        cJSON_Delete(root);
-        return;
+        return false;
     }
     if (esp_zb_lock_acquire(portMAX_DELAY)) {
         zcl_seq = esp_zb_zcl_on_off_cmd_req(&req);
@@ -1429,10 +1449,11 @@ static void gateway_handle_node_cmd(const char *topic, const char *payload)
     } else {
         ESP_LOGW(TAG, "CMD fwd: node=0x%04x skipped: lock unavailable",
                  (unsigned)short_addr);
+        return false;
     }
     ESP_LOGI(TAG, "CMD fwd: node=0x%04x cmd=%s zcl_seq=%u",
-             (unsigned)short_addr, command->valuestring, (unsigned)zcl_seq);
-    cJSON_Delete(root);
+             (unsigned)short_addr, command, (unsigned)zcl_seq);
+    return true;
 }
 
 static void mqtt_client_connected(void *arg)
@@ -1700,6 +1721,10 @@ static void oled_task(void *arg)
     // Two-colour SSD1306: rows 0-15 are physically YELLOW (title),
     // rows 16-63 are BLUE (content). Compact font is 5x7 with 6px pitch.
     while (1) {
+        if (local_control_is_active()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         int64_t us = esp_timer_get_time() / 1000000;
         int h = (int)(us / 3600), m = (int)((us % 3600) / 60), sec = (int)(us % 60);
         char line[24];
@@ -2367,6 +2392,21 @@ void app_main(void)
     }
 
     
+
+    // Local control UI (rotary encoder + OLED menus). Reuses gateway logic
+    // and syncs local actions to the cloud via the existing MQTT publisher.
+    if (s_oled_available) {
+        const local_control_api_t lc_api = {
+            .mqtt_publish = mqtt_pub_retained,
+            .onoff_send = gateway_send_onoff_cmd,
+            .get_active_rf_addr = rf_power_controller_get_active_addr,
+        };
+        esp_err_t lc_ret = local_control_init(&s_oled, &lc_api);
+        if (lc_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Local control UI init failed: %s", esp_err_to_name(lc_ret));
+        }
+    }
+
 #if !ZB_ONLY_RF_DIAG
     product_runtime_config_init();
 #endif

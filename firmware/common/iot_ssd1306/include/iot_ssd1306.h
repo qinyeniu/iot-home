@@ -46,12 +46,7 @@ typedef struct {
     bool panel_ready;
 } iot_ssd1306_t;
 
-/**
- * @brief Validate and save the configuration, then initialize the I2C bus.
- *
- * Storage for the instance, drawing framebuffer and GRAM scratch buffer is
- * provided by the caller. The two byte buffers must not overlap.
- */
+/** @brief Validate and save the configuration, then initialize the I2C bus. */
 esp_err_t iot_ssd1306_init(iot_ssd1306_t *self,
                            const iot_ssd1306_config_t *config);
 
@@ -71,7 +66,30 @@ esp_err_t iot_ssd1306_clear(iot_ssd1306_t *self);
 esp_err_t iot_ssd1306_draw_char(iot_ssd1306_t *self, int x, int y, char ch);
 esp_err_t iot_ssd1306_draw_text(iot_ssd1306_t *self, int x, int y,
                                 const char *text);
+/** Draw text in inverted color (clears pixels) - for highlighted menu rows. */
+esp_err_t iot_ssd1306_draw_text_inv(iot_ssd1306_t *self, int x, int y,
+                                    const char *text);
 esp_err_t iot_ssd1306_flush(iot_ssd1306_t *self);
+
+/* ---- Graphics primitives added for local control UI ---- */
+
+/** Set or clear a single pixel. (0,0) is top-left. */
+esp_err_t iot_ssd1306_draw_pixel(iot_ssd1306_t *self, int x, int y, bool on);
+
+/** Draw a horizontal/vertical line. */
+esp_err_t iot_ssd1306_draw_hline(iot_ssd1306_t *self, int x, int y, int w, bool on);
+esp_err_t iot_ssd1306_draw_vline(iot_ssd1306_t *self, int x, int y, int h, bool on);
+
+/** Draw an unfilled rectangle outline. */
+esp_err_t iot_ssd1306_draw_rect(iot_ssd1306_t *self, int x, int y, int w, int h, bool on);
+
+/** Draw a filled rectangle. */
+esp_err_t iot_ssd1306_fill_rect(iot_ssd1306_t *self, int x, int y, int w, int h, bool on);
+
+/** Draw a 1bpp bitmap (XBM-style, MSB first, row-major). Each byte holds
+ *  8 horizontal pixels. x,y is the top-left origin. */
+esp_err_t iot_ssd1306_draw_bitmap(iot_ssd1306_t *self, int x, int y,
+                                  const uint8_t *bitmap, int w, int h, bool on);
 
 /** Generic lifecycle table. The instance must be configured first. */
 const iot_driver_t *iot_ssd1306_driver(void);
@@ -79,3 +97,4 @@ const iot_driver_t *iot_ssd1306_driver(void);
 #ifdef __cplusplus
 }
 #endif
+

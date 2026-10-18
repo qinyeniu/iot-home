@@ -485,6 +485,148 @@ esp_err_t iot_ssd1306_draw_text(iot_ssd1306_t *self, int x, int y,
     return ESP_OK;
 }
 
+esp_err_t iot_ssd1306_draw_text_inv(iot_ssd1306_t *self, int x, int y,
+                                    const char *text)
+{
+    if (self == NULL || self->config.framebuffer == NULL || text == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    while (*text != '\0') {
+        char ch = *text;
+        if (ch >= 'a' && ch <= 'z') {
+            ch = (char)(ch - 'a' + 'A');
+        }
+        if (ch == '_') {
+            ch = '-';
+        }
+        if (ch < ' ' || ch > 'Z') {
+            x += 6;
+            text++;
+            continue;
+        }
+        int idx = ch - ' ';
+        for (int col = 0; col < 5; col++) {
+            uint8_t line = FONT_5x7[idx][col];
+            for (int row = 0; row < 7; row++) {
+                int px = x + col;
+                int py = y + row;
+                if ((line & (1 << row)) &&
+                    px >= 0 && px < self->config.width &&
+                    py >= 0 && py < self->config.height) {
+                    self->config.framebuffer[(py / 8) * self->config.width + px] &=
+                        (uint8_t)~(1u << (py % 8));
+                }
+            }
+        }
+        x += 6;
+        text++;
+    }
+    return ESP_OK;
+}
+
+/* ---- Graphics primitives (local control UI) ---- */
+
+esp_err_t iot_ssd1306_draw_pixel(iot_ssd1306_t *self, int x, int y, bool on)
+{
+    if (self == NULL || self->config.framebuffer == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (x < 0 || y < 0 || x >= self->config.width || y >= self->config.height) {
+        return ESP_OK; /* clip silently */
+    }
+    const int page = y / 8;
+    const uint8_t bit = (uint8_t)(1U << (y % 8));
+    uint8_t *fb = &self->config.framebuffer[page * self->config.width + x];
+    if (on) {
+        *fb |= bit;
+    } else {
+        *fb &= (uint8_t)~bit;
+    }
+    return ESP_OK;
+}
+
+esp_err_t iot_ssd1306_draw_hline(iot_ssd1306_t *self, int x, int y, int w, bool on)
+{
+    if (self == NULL || self->config.framebuffer == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (int i = 0; i < w; i++) {
+        esp_err_t ret = iot_ssd1306_draw_pixel(self, x + i, y, on);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t iot_ssd1306_draw_vline(iot_ssd1306_t *self, int x, int y, int h, bool on)
+{
+    if (self == NULL || self->config.framebuffer == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (int i = 0; i < h; i++) {
+        esp_err_t ret = iot_ssd1306_draw_pixel(self, x, y + i, on);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t iot_ssd1306_draw_rect(iot_ssd1306_t *self, int x, int y, int w, int h, bool on)
+{
+    if (self == NULL || self->config.framebuffer == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t ret;
+    ret = iot_ssd1306_draw_hline(self, x, y, w, on);
+    if (ret != ESP_OK) return ret;
+    ret = iot_ssd1306_draw_hline(self, x, y + h - 1, w, on);
+    if (ret != ESP_OK) return ret;
+    ret = iot_ssd1306_draw_vline(self, x, y, h, on);
+    if (ret != ESP_OK) return ret;
+    ret = iot_ssd1306_draw_vline(self, x + w - 1, y, h, on);
+    return ret;
+}
+
+esp_err_t iot_ssd1306_fill_rect(iot_ssd1306_t *self, int x, int y, int w, int h, bool on)
+{
+    if (self == NULL || self->config.framebuffer == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (int row = 0; row < h; row++) {
+        esp_err_t ret = iot_ssd1306_draw_hline(self, x, y + row, w, on);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t iot_ssd1306_draw_bitmap(iot_ssd1306_t *self, int x, int y,
+                                  const uint8_t *bitmap, int w, int h, bool on)
+{
+    if (self == NULL || self->config.framebuffer == NULL || bitmap == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Row-major, MSB-first: bit 7 of byte[0] is the leftmost pixel. */
+    for (int row = 0; row < h; row++) {
+        for (int col = 0; col < w; col++) {
+            const int byte_idx = (row * ((w + 7) / 8)) + (col / 8);
+            const uint8_t bit = (uint8_t)(0x80U >> (col % 8));
+            bool set = (bitmap[byte_idx] & bit) != 0;
+            if (set) {
+                esp_err_t ret = iot_ssd1306_draw_pixel(self, x + col, y + row, on);
+                if (ret != ESP_OK) {
+                    return ret;
+                }
+            }
+        }
+    }
+    return ESP_OK;
+}
+
 static bool oled_ranges_overlap(const void *a, size_t a_size,
                                 const void *b, size_t b_size)
 {

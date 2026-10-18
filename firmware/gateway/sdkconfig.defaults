@@ -23,3 +23,11 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
 # Coexistence
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+
+# Flash-efficient: gateway runs as Wi-Fi STA only; no SoftAP/DHCP server yet
+# CONFIG_LWIP_DHCPS is not set
+# IPv6 not used (MQTT broker is IPv4)
+# CONFIG_LWIP_IPV6 is not set
+# SNTP not used (no time sync dependency)
+# CONFIG_LWIP_SNTP is not set

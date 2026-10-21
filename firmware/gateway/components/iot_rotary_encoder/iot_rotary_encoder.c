@@ -50,42 +50,64 @@ static bool IRAM_ATTR pcnt_watch_cb(pcnt_unit_handle_t unit,
     return false;
 }
 
-static void button_isr_handler(void *arg)
-{
-    (void)arg;
-    BaseType_t higher = pdFALSE;
-    /* Notify the button processing task; actual debounce happens there. */
-    xTaskNotifyFromISR(s_ctx.button_task, 1, eSetBits, &higher);
-    portYIELD_FROM_ISR(higher);
-}
+/* Button polling state machine.
+ * The old implementation used a NEGEDGE ISR + task notification, which only
+ * woke on press. Release never triggered an interrupt, so a short press was
+ * only detected on the NEXT press - by then held_ms exceeded long_press_ms
+ * and every press was misreported as LONG_PRESS.
+ *
+ * This version polls the active-low switch every 5 ms with software debounce
+ * and detects both press (falling edge) and release (rising edge), so short
+ * and long presses are reported correctly.
+ */
+/* NB: ESP-IDF default tick rate is 100 Hz (10 ms/tick), so a 5 ms poll
+ * maps to vTaskDelay(0) = busy loop and starves IDLE -> task WDT reset.
+ * Use 20 ms (2 ticks) to yield the CPU properly. */
+#define BTN_POLL_MS         20
+#define BTN_DEBOUNCE_STABLE 3   /* consecutive equal samples to confirm */
 
 static void button_task(void *arg)
 {
     (void)arg;
-    uint32_t notify;
+    int stable_level = 1;      /* active-low: idle = high */
+    int stable_count = 0;
+    int prev_level = 1;
+    int64_t press_start_ms = 0;
+
     for (;;) {
-        if (xTaskNotifyWait(0, ULONG_MAX, &notify, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-        /* Sample with debounce: wait for stable level. */
-        vTaskDelay(pdMS_TO_TICKS(s_ctx.debounce_ms));
         int level = gpio_get_level(s_ctx.pin_sw);
-        if (level == 1) {
-            /* Released (active low): if it was pressed, decide short/long. */
-            if (s_ctx.pressed) {
-                s_ctx.pressed = false;
-                int64_t held_ms = (esp_timer_get_time() / 1000) - s_ctx.press_start_ms;
-                post_event(held_ms >= s_ctx.long_press_ms
-                               ? IOT_ROTARY_EVENT_LONG_PRESS
-                               : IOT_ROTARY_EVENT_PRESS);
+
+        if (level == stable_level) {
+            if (stable_count < BTN_DEBOUNCE_STABLE) {
+                stable_count++;
             }
+        } else {
+            stable_count = 0;
+            stable_level = level;
+            vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS));
             continue;
         }
-        /* Pressed (active low). */
-        if (!s_ctx.pressed) {
-            s_ctx.pressed = true;
-            s_ctx.press_start_ms = esp_timer_get_time() / 1000;
+
+        if (stable_count < BTN_DEBOUNCE_STABLE) {
+            vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS));
+            continue;
         }
+
+        /* Stable level confirmed. Detect transitions on the stable value. */
+        if (stable_level == 0 && prev_level == 1) {
+            /* Press detected (active low). */
+            press_start_ms = esp_timer_get_time() / 1000;
+            prev_level = 0;
+        } else if (stable_level == 1 && prev_level == 0) {
+            /* Release detected: decide short vs long. */
+            int64_t held_ms = (esp_timer_get_time() / 1000) - press_start_ms;
+            post_event(held_ms >= s_ctx.long_press_ms
+                           ? IOT_ROTARY_EVENT_LONG_PRESS
+                           : IOT_ROTARY_EVENT_PRESS);
+            prev_level = 1;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS));
     }
 }
 
@@ -176,7 +198,7 @@ esp_err_t iot_rotary_encoder_start(iot_rotary_encoder_t *self,
             .mode = GPIO_MODE_INPUT,
             .pull_up_en = GPIO_PULLUP_ENABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_NEGEDGE,
+            .intr_type = GPIO_INTR_DISABLE,
         };
         ret = gpio_config(&io);
         if (ret != ESP_OK) {
@@ -196,18 +218,6 @@ esp_err_t iot_rotary_encoder_start(iot_rotary_encoder_t *self,
             pcnt_del_channel(self->pcnt_chan);
             pcnt_del_unit(self->pcnt_unit);
             return ESP_ERR_NO_MEM;
-        }
-
-        gpio_install_isr_service(0);
-        ret = gpio_isr_handler_add(config->pin_sw, button_isr_handler, NULL);
-        if (ret != ESP_OK) {
-            ESP_LOGE(IOT_ROTARY_TAG, "gpio isr add failed: %s", esp_err_to_name(ret));
-            vTaskDelete(s_ctx.button_task);
-            pcnt_unit_stop(self->pcnt_unit);
-            pcnt_unit_disable(self->pcnt_unit);
-            pcnt_del_channel(self->pcnt_chan);
-            pcnt_del_unit(self->pcnt_unit);
-            return ret;
         }
     }
 

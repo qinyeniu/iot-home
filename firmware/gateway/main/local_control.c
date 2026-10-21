@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include "iot_rotary_encoder.h"
 #include "iot_ssd1306.h"
+#include "driver/gpio.h"
 #include "iot_rf_power_policy.h"
 
 #define LC_TAG "local_ctrl"
@@ -47,7 +48,6 @@ typedef struct {
 } lc_menu_t;
 
 /* Forward declarations */
-static void menu_root_draw(void);
 static void menu_node_enter(void);
 static void menu_rf_enter(void);
 static void menu_info_enter(void);
@@ -92,7 +92,7 @@ static lc_menu_t s_menus[] = {
     { LC_MENU_ROOT,       "IOT-HOME GW", 0, 3 },
     { LC_MENU_NODE,       "Select Node", 0, 0 },
     { LC_MENU_NODE_ACTIONS, "Node Cmd",  3, 3 },
-    { LC_MENU_RF,         "RF Power",    0, 0 },
+    { LC_MENU_RF,         "RF Power",    6, 3 },
     { LC_MENU_RF_ACTIONS, "RF Cmd",      6, 3 },
     { LC_MENU_INFO,       "System Info",  0, 1 },
 };
@@ -135,8 +135,10 @@ static void lc_draw_menu(const lc_menu_t *menu, int selected, int offset_x)
         char tmp[24];
 
         if (menu->id == LC_MENU_NODE) {
-            /* Node list: show short address */
-            if (i < s_node_count) {
+            /* Node list: show short address, or a placeholder when empty */
+            if (s_node_count == 0) {
+                label = "NO NODE";
+            } else if (i < s_node_count) {
                 snprintf(tmp, sizeof(tmp), "0x%04X", s_node_addrs[i]);
                 label = tmp;
             }
@@ -155,28 +157,6 @@ static void lc_draw_menu(const lc_menu_t *menu, int selected, int offset_x)
     iot_ssd1306_flush(s_oled);
 }
 
-/* --- Root draw with live status --- */
-static void menu_root_draw(void)
-{
-    iot_ssd1306_clear(s_oled);
-    iot_ssd1306_draw_text(s_oled, 28, 2, "IOT-HOME GW");
-    iot_ssd1306_draw_hline(s_oled, 0, 13, LC_SCREEN_W, true);
-
-    char line[24];
-    snprintf(line, sizeof(line), "NODES: %d", s_node_count);
-    iot_ssd1306_draw_text(s_oled, 2, 18, line);
-
-    if (s_api_valid && s_api.mqtt_publish != NULL) {
-        snprintf(line, sizeof(line), "MODE: LOCAL CTRL");
-        iot_ssd1306_draw_text(s_oled, 2, 30, line);
-    }
-    snprintf(line, sizeof(line), "RF: %s", s_rf_mode == 0 ? "AUTO" : "MANUAL");
-    iot_ssd1306_draw_text(s_oled, 2, 42, line);
-
-    iot_ssd1306_draw_text(s_oled, 2, 54, "ROT:menu PRESS:open");
-    iot_ssd1306_flush(s_oled);
-}
-
 /* --- Node menu --- */
 static void menu_node_enter(void)
 {
@@ -191,7 +171,7 @@ static void menu_node_enter(void)
             s_node_addrs[s_node_count++] = addr;
         }
     }
-    s_menus[1].item_count = s_node_count;
+    s_menus[1].item_count = s_node_count > 0 ? s_node_count : 1;
     lc_draw_menu(&s_menus[LC_MENU_NODE], s_cur_index, 0);
 }
 
@@ -199,8 +179,7 @@ static void menu_rf_enter(void)
 {
     s_cur_menu = LC_MENU_RF;
     s_cur_index = 0;
-    /* Auto / Manual / Query as items 0..2 */
-    s_menus[3].item_count = 3;
+    /* Auto / Manual / Query commands (s_items[6..8]) */
     lc_draw_menu(&s_menus[LC_MENU_RF], s_cur_index, 0);
 }
 
@@ -289,22 +268,31 @@ static void rf_action(int selected)
 }
 
 /* --- Event handling --- */
+/* Apply accumulated rotation steps and redraw once (throttled). */
+static void lc_apply_rotation(int steps)
+{
+    const lc_menu_t *menu = &s_menus[s_cur_menu];
+    if (menu->item_count <= 0) {
+        return;
+    }
+    int idx = s_cur_index + steps;
+    idx %= menu->item_count;
+    if (idx < 0) {
+        idx += menu->item_count;
+    }
+    s_cur_index = idx;
+    lc_draw_menu(menu, s_cur_index, 0);
+}
+
 static void lc_handle_event(const iot_rotary_event_msg_t *msg)
 {
+    ESP_LOGI(LC_TAG, "rotary event=%d ts=%u", (int)msg->event, (unsigned)msg->timestamp_ms);
     const lc_menu_t *menu = &s_menus[s_cur_menu];
 
     switch (msg->event) {
     case IOT_ROTARY_EVENT_CW:
-        if (menu->item_count > 0) {
-            s_cur_index = (s_cur_index + 1) % menu->item_count;
-            lc_draw_menu(menu, s_cur_index, 0);
-        }
-        break;
     case IOT_ROTARY_EVENT_CCW:
-        if (menu->item_count > 0) {
-            s_cur_index = (s_cur_index - 1 + menu->item_count) % menu->item_count;
-            lc_draw_menu(menu, s_cur_index, 0);
-        }
+        /* Rotation is accumulated and applied by lc_ui_task (throttled). */
         break;
     case IOT_ROTARY_EVENT_PRESS:
         if (s_cur_menu == LC_MENU_ROOT) {
@@ -313,19 +301,28 @@ static void lc_handle_event(const iot_rotary_event_msg_t *msg)
             else if (s_cur_index == 1) menu_rf_enter();
             else if (s_cur_index == 2) menu_info_enter();
         } else if (s_cur_menu == LC_MENU_NODE) {
-            s_cur_menu = LC_MENU_NODE_ACTIONS;
-            s_cur_index = 0;
-            lc_draw_menu(&s_menus[LC_MENU_NODE_ACTIONS], 0, 0);
+            if (s_node_count == 0) {
+                /* No node online: pressing returns to root. */
+                s_cur_menu = LC_MENU_ROOT;
+                s_cur_index = 0;
+                lc_draw_menu(&s_menus[LC_MENU_ROOT], 0, 0);
+            } else {
+                s_cur_menu = LC_MENU_NODE_ACTIONS;
+                s_cur_index = 0;
+                lc_draw_menu(&s_menus[LC_MENU_NODE_ACTIONS], 0, 0);
+            }
         } else if (s_cur_menu == LC_MENU_NODE_ACTIONS) {
             node_action(s_cur_index);
         } else if (s_cur_menu == LC_MENU_RF) {
-            if (s_cur_index == 0) { s_rf_mode = 0; }
-            else if (s_cur_index == 1) { s_rf_manual_dbm = -10; }
-            s_cur_menu = LC_MENU_RF_ACTIONS;
-            s_cur_index = s_cur_index < 2 ? s_cur_index : 2;
-            lc_draw_menu(&s_menus[LC_MENU_RF_ACTIONS], s_cur_index, 0);
+            /* RF Power menu shows AUTO/MANUAL/QUERY; press executes it. */
+            rf_action(s_cur_index);
         } else if (s_cur_menu == LC_MENU_RF_ACTIONS) {
             rf_action(s_cur_index);
+        } else if (s_cur_menu == LC_MENU_INFO) {
+            /* System Info: press returns to root. */
+            s_cur_menu = LC_MENU_ROOT;
+            s_cur_index = 0;
+            lc_draw_menu(&s_menus[LC_MENU_ROOT], 0, 0);
         }
         break;
     case IOT_ROTARY_EVENT_LONG_PRESS:
@@ -339,23 +336,129 @@ static void lc_handle_event(const iot_rotary_event_msg_t *msg)
     }
 }
 
+/* --- Rotary GPIO ISR (gray-code state machine) --- */
+#define LC_ROT_A_PIN GPIO_NUM_4
+#define LC_ROT_B_PIN GPIO_NUM_5
+
+static volatile uint8_t s_rot_last_a;
+
+/* Decode on A rising edge: one mechanical detent produces exactly one
+ * A rising edge, so one detent = one step regardless of speed. Direction
+ * is given by the B level sampled at the A rising edge (KY-040 wiring:
+ * B high -> CW, B low -> CCW when S1=A on GPIO4 / S2=B on GPIO5).
+ */
+static void IRAM_ATTR rot_isr_handler(void *arg)
+{
+    (void)arg;
+    uint8_t a = (uint8_t)gpio_get_level(LC_ROT_A_PIN);
+    uint8_t b = (uint8_t)gpio_get_level(LC_ROT_B_PIN);
+    uint8_t last_a = s_rot_last_a;
+    s_rot_last_a = a;
+
+    if (!(a == 1 && last_a == 0)) {
+        return; /* not an A rising edge */
+    }
+
+    iot_rotary_event_msg_t msg = {
+        .event = b ? IOT_ROTARY_EVENT_CW : IOT_ROTARY_EVENT_CCW,
+        .timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000),
+    };
+    BaseType_t higher = pdFALSE;
+    xQueueSendFromISR(s_evt_queue, &msg, &higher);
+    if (higher) {
+        portYIELD_FROM_ISR(higher);
+    }
+}
+
+static esp_err_t lc_rot_gpio_isr_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << LC_ROT_A_PIN) | (1ULL << LC_ROT_B_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
+    };
+    esp_err_t ret = gpio_config(&io);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    /* ISR service is normally installed by iot_rotary_encoder (SW pin).
+     * Install here too if not already installed. */
+    ret = gpio_install_isr_service(0);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        return ret;
+    }
+    ret = gpio_isr_handler_add(LC_ROT_A_PIN, rot_isr_handler, NULL);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = gpio_isr_handler_add(LC_ROT_B_PIN, rot_isr_handler, NULL);
+    return ret;
+}
+
 /* --- UI task --- */
+#define LC_ROT_DETENT_MERGE_MS 20   /* same-direction events closer than this = one detent */
+
 static void lc_ui_task(void *arg)
 {
     (void)arg;
     iot_rotary_event_msg_t msg;
-    /* Start at root menu */
+    int pending_rot = 0;
+    int last_dir = 0;              /* +1 CW, -1 CCW, 0 none */
+    uint32_t last_dir_ts = 0;      /* timestamp of last rotation event */
+    uint32_t last_root_refresh = 0;
+
+    /* Start at root menu (with highlighted selection bar) */
     s_cur_menu = LC_MENU_ROOT;
     s_cur_index = 0;
     lc_draw_menu(&s_menus[LC_MENU_ROOT], 0, 0);
+    last_root_refresh = (uint32_t)(esp_timer_get_time() / 1000);
 
     while (s_lc_active) {
-        if (xQueueReceive(s_evt_queue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
-            lc_handle_event(&msg);
+        /* Wait up to 20 ms for an event, then apply accumulated rotation. */
+        if (xQueueReceive(s_evt_queue, &msg, pdMS_TO_TICKS(20)) == pdTRUE) {
+            int dir = 0;
+            if (msg.event == IOT_ROTARY_EVENT_CW) {
+                dir = 1;
+            } else if (msg.event == IOT_ROTARY_EVENT_CCW) {
+                dir = -1;
+            }
+
+            if (dir != 0) {
+                /* Merge multiple edges of the same detent into one step:
+                 * if the same direction repeats within 20 ms, it is the
+                 * second/third edge of the same mechanical detent. */
+                if (last_dir != dir ||
+                    (uint32_t)(msg.timestamp_ms - last_dir_ts) >= LC_ROT_DETENT_MERGE_MS) {
+                    pending_rot += dir;
+                }
+                last_dir = dir;
+                last_dir_ts = msg.timestamp_ms;
+            } else {
+                /* Button press/long-press: apply pending rotation first,
+                 * then handle the button immediately. */
+                if (pending_rot != 0) {
+                    lc_apply_rotation(pending_rot);
+                    pending_rot = 0;
+                }
+                lc_handle_event(&msg);
+            }
         } else {
-            /* Periodic refresh of root menu to keep live status */
+            /* Timeout: apply any accumulated rotation (one redraw per batch). */
+            if (pending_rot != 0) {
+                lc_apply_rotation(pending_rot);
+                pending_rot = 0;
+            }
+            /* Slow periodic refresh of root menu keeps live status while
+             * keeping the highlighted selection bar visible. Do not redraw
+             * faster than every 500 ms to avoid flicker. */
             if (s_cur_menu == LC_MENU_ROOT) {
-                menu_root_draw();
+                uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+                if (now - last_root_refresh >= 500) {
+                    lc_draw_menu(&s_menus[LC_MENU_ROOT], s_cur_index, 0);
+                    last_root_refresh = now;
+                }
             }
         }
     }
@@ -399,6 +502,14 @@ esp_err_t local_control_init(iot_ssd1306_t *oled,
     esp_err_t ret = iot_rotary_encoder_start(&s_rotary, &rot_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(LC_TAG, "rotary encoder init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* GPIO ISR quadrature decode (independent of PCNT). */
+    ret = lc_rot_gpio_isr_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(LC_TAG, "rotary gpio isr init failed: %s", esp_err_to_name(ret));
+        iot_rotary_encoder_stop(&s_rotary);
         return ret;
     }
 
